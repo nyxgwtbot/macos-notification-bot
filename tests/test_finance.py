@@ -220,5 +220,80 @@ class TestFinanceExtractorLLM(unittest.TestCase):
             self.assertIsNone(extractor.extract({"app": "b", "title": "t", "subtitle": "", "body": "b"}))
 
 
+class TestFinanceLedger(unittest.TestCase):
+    """SQLite ledger: schema, idempotent insertion, decimal-safe aggregates."""
+
+    def _make_tx(self, rec_id, amount, ts="2026-10-25T14:30:00-03:00", kind="gasto",
+                 category="alimentacao", description="Compra", bundle="com.itau", raw=None):
+        from decimal import Decimal as D
+        return {
+            "rec_id": rec_id,
+            "ts": ts,
+            "bundle": bundle,
+            "amount": D(str(amount)),
+            "kind": kind,
+            "category": category,
+            "description": description,
+            "raw": raw if raw is not None else {"rec_id": rec_id, "body": f"tx {rec_id}"},
+        }
+
+    def test_create_insert_idempotent(self):
+        import tempfile, os
+        from notifybot.finance import FinanceLedger
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ledger = FinanceLedger(os.path.join(tmpdir, "finance.db"))
+            self.assertEqual(ledger.insert_transaction(self._make_tx(1, "123.45")), "inserted")
+            self.assertEqual(ledger.insert_transaction(self._make_tx(1, "123.45")), "ignored")
+            ledger.close()
+            # Reopening recreates schema and keeps data
+            ledger2 = FinanceLedger(os.path.join(tmpdir, "finance.db"))
+            self.assertEqual(len(ledger2.month_records("2026-10")), 1)
+            ledger2.close()
+
+    def test_month_records_filter(self):
+        import tempfile, os
+        from notifybot.finance import FinanceLedger
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ledger = FinanceLedger(os.path.join(tmpdir, "finance.db"))
+            ledger.insert_transaction(self._make_tx(1, "10.00", ts="2026-10-25T10:00:00-03:00"))
+            ledger.insert_transaction(self._make_tx(2, "20.00", ts="2026-09-25T10:00:00-03:00"))
+            ledger.insert_transaction(self._make_tx(3, "30.00", ts="2026-11-01T10:00:00-03:00"))
+            records = ledger.month_records("2026-10")
+            self.assertEqual([r["rec_id"] for r in records], [1])
+            self.assertEqual(len(ledger.month_records("2026-09")), 1)
+            self.assertEqual(len(ledger.month_records("2026-11")), 1)
+            ledger.close()
+
+    def test_month_totals_decimal_safe(self):
+        import tempfile, os
+        from decimal import Decimal as D
+        from notifybot.finance import FinanceLedger
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ledger = FinanceLedger(os.path.join(tmpdir, "finance.db"))
+            ledger.insert_transaction(self._make_tx(1, "0.1", category="a", ts="2026-10-01T00:00:00-03:00"))
+            ledger.insert_transaction(self._make_tx(2, "0.2", category="a", ts="2026-10-01T12:00:00-03:00"))
+            ledger.insert_transaction(self._make_tx(3, "1234.56", category="b", ts="2026-10-02T18:00:00-03:00"))
+            totals = ledger.month_totals("2026-10")
+            self.assertEqual(totals["count"], 3)
+            # 0.1 + 0.2 must be EXACTLY 0.3 under Decimal arithmetic
+            self.assertEqual(totals["total"], D("1234.86"))
+            self.assertEqual(totals["by_category"]["a"], D("0.3"))
+            self.assertEqual(totals["by_category"]["b"], D("1234.56"))
+            self.assertEqual(totals["by_day"]["2026-10-01"], D("0.3"))
+            self.assertEqual(totals["by_day"]["2026-10-02"], D("1234.56"))
+            self.assertEqual(totals["max_tx"]["rec_id"], 3)
+            empty = ledger.month_totals("2026-05")
+            self.assertEqual(empty["count"], 0)
+            self.assertEqual(empty["total"], D("0"))
+            self.assertIsNone(empty["max_tx"])
+            ledger.close()
+
+    def test_previous_month_helper(self):
+        from notifybot.finance import previous_month
+        self.assertEqual(previous_month("2026-10"), "2026-09")
+        self.assertEqual(previous_month("2026-01"), "2025-12")
+        self.assertEqual(previous_month("2026-03"), "2026-02")
+
+
 if __name__ == "__main__":
     unittest.main()

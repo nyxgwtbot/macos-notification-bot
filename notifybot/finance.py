@@ -9,7 +9,9 @@ when the regex finds no monetary value. All money math uses decimal.Decimal.
 import datetime
 import json
 import logging
+import os
 import re
+import sqlite3
 import unicodedata
 import urllib.request
 from decimal import Decimal, InvalidOperation
@@ -18,6 +20,132 @@ from typing import List, Optional
 from notifybot.classifier import clean_json_text
 
 logger = logging.getLogger("notification_bot")
+
+LEDGER_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS expenses ("
+    "rec_id INTEGER PRIMARY KEY, ts TEXT, bundle TEXT, "
+    "amount REAL NOT NULL, kind TEXT NOT NULL, category TEXT NOT NULL, "
+    "description TEXT, raw_json TEXT)"
+)
+
+
+def previous_month(month: str) -> str:
+    """Return the previous month for a 'YYYY-MM' string (calendar-aware)."""
+    year, mon = month.split("-")
+    year, mon = int(year), int(mon)
+    mon -= 1
+    if mon == 0:
+        mon = 12
+        year -= 1
+    return f"{year:04d}-{mon:02d}"
+
+
+class FinanceLedger:
+    """
+    Local SQLite ledger for curated bank-notification transactions.
+
+    Idempotent by rec_id (INSERT OR IGNORE); all aggregations use
+    decimal.Decimal arithmetic over the stored values to avoid
+    floating-point drift.
+    """
+
+    INSERT_SQL = (
+        "INSERT OR IGNORE INTO expenses "
+        "(rec_id, ts, bundle, amount, kind, category, description, raw_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+
+    def __init__(self, db_path: str = "finance.db"):
+        self.db_path = db_path
+        parent = os.path.dirname(os.path.abspath(db_path))
+        os.makedirs(parent, exist_ok=True)
+        self.conn = sqlite3.connect(db_path)
+        self.conn.execute(LEDGER_SCHEMA)
+        self.conn.commit()
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def insert_transaction(self, tx: dict) -> str:
+        """
+        Insert a curated transaction. Returns 'inserted' or 'ignored'
+        (duplicate rec_id) so the pipeline stays idempotent.
+        """
+        raw_json = json.dumps(
+            tx.get("raw", {}), ensure_ascii=False, default=str
+        )
+        row = (
+            int(tx["rec_id"]),
+            str(tx["ts"]),
+            str(tx.get("bundle") or ""),
+            float(tx["amount"]),
+            str(tx["kind"]),
+            str(tx["category"]),
+            str(tx.get("description") or ""),
+            raw_json,
+        )
+        with self.conn:
+            cur = self.conn.execute(self.INSERT_SQL, row)
+        return "inserted" if cur.rowcount == 1 else "ignored"
+
+    def month_records(self, month: str) -> List[dict]:
+        """All ledger rows whose local ts string starts with 'YYYY-MM'.
+
+        Filtered via substr(ts, 1, 7) so local-time ISO strings are never
+        re-normalized (SQLite date math could shift days across months
+        with a UTC offset).
+        """
+        cur = self.conn.execute(
+            "SELECT rec_id, ts, bundle, amount, kind, category, description, raw_json "
+            "FROM expenses WHERE substr(ts, 1, 7) = ? ORDER BY ts ASC",
+            (month,),
+        )
+        records = []
+        for rec_id, ts, bundle, amount, kind, category, description, raw_json in cur.fetchall():
+            records.append(
+                {
+                    "rec_id": rec_id,
+                    "ts": ts,
+                    "bundle": bundle,
+                    "amount": float(amount),
+                    "kind": kind,
+                    "category": category,
+                    "description": description,
+                    "raw_json": raw_json,
+                }
+            )
+        return records
+
+    def month_totals(self, month: str) -> dict:
+        """Decimal-safe monthly aggregates (total, by_category, by_day, max_tx)."""
+        records = self.month_records(month)
+        total = Decimal("0")
+        by_category = {}
+        by_day = {}
+        max_tx = None
+        max_amount = Decimal("-1")
+        for r in records:
+            amount = Decimal(str(r["amount"]))
+            total += amount
+            cat = r["category"]
+            by_category[cat] = by_category.get(cat, Decimal("0")) + amount
+            day = r["ts"][:10] if r["ts"] else ""
+            if day:
+                by_day[day] = by_day.get(day, Decimal("0")) + amount
+            if amount > max_amount:
+                max_amount = amount
+                max_tx = r
+        return {
+            "month": month,
+            "count": len(records),
+            "total": total,
+            "by_category": by_category,
+            "by_day": by_day,
+            "max_tx": max_tx,
+        }
 
 DEFAULT_CATEGORIES = [
     "alimentacao",
