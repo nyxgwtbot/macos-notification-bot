@@ -21,7 +21,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 COREDATA_EPOCH_OFFSET = 978307200  # seconds between 1970-01-01 and 2001-01-01
 COREDATA_EPOCH = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
@@ -61,7 +61,7 @@ def parse_plist_blob(blob: Optional[bytes]) -> dict:
             return {}
 
 
-def format_uuid(val: Optional[bytes]) -> str:
+def format_uuid(val: Any) -> str:
     """Convert binary UUID to string representation."""
     if not val:
         return ""
@@ -86,6 +86,33 @@ def coredata_to_iso(date_val: Optional[float]) -> str:
     except Exception:
         pass
     return ""
+
+
+def resolve_telegram_config(config_tg: Optional[dict] = None) -> Tuple[str, str]:
+    """
+    Resolve Telegram token and chat_id following correction rules:
+    - Token: config['telegram']['token'] overrides TELEGRAM_BOT_TOKEN and TG_BOT_TOKEN.
+    - Chat ID: config['telegram']['chat_id'] overrides TELEGRAM_ALLOWED_USERS (first id) and TG_CHAT_ID.
+    """
+    config_tg = config_tg or {}
+    token = (
+        config_tg.get("token")
+        or os.environ.get("TELEGRAM_BOT_TOKEN")
+        or os.environ.get("TG_BOT_TOKEN")
+        or ""
+    )
+
+    chat_id = config_tg.get("chat_id")
+    if not chat_id:
+        allowed = os.environ.get("TELEGRAM_ALLOWED_USERS", "").strip()
+        if allowed:
+            parts = [p.strip() for p in allowed.split(",") if p.strip()]
+            if parts:
+                chat_id = parts[0]
+    if not chat_id:
+        chat_id = os.environ.get("TG_CHAT_ID", "").strip()
+
+    return str(token).strip(), str(chat_id or "").strip()
 
 
 class NotificationReader:
@@ -371,25 +398,300 @@ class LLMClassifier:
             return self.fallback(notif)
 
 
-def append_archive(archive_file: str, notif: dict) -> None:
-    """Persist notification to local archive file to prevent loss upon NC purge."""
-    try:
-        archive_dir = os.path.dirname(os.path.abspath(archive_file))
-        os.makedirs(archive_dir, exist_ok=True)
-        record = {
+class RuleRouter:
+    """Evaluates routing rules top-down; first match wins; fallthrough is ['log']."""
+
+    def __init__(self, rules: Optional[List[dict]] = None):
+        self.rules = rules or []
+
+    def evaluate(self, notif: dict, classification: dict) -> Tuple[str, List[str]]:
+        for rule in self.rules:
+            name = rule.get("name", "unnamed")
+            cond = rule.get("condition", {})
+            actions = rule.get("actions", ["log"])
+
+            if self._matches(cond, notif, classification):
+                return name, actions
+
+        return "default_fallthrough", ["log"]
+
+    def _matches(self, cond: dict, notif: dict, classification: dict) -> bool:
+        if not cond:
+            return True
+
+        for key, expected in cond.items():
+            actual = classification.get(key)
+            if actual is None:
+                actual = notif.get(key)
+
+            if actual is None:
+                return False
+
+            actual_str = str(actual).lower()
+            if isinstance(expected, list):
+                if actual_str not in [str(x).lower() for x in expected]:
+                    return False
+            else:
+                if actual_str != str(expected).lower():
+                    return False
+
+        return True
+
+
+class ActionDispatcher:
+    """Dispatches routed actions: log to JSONL & stderr, telegram, external command."""
+
+    def __init__(
+        self,
+        log_file: str = "logs/events.jsonl",
+        telegram_token: str = "",
+        telegram_chat_id: str = "",
+    ):
+        self.log_file = log_file
+        self.telegram_token = telegram_token
+        self.telegram_chat_id = telegram_chat_id
+
+    def log_event(self, event_data: dict) -> None:
+        """Append event to log_file as a JSON line."""
+        try:
+            log_dir = os.path.dirname(os.path.abspath(self.log_file))
+            os.makedirs(log_dir, exist_ok=True)
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event_data, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.error("Failed to write to log_file %s: %s", self.log_file, e)
+
+    def log_startup(self, watermark: int, mode: str = "daemon") -> None:
+        """Write a startup event line to log_file."""
+        startup_event = {
+            "event": "startup",
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "mode": mode,
+            "watermark": watermark,
+        }
+        self.log_event(startup_event)
+        logger.info("Bot started in '%s' mode (watermark=%d)", mode, watermark)
+
+    def execute_command(self, cmd_path: str, event_payload: dict) -> str:
+        """Run an external command with event JSON in argv[1]. Timeout 30s."""
+        try:
+            payload_json = json.dumps(event_payload, ensure_ascii=False)
+            proc = subprocess.run(
+                [cmd_path, payload_json],
+                capture_output=True,
+                text=True,
+                timeout=30.0,
+            )
+            if proc.returncode == 0:
+                return "ok"
+            logger.warning(
+                "Command '%s' exited %d. stderr: %s",
+                cmd_path,
+                proc.returncode,
+                proc.stderr.strip(),
+            )
+            return f"exit_{proc.returncode}"
+        except subprocess.TimeoutExpired:
+            logger.error("Command '%s' timed out after 30s", cmd_path)
+            return "timeout"
+        except Exception as e:
+            logger.error("Command '%s' execution error: %s", cmd_path, e)
+            return f"error: {e}"
+
+    def send_telegram(self, notif: dict, classification: dict) -> str:
+        """Send message via Telegram Bot API."""
+        if not self.telegram_token or not self.telegram_chat_id:
+            logger.info("Telegram action SKIPPED (missing token or chat_id)")
+            return "skipped"
+
+        cat = classification.get("category", "other").upper()
+        urg = classification.get("urgency", "low").upper()
+        app = notif.get("app", "Unknown")
+        title = notif.get("title", "")
+        body = notif.get("body", "")
+        summary = classification.get("summary", "")
+
+        text_lines = [
+            f"🔔 *[{cat}]* {urg} — `{app}`",
+            f"*Title:* {title}",
+        ]
+        if body:
+            text_lines.append(f"{body}")
+        if summary and summary != title:
+            text_lines.append(f"*Summary:* _{summary}_")
+        message_text = "\n".join(text_lines)
+
+        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+        payload = {
+            "chat_id": self.telegram_chat_id,
+            "text": message_text,
+            "parse_mode": "Markdown",
+        }
+        try:
+            req_data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=req_data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10.0) as resp:
+                resp_json = json.loads(resp.read().decode("utf-8"))
+                if resp_json.get("ok"):
+                    return "ok"
+                return f"error: {resp_json}"
+        except Exception as e:
+            logger.warning("Telegram send failed: %s", e)
+            return f"error: {e}"
+
+    def dispatch(
+        self,
+        actions: List[str],
+        notif: dict,
+        classification: dict,
+        rule_name: str,
+    ) -> Dict[str, str]:
+        """Dispatch actions according to rule results."""
+        results: Dict[str, str] = {}
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        # Build base event payload
+        event = {
+            "event": "notification",
+            "timestamp": now_iso,
             "rec_id": notif.get("rec_id"),
-            "timestamp": notif.get("timestamp"),
             "app": notif.get("app"),
             "uuid": notif.get("uuid"),
             "title": notif.get("title"),
             "subtitle": notif.get("subtitle"),
             "body": notif.get("body"),
-            "archived_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "classification": classification,
+            "rule_matched": rule_name,
+            "actions": actions,
         }
-        with open(archive_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # Telegram action
+        if "telegram" in actions:
+            status = self.send_telegram(notif, classification)
+            results["telegram"] = status
+            event["telegram"] = status
+
+        # Command actions
+        for act in actions:
+            if act.startswith("command:"):
+                cmd_path = act[len("command:"):].strip()
+                cmd_status = self.execute_command(cmd_path, event)
+                results[act] = cmd_status
+
+        # Log action (default and explicit)
+        results["log"] = "ok"
+        event["action_results"] = results
+
+        # Write to stderr
+        readable_line = (
+            f"[{now_iso}] [RULE: {rule_name}] [ACTIONS: {','.join(actions)}] "
+            f"{notif.get('app', 'app')} - {notif.get('title', '')}: {notif.get('body', '')} "
+            f"(Summary: {classification.get('summary', '')})"
+        )
+        print(readable_line, file=sys.stderr)
+
+        # Write to log_file
+        self.log_event(event)
+        return results
+
+
+def run_cycle(
+    reader: NotificationReader,
+    state_mgr: StateManager,
+    classifier: LLMClassifier,
+    router: RuleRouter,
+    dispatcher: ActionDispatcher,
+    is_startup: bool = False,
+    mode: str = "daemon",
+) -> int:
+    """Run a single polling cycle, processing any new notifications."""
+    if is_startup:
+        dispatcher.log_startup(state_mgr.last_rec_id, mode=mode)
+
+    try:
+        notifications = reader.fetch_notifications(
+            since_rec_id=state_mgr.last_rec_id, reverse=False
+        )
     except Exception as e:
-        logger.warning("Failed to append to archive %s: %s", archive_file, e)
+        logger.error("Failed to read notifications: %s", e)
+        return 0
+
+    processed_count = 0
+    for notif in notifications:
+        rec_id = notif.get("rec_id", 0)
+        notif_uuid = notif.get("uuid", "")
+
+        if state_mgr.is_duplicate(rec_id, notif_uuid):
+            # Advance watermark even for duplicate presentations so we don't query it again
+            state_mgr.record_seen(rec_id, notif_uuid)
+            continue
+
+        classification = classifier.classify(notif)
+        rule_name, actions = router.evaluate(notif, classification)
+        dispatcher.dispatch(actions, notif, classification, rule_name)
+
+        state_mgr.record_seen(rec_id, notif_uuid)
+        state_mgr.save()
+        processed_count += 1
+
+    if processed_count > 0:
+        state_mgr.save()
+
+    return processed_count
+
+
+def load_config(config_path: str) -> dict:
+    """Load configuration from JSON file or return defaults."""
+    defaults = {
+        "poll_interval": 2.0,
+        "state_file": ".bot_state.json",
+        "log_file": "logs/events.jsonl",
+        "ollama": {
+            "url": "http://127.0.0.1:11434/api/chat",
+            "model": "glm-5.3-flash:cloud",
+            "timeout": 30.0,
+        },
+        "telegram": {
+            "token": "",
+            "chat_id": "",
+        },
+        "rules": [
+            {
+                "name": "high_urgency",
+                "condition": {"urgency": ["high"]},
+                "actions": ["log", "telegram"],
+            },
+            {
+                "name": "messages",
+                "condition": {"category": ["message"]},
+                "actions": ["log", "telegram"],
+            },
+            {
+                "name": "promo_or_system",
+                "condition": {"category": ["promo", "system"]},
+                "actions": ["log"],
+            },
+            {
+                "name": "default",
+                "condition": {},
+                "actions": ["log"],
+            },
+        ],
+    }
+
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                defaults.update(loaded)
+        except Exception as e:
+            logger.warning("Could not read config %s: %s; using defaults", config_path, e)
+    return defaults
 
 
 def trigger_test_notifications() -> None:
@@ -465,6 +767,22 @@ def main():
         action="store_true",
         help="Trigger 3 test notifications via osascript and exit",
     )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single polling cycle, write logs, and exit",
+    )
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        help="Override path to Notification Center db2 file",
+    )
+    parser.add_argument(
+        "--watermark",
+        type=int,
+        default=None,
+        help="Override starting watermark rec_id",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -476,13 +794,90 @@ def main():
         trigger_test_notifications()
         sys.exit(0)
 
-    reader = NotificationReader()
+    reader = NotificationReader(db_path=args.db_path)
 
     if args.dump is not None:
         dump_notifications(reader, count=args.dump)
         sys.exit(0)
 
-    print("bot.py ready (use --dump or --test-notify). Full daemon implementation in progress.")
+    config = load_config(args.config)
+    state_file = config.get("state_file", ".bot_state.json")
+    log_file = config.get("log_file", "logs/events.jsonl")
+
+    state_mgr = StateManager(state_file=state_file)
+    if args.watermark is not None:
+        state_mgr.last_rec_id = args.watermark
+
+    ollama_cfg = config.get("ollama", {})
+    classifier = LLMClassifier(
+        url=ollama_cfg.get("url", "http://127.0.0.1:11434/api/chat"),
+        model=ollama_cfg.get("model", "glm-5.3-flash:cloud"),
+        timeout=float(ollama_cfg.get("timeout", 30.0)),
+    )
+
+    tg_token, tg_chat_id = resolve_telegram_config(config.get("telegram"))
+    dispatcher = ActionDispatcher(
+        log_file=log_file,
+        telegram_token=tg_token,
+        telegram_chat_id=tg_chat_id,
+    )
+
+    router = RuleRouter(rules=config.get("rules", []))
+
+    if args.once:
+        run_cycle(
+            reader=reader,
+            state_mgr=state_mgr,
+            classifier=classifier,
+            router=router,
+            dispatcher=dispatcher,
+            is_startup=True,
+            mode="once",
+        )
+        sys.exit(0)
+
+    # Daemon mode
+    running = True
+
+    def _handle_exit(signum, frame):
+        nonlocal running
+        running = False
+        logger.info("Received signal %d; shutting down cleanly...", signum)
+
+    signal.signal(signal.SIGINT, _handle_exit)
+    signal.signal(signal.SIGTERM, _handle_exit)
+
+    poll_interval = float(config.get("poll_interval", 2.0))
+    run_cycle(
+        reader=reader,
+        state_mgr=state_mgr,
+        classifier=classifier,
+        router=router,
+        dispatcher=dispatcher,
+        is_startup=True,
+        mode="daemon",
+    )
+
+    while running:
+        try:
+            time.sleep(poll_interval)
+            if not running:
+                break
+            run_cycle(
+                reader=reader,
+                state_mgr=state_mgr,
+                classifier=classifier,
+                router=router,
+                dispatcher=dispatcher,
+                is_startup=False,
+                mode="daemon",
+            )
+        except Exception as e:
+            logger.error("Error in daemon polling loop: %s", e)
+
+    state_mgr.save()
+    logger.info("Bot daemon stopped.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
