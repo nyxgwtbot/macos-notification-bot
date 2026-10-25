@@ -671,6 +671,62 @@ def load_config(config_path: str) -> dict:
             "token": "",
             "chat_id": "",
         },
+        # Router v2: LLM-based action routing for notifications that match no
+        # deterministic rule. min_confidence below the threshold falls back to "log".
+        "router": {
+            "min_confidence": 0.5,
+            "timeout": 15.0,
+        },
+        # Extensible action registry. "builtin" ids are handled natively
+        # (log, telegram, finance); "command" actions run config command
+        # with the event JSON in argv[1].
+        "actions": [
+            {
+                "id": "log",
+                "match_hint": (
+                    "Ação padrão: apenas registrar a notificação no histórico, "
+                    "sem nenhuma consequência externa."
+                ),
+                "type": "builtin",
+                "enabled": True,
+                "config": {},
+            },
+            {
+                "id": "telegram",
+                "match_hint": (
+                    "Enviar alerta pessoal no Telegram: mensagens diretas de "
+                    "contatos, urgências altas e avisos importantes que merecem "
+                    "atenção imediata."
+                ),
+                "type": "builtin",
+                "enabled": True,
+                "config": {},
+            },
+            {
+                "id": "finance",
+                "match_hint": (
+                    "Notificações bancárias e de finanças pessoais para curadoria "
+                    "de gastos: compras aprovadas, Pix enviado ou recebido, "
+                    "pagamentos, débitos, faturas, estornos e qualquer notificação "
+                    "com valores em R$."
+                ),
+                "type": "builtin",
+                "enabled": True,
+                "config": {},
+            },
+            {
+                "id": "example_command",
+                "match_hint": (
+                    "Exemplo de ação externa: executar um programa local com o "
+                    "payload da notificação em argv[1]. Desabilitada por padrão."
+                ),
+                "type": "command",
+                "enabled": False,
+                "config": {"command": "/path/to/prog"},
+            },
+        ],
+        # Deterministic rules evaluated FIRST (overrides). No catch-all rule:
+        # unmatched notifications flow into the LLM router (Router v2).
         "rules": [
             {
                 "name": "high_urgency",
@@ -687,12 +743,26 @@ def load_config(config_path: str) -> dict:
                 "condition": {"category": ["promo", "system"]},
                 "actions": ["log"],
             },
-            {
-                "name": "default",
-                "condition": {},
-                "actions": ["log"],
-            },
         ],
+        # Finance plugin: extracts bank-notification transactions into a local
+        # SQLite ledger. bank_apps empty = ingest from every app that the
+        # router decides is finance-related.
+        "finance": {
+            "enabled": True,
+            "ledger_db": "finance.db",
+            "bank_apps": [],
+            "telegram_summary": False,
+            "categories": [
+                "alimentacao",
+                "transporte",
+                "compras",
+                "saude",
+                "lazer",
+                "servicos",
+                "assinaturas",
+                "outros",
+            ],
+        },
     }
 
     if os.path.exists(config_path):

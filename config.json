@@ -11,6 +11,42 @@
     "token": "",
     "chat_id": ""
   },
+  "router": {
+    "min_confidence": 0.5,
+    "timeout": 15.0
+  },
+  "actions": [
+    {
+      "id": "log",
+      "match_hint": "Ação padrão: apenas registrar a notificação no histórico, sem nenhuma consequência externa.",
+      "type": "builtin",
+      "enabled": true,
+      "config": {}
+    },
+    {
+      "id": "telegram",
+      "match_hint": "Enviar alerta pessoal no Telegram: mensagens diretas de contatos, urgências altas e avisos importantes que merecem atenção imediata.",
+      "type": "builtin",
+      "enabled": true,
+      "config": {}
+    },
+    {
+      "id": "finance",
+      "match_hint": "Notificações bancárias e de finanças pessoais para curadoria de gastos: compras aprovadas, Pix enviado ou recebido, pagamentos, débitos, faturas, estornos e qualquer notificação com valores em R$.",
+      "type": "builtin",
+      "enabled": true,
+      "config": {}
+    },
+    {
+      "id": "example_command",
+      "match_hint": "Exemplo de ação externa: executar um programa local com o payload da notificação em argv[1]. Desabilitada por padrão.",
+      "type": "command",
+      "enabled": false,
+      "config": {
+        "command": "/path/to/prog"
+      }
+    }
+  ],
   "rules": [
     {
       "name": "high_urgency",
@@ -32,11 +68,22 @@
         "category": ["promo", "system"]
       },
       "actions": ["log"]
-    },
-    {
-      "name": "default",
-      "condition": {},
-      "actions": ["log"]
     }
-  ]
+  ],
+  "finance": {
+    "enabled": true,
+    "ledger_db": "finance.db",
+    "bank_apps": [],
+    "telegram_summary": false,
+    "categories": [
+      "alimentacao",
+      "transporte",
+      "compras",
+      "saude",
+      "lazer",
+      "servicos",
+      "assinaturas",
+      "outros"
+    ]
+  }
 }
