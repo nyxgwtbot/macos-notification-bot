@@ -29,7 +29,7 @@ MARKERS: List[Tuple[str, str]] = [
     ("SMOKE-E2E-2",
      "smoke e2e bravo: urgent security alert - verify your account now"),
 ]
-TELEGRAM_SKIP_TEXT = "Telegram action SKIPPED"
+TELEGRAM_SKIP_TEXT = "Ação do Telegram IGNORADA"
 EVIDENCE_LIMIT = 240
 
 

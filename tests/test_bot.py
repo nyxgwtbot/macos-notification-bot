@@ -17,7 +17,12 @@ import urllib.error
 from unittest.mock import MagicMock, patch
 import uuid
 
-import bot
+from notifybot.actions import ActionDispatcher, resolve_telegram_config
+from notifybot.classifier import LLMClassifier
+from notifybot.parser import coredata_to_iso, format_uuid, parse_plist_blob
+from notifybot.reader import NotificationReader
+from notifybot.router import RuleRouter
+from notifybot.state import StateManager
 
 
 class TestPlistParserAndReader(unittest.TestCase):
@@ -34,30 +39,30 @@ class TestPlistParserAndReader(unittest.TestCase):
             },
         }
         blob = plistlib.dumps(sample, fmt=plistlib.FMT_BINARY)
-        parsed = bot.parse_plist_blob(blob)
+        parsed = parse_plist_blob(blob)
         self.assertEqual(parsed["app"], "com.apple.MobileSMS")
         self.assertEqual(parsed["req"]["titl"], "Alice")
         self.assertEqual(parsed["req"]["body"], "Lunch?")
 
     def test_parse_plist_blob_corrupt_or_empty(self):
-        self.assertEqual(bot.parse_plist_blob(None), {})
-        self.assertEqual(bot.parse_plist_blob(b""), {})
-        self.assertEqual(bot.parse_plist_blob(b"not a valid plist binary"), {})
+        self.assertEqual(parse_plist_blob(None), {})
+        self.assertEqual(parse_plist_blob(b""), {})
+        self.assertEqual(parse_plist_blob(b"not a valid plist binary"), {})
 
     def test_coredata_to_iso(self):
         # 814583607.0 seconds after 2001-01-01 00:00:00 UTC
-        iso_str = bot.coredata_to_iso(814583607.0)
+        iso_str = coredata_to_iso(814583607.0)
         self.assertTrue(iso_str.startswith("2026-10-25T01:13:27"))
         # Missing or invalid date should return empty string without error
-        self.assertEqual(bot.coredata_to_iso(None), "")
-        self.assertEqual(bot.coredata_to_iso("invalid"), "")
+        self.assertEqual(coredata_to_iso(None), "")
+        self.assertEqual(coredata_to_iso("invalid"), "")
 
     def test_format_uuid(self):
         raw_uuid = uuid.uuid4().bytes
         expected = str(uuid.UUID(bytes=raw_uuid))
-        self.assertEqual(bot.format_uuid(raw_uuid), expected)
-        self.assertEqual(bot.format_uuid(None), "")
-        self.assertEqual(bot.format_uuid(b"short"), "73686f7274")
+        self.assertEqual(format_uuid(raw_uuid), expected)
+        self.assertEqual(format_uuid(None), "")
+        self.assertEqual(format_uuid(b"short"), "73686f7274")
 
     def test_snapshot_and_read_synthetic_db(self):
         """Creates a synthetic SQLite DB with app and record tables, snapshots, and reads."""
@@ -89,7 +94,7 @@ class TestPlistParserAndReader(unittest.TestCase):
             open(f"{db_file}-wal", "w").close()
             open(f"{db_file}-shm", "w").close()
 
-            reader = bot.NotificationReader(db_path=db_file)
+            reader = NotificationReader(db_path=db_file)
             notifs = reader.fetch_notifications(since_rec_id=0)
 
             self.assertEqual(len(notifs), 1)
@@ -130,7 +135,7 @@ class TestPlistParserAndReader(unittest.TestCase):
             conn.commit()
             conn.close()
 
-            reader = bot.NotificationReader(db_path=db_file)
+            reader = NotificationReader(db_path=db_file)
             notifs = reader.fetch_notifications(since_rec_id=0)
 
             self.assertEqual(len(notifs), 1)
@@ -162,7 +167,7 @@ class TestPlistParserAndReader(unittest.TestCase):
             conn.commit()
             conn.close()
 
-            reader = bot.NotificationReader(db_path=db_file)
+            reader = NotificationReader(db_path=db_file)
             notifs = reader.fetch_notifications(since_rec_id=0)
             self.assertEqual(len(notifs), 1)
             self.assertEqual(notifs[0]["title"], "")
@@ -176,7 +181,7 @@ class TestStateManager(unittest.TestCase):
     def test_watermark_and_dedupe(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state_file = os.path.join(tmpdir, "state.json")
-            mgr = bot.StateManager(state_file=state_file, max_recent_uuids=5)
+            mgr = StateManager(state_file=state_file, max_recent_uuids=5)
 
             self.assertEqual(mgr.last_rec_id, 0)
             self.assertFalse(mgr.is_duplicate(1, "uuid-1"))
@@ -195,7 +200,7 @@ class TestStateManager(unittest.TestCase):
 
             # Persist and reload
             mgr.save()
-            mgr2 = bot.StateManager(state_file=state_file, max_recent_uuids=5)
+            mgr2 = StateManager(state_file=state_file, max_recent_uuids=5)
             self.assertEqual(mgr2.last_rec_id, 2)
             self.assertTrue(mgr2.is_duplicate(2, "uuid-2"))
             self.assertTrue(mgr2.is_duplicate(3, "uuid-1"))
@@ -203,7 +208,7 @@ class TestStateManager(unittest.TestCase):
     def test_uuid_cache_capping(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state_file = os.path.join(tmpdir, "state.json")
-            mgr = bot.StateManager(state_file=state_file, max_recent_uuids=3)
+            mgr = StateManager(state_file=state_file, max_recent_uuids=3)
             mgr.record_seen(1, "u1")
             mgr.record_seen(2, "u2")
             mgr.record_seen(3, "u3")
@@ -219,17 +224,17 @@ class TestLLMClassifier(unittest.TestCase):
 
     def test_clean_json_text(self):
         # Normal JSON
-        self.assertEqual(bot.LLMClassifier.clean_json_text('{"a": 1}'), '{"a": 1}')
+        self.assertEqual(LLMClassifier.clean_json_text('{"a": 1}'), '{"a": 1}')
         # Markdown fenced code
         raw = '```json\n{"category": "message", "urgency": "medium", "summary": "Hi"}\n```'
         self.assertEqual(
-            bot.LLMClassifier.clean_json_text(raw),
+            LLMClassifier.clean_json_text(raw),
             '{"category": "message", "urgency": "medium", "summary": "Hi"}',
         )
         # Extra text before and after
         raw2 = 'Sure, here is the JSON:\n{"category": "alert", "urgency": "high", "summary": "Bank"}\nHope this helps!'
         self.assertEqual(
-            bot.LLMClassifier.clean_json_text(raw2),
+            LLMClassifier.clean_json_text(raw2),
             '{"category": "alert", "urgency": "high", "summary": "Bank"}',
         )
 
@@ -247,7 +252,7 @@ class TestLLMClassifier(unittest.TestCase):
         mock_response.read.return_value = json.dumps({"message": {"content": stub_content}}).encode("utf-8")
         mock_urlopen.return_value.__enter__.return_value = mock_response
 
-        classifier = bot.LLMClassifier()
+        classifier = LLMClassifier()
         res = classifier.classify(fixture_1)
 
         self.assertEqual(res["category"], "message")
@@ -268,7 +273,7 @@ class TestLLMClassifier(unittest.TestCase):
         mock_response.read.return_value = json.dumps({"message": {"content": stub_content}}).encode("utf-8")
         mock_urlopen.return_value.__enter__.return_value = mock_response
 
-        classifier = bot.LLMClassifier()
+        classifier = LLMClassifier()
         res = classifier.classify(fixture_2)
 
         self.assertEqual(res["category"], "alert")
@@ -286,7 +291,7 @@ class TestLLMClassifier(unittest.TestCase):
             "subtitle": "",
             "body": "High memory usage",
         }
-        classifier = bot.LLMClassifier()
+        classifier = LLMClassifier()
         res = classifier.classify(notif)
 
         self.assertEqual(res["category"], "other")
@@ -320,7 +325,7 @@ class TestRuleRouter(unittest.TestCase):
                 "actions": ["log"],
             },
         ]
-        self.router = bot.RuleRouter(rules=self.rules)
+        self.router = RuleRouter(rules=self.rules)
 
     def test_high_urgency_precedence(self):
         notif = {"app": "com.bank"}
@@ -344,7 +349,7 @@ class TestRuleRouter(unittest.TestCase):
         self.assertEqual(actions, ["log"])
 
     def test_fallthrough(self):
-        router_no_default = bot.RuleRouter(rules=[
+        router_no_default = RuleRouter(rules=[
             {"name": "only_high", "condition": {"urgency": "high"}, "actions": ["telegram"]}
         ])
         rule, actions = router_no_default.evaluate({}, {"urgency": "low", "category": "misc"})
@@ -358,7 +363,7 @@ class TestActionDispatcherAndTelegram(unittest.TestCase):
     def test_resolve_telegram_config(self):
         # 1. Config takes precedence
         cfg = {"token": "cfg-tok", "chat_id": "cfg-chat"}
-        tok, chat = bot.resolve_telegram_config(cfg)
+        tok, chat = resolve_telegram_config(cfg)
         self.assertEqual(tok, "cfg-tok")
         self.assertEqual(chat, "cfg-chat")
 
@@ -367,7 +372,7 @@ class TestActionDispatcherAndTelegram(unittest.TestCase):
             "TELEGRAM_BOT_TOKEN": "env-tok",
             "TELEGRAM_ALLOWED_USERS": "1111,2222,3333",
         }, clear=True):
-            tok, chat = bot.resolve_telegram_config({})
+            tok, chat = resolve_telegram_config({})
             self.assertEqual(tok, "env-tok")
             self.assertEqual(chat, "1111")
 
@@ -376,7 +381,7 @@ class TestActionDispatcherAndTelegram(unittest.TestCase):
             "TG_BOT_TOKEN": "legacy-tok",
             "TG_CHAT_ID": "legacy-chat",
         }, clear=True):
-            tok, chat = bot.resolve_telegram_config({})
+            tok, chat = resolve_telegram_config({})
             self.assertEqual(tok, "legacy-tok")
             self.assertEqual(chat, "legacy-chat")
 
@@ -384,7 +389,7 @@ class TestActionDispatcherAndTelegram(unittest.TestCase):
         """Correction requirement: missing token => telegram logs SKIPPED, never an error."""
         with tempfile.TemporaryDirectory() as tmpdir:
             log_file = os.path.join(tmpdir, "events.jsonl")
-            dispatcher = bot.ActionDispatcher(
+            dispatcher = ActionDispatcher(
                 log_file=log_file,
                 telegram_token="",
                 telegram_chat_id="",
@@ -416,7 +421,7 @@ class TestActionDispatcherAndTelegram(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             log_file = os.path.join(tmpdir, "events.jsonl")
-            dispatcher = bot.ActionDispatcher(
+            dispatcher = ActionDispatcher(
                 log_file=log_file,
                 telegram_token="valid_token",
                 telegram_chat_id="12345",
@@ -442,7 +447,7 @@ class TestActionDispatcherAndTelegram(unittest.TestCase):
                 f.write("#!/usr/bin/env python3\nimport sys, json\nassert len(sys.argv) > 1\ndata = json.loads(sys.argv[1])\nassert data['event'] == 'notification'\n")
             os.chmod(cmd_script, 0o755)
 
-            dispatcher = bot.ActionDispatcher(log_file=log_file)
+            dispatcher = ActionDispatcher(log_file=log_file)
             notif = {"rec_id": 1, "app": "test", "uuid": "u", "title": "T", "body": "B"}
             classification = {"category": "other", "urgency": "low", "summary": "S"}
 
