@@ -7,7 +7,7 @@ import os
 import subprocess
 import sys
 import urllib.request
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("notification_bot")
 
@@ -71,17 +71,43 @@ def send_telegram_text(token: str, chat_id: str, text: str, parse_mode: Optional
 
 
 class ActionDispatcher:
-    """Dispatches routed actions: log to JSONL & stderr, telegram, external command."""
+    """Dispatches routed actions: log to JSONL & stderr, telegram, external command.
+
+    Supports the Phase 2 action registry:
+    - built-in ids: "log" (implicit), "telegram"
+    - legacy action strings: "command:<path>" (Phase 1 rules)
+    - registry entries of type "command": runs entry["config"]["command"]
+    - registered external handlers (e.g. finance) via register_action()
+    """
 
     def __init__(
         self,
         log_file: str = "logs/events.jsonl",
         telegram_token: str = "",
         telegram_chat_id: str = "",
+        registry: Optional[List[dict]] = None,
+        action_handlers: Optional[Dict[str, Callable]] = None,
     ):
         self.log_file = log_file
         self.telegram_token = telegram_token
         self.telegram_chat_id = telegram_chat_id
+        self.registry: List[dict] = list(registry or [])
+        self._handlers: Dict[str, Callable] = dict(action_handlers or {})
+
+    def register_action(self, action_id: str, handler: Callable) -> None:
+        """Register an executor for an action id (e.g. finance).
+
+        handler(notif, classification, event) -> status string; the handler
+        may enrich the event dict (which is later written to the JSONL log).
+        """
+        self._handlers[action_id] = handler
+
+    def registry_entry(self, action_id: str) -> Optional[dict]:
+        """Find a registry entry by id (enabled or not; rules may override)."""
+        for entry in self.registry:
+            if str(entry.get("id", "")) == action_id:
+                return entry
+        return None
 
     def log_event(self, event_data: dict) -> None:
         """Append event to log_file as a JSON line."""
@@ -195,12 +221,38 @@ class ActionDispatcher:
             results["telegram"] = status
             event["telegram"] = status
 
-        # Command actions
+        # Action resolution: legacy strings, registry entries, registered handlers
         for act in actions:
+            if act in ("log", "telegram"):
+                continue  # handled above (log is recorded implicitly below)
             if act.startswith("command:"):
                 cmd_path = act[len("command:"):].strip()
-                cmd_status = self.execute_command(cmd_path, event)
-                results[act] = cmd_status
+                results[act] = self.execute_command(cmd_path, event)
+                continue
+            if act in self._handlers:
+                try:
+                    results[act] = self._handlers[act](notif, classification, event)
+                except Exception as e:
+                    logger.error("Ação '%s' falhou: %s", act, e)
+                    results[act] = f"error: {e}"
+                continue
+            entry = self.registry_entry(act)
+            if entry is not None:
+                if entry.get("type") == "command":
+                    cmd_path = str(((entry.get("config") or {}).get("command")) or "").strip()
+                    if cmd_path:
+                        results[act] = self.execute_command(cmd_path, event)
+                    else:
+                        logger.warning("Ação '%s' sem comando configurado; IGNORADA.", act)
+                        results[act] = "skipped_no_command"
+                else:
+                    logger.info(
+                        "Ação builtin '%s' sem executor registrado; IGNORADA.", act
+                    )
+                    results[act] = "skipped_no_handler"
+            else:
+                logger.warning("Ação desconhecida '%s'; IGNORADA.", act)
+                results[act] = "skipped_unknown_action"
 
         # Log action (default and explicit)
         results["log"] = "ok"

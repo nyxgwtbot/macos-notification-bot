@@ -11,6 +11,7 @@ import unittest
 import urllib.error
 from unittest.mock import MagicMock, patch
 
+from notifybot.actions import ActionDispatcher
 from notifybot.cli import load_config
 from notifybot.router import LAYER_FALLBACK, LAYER_LLM_ROUTER, LAYER_RULE, LLMRouter, Router
 
@@ -187,6 +188,83 @@ class TestRouterTwoStage(unittest.TestCase):
             decision = router.route(NOTIF, CLASSIFICATION)
         self.assertEqual(decision["layer"], LAYER_LLM_ROUTER)
         self.assertEqual(decision["actions"], ["log"])
+
+
+class TestRegistryDrivenDispatcher(unittest.TestCase):
+    """ActionDispatcher resolves legacy strings, registry entries and handlers."""
+
+    def dispatch_notif(self, dispatcher, actions):
+        notif = {"rec_id": 7, "app": "com.bank", "uuid": "u7", "title": "T", "subtitle": "", "body": "B"}
+        classification = {"category": "other", "urgency": "low", "summary": "S"}
+        return dispatcher.dispatch(actions, notif, classification, rule_name="none", layer=LAYER_LLM_ROUTER, confidence=0.9)
+
+    def test_registered_handler_recovers_event_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "events.jsonl")
+            seen = {}
+
+            def handler(notif, classification, event):
+                seen["rec_id"] = event.get("rec_id")
+                seen["layer"] = event.get("layer")
+                seen["confidence"] = event.get("confidence")
+                event["finance"] = {"status": "ok"}
+                return "ok"
+
+            dispatcher = ActionDispatcher(log_file=log_file)
+            dispatcher.register_action("finance", handler)
+            results = self.dispatch_notif(dispatcher, ["finance"])
+
+            self.assertEqual(results["finance"], "ok")
+            self.assertEqual(seen["rec_id"], 7)
+            self.assertEqual(seen["layer"], LAYER_LLM_ROUTER)
+            self.assertAlmostEqual(seen["confidence"], 0.9)
+            with open(log_file, "r", encoding="utf-8") as f:
+                event = json.loads(f.readline().strip())
+            self.assertEqual(event["finance"], {"status": "ok"})
+            self.assertEqual(event["action_results"]["finance"], "ok")
+            self.assertEqual(event["layer"], LAYER_LLM_ROUTER)
+            self.assertEqual(event["router_payload"], {})
+
+    def test_finance_without_handler_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dispatcher = ActionDispatcher(
+                log_file=os.path.join(tmpdir, "events.jsonl"),
+                registry=[e for e in make_registry() if e["id"] == "finance"],
+            )
+            results = self.dispatch_notif(dispatcher, ["finance"])
+            self.assertEqual(results["finance"], "skipped_no_handler")
+
+    def test_registry_command_action(self):
+        cmd_script = os.path.join(tempfile.gettempdir(), "notifybot_test_cmd.py")
+        with open(cmd_script, "w") as f:
+            f.write("#!/usr/bin/env python3\nimport sys, json\nd=json.loads(sys.argv[1]); assert d['event']\n")
+        os.chmod(cmd_script, 0o755)
+        registry = [{
+            "id": "example_command", "match_hint": "Exemplo.",
+            "type": "command", "enabled": False, "config": {"command": cmd_script},
+        }]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dispatcher = ActionDispatcher(
+                log_file=os.path.join(tmpdir, "events.jsonl"),
+                registry=registry,
+            )
+            results = self.dispatch_notif(dispatcher, ["example_command"])
+            self.assertEqual(results["example_command"], "ok")
+
+    def test_unknown_action_skipped(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dispatcher = ActionDispatcher(log_file=os.path.join(tmpdir, "events.jsonl"))
+            results = self.dispatch_notif(dispatcher, ["mystery_action"])
+            self.assertEqual(results["mystery_action"], "skipped_unknown_action")
+            self.assertEqual(results["log"], "ok")
+
+    def test_handler_exception_is_reported_not_raised(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dispatcher = ActionDispatcher(log_file=os.path.join(tmpdir, "events.jsonl"))
+            dispatcher.register_action("finance", lambda n, c, e: 1 / 0)
+            results = self.dispatch_notif(dispatcher, ["finance"])
+            self.assertTrue(results["finance"].startswith("error:"))
+            self.assertEqual(results["log"], "ok")
 
 
 if __name__ == "__main__":
