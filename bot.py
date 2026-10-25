@@ -175,6 +175,14 @@ class NotificationReader:
         If reverse is True, orders DESC (e.g. for --dump). Default is ASC (for daemon chronological processing).
         """
         def _query(conn: sqlite3.Connection) -> List[dict]:
+            # Prefill app_cache from the snapshot's app table so bundle-id
+            # resolution has a warm entry for every known app_id, even when
+            # the record blob already embeds an `app` value.
+            prefill = conn.cursor()
+            prefill.execute("SELECT app_id, identifier FROM app")
+            for row_app_id, row_identifier in prefill:
+                self.app_cache[row_app_id] = row_identifier or ""
+
             order = "DESC" if reverse else "ASC"
             sql = f"SELECT rec_id, app_id, uuid, data, delivered_date, presented FROM record WHERE rec_id > ? ORDER BY rec_id {order}"
             params: list = [since_rec_id]
