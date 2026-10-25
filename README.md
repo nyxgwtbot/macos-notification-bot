@@ -196,7 +196,9 @@ when customizing `telegram.*`, list both.
 ## Rules
 
 Rules are evaluated top-down in the order they appear in `config.json`; the first rule
-whose condition matches is used, and only its actions run.
+whose condition matches decides the extra actions. The local event log always records
+the notification: the `event` line is appended unconditionally, whatever the rule's
+`actions` list contains.
 
 Condition semantics:
 
@@ -222,12 +224,13 @@ Condition keys and where they come from:
 | `body` | notification | notification body text |
 | `presented` | notification | `true` / `false` |
 
-Available actions (a rule lists any combination, executed in order):
+Available actions (a rule lists any combination; `telegram` always runs before any
+`command:<path>` actions, regardless of the order they are listed in):
 
 | Action | Behavior |
 | --- | --- |
-| `log` | Append an `event` JSON line to `log_file` (JSONL) and print a human-readable line to stderr |
-| `telegram` | Send a formatted message via the Telegram Bot API; status is `ok`, `skipped` (no credentials), or `error: ...` |
+| `log` | Effectively a no-op marker: the `event` JSON line and the human-readable stderr line for every processed notification are written regardless of the rule's `actions`, and `action_results.log` is always `ok` |
+| `telegram` | Send a formatted message via the Telegram Bot API; always executed before any `command:<path>` actions (listed order is not honored for telegram-vs-command); status is `ok`, `skipped` (no credentials), or `error: ...` |
 | `command:<path>` | Run an external command with a JSON serialization of the event as `argv[1]` (not stdin). 30-second timeout; exit code 0 -> `ok`, non-zero -> `exit_<code>`, otherwise `timeout` / `error: ...` |
 
 The default rules shipped in `config.json` are shown verbatim in the

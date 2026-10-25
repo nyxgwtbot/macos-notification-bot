@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """End-to-end smoke test for the macOS notification bot.
 
-Step 0 reuses complete evidence from a previous run (no post, no bot run).
-Otherwise it posts two osascript notifications, runs ``bot.py --once`` (at
-most twice), and verifies received/classified/routed evidence in the JSONL
-log. The script only READS ``logs/events.jsonl`` and never touches
-``.bot_state.json``. Telegram SKIPPED is acceptable and never a failure.
+Step 0 reuses complete evidence from a previous run; markers that already have
+complete evidence are never re-posted, so a partial rerun only posts the
+markers still lacking it. Posted markers trigger at most two ``bot.py --once``
+runs, after which received/classified/routed evidence is verified in the JSONL
+log.
+
+The script itself never resets or deletes ``.bot_state.json`` or
+``logs/events.jsonl``, but the ``bot.py --once`` subprocess it invokes loads and
+saves ``.bot_state.json`` (advancing the watermark) and appends to the event
+log, so a smoke run consumes its notifications. Failures are sticky: a failed
+osascript post or a bot run that exits non-zero fails the script outright even
+if evidence appears later. Telegram SKIPPED is reported but never asserted
+(report-only, by design).
 """
 
 import json
@@ -250,22 +258,31 @@ def main() -> int:
     existing = {marker: best_marker_event(records, marker) for marker, _ in MARKERS}
     all_ok = True
 
-    if all(has_full_evidence(existing[marker]) for marker, _ in MARKERS):
+    # Per-marker reuse: never re-post a marker that already has full evidence.
+    pending = [
+        (marker, body) for marker, body in MARKERS
+        if not has_full_evidence(existing[marker])
+    ]
+
+    if not pending:
         # Step 0: idempotent reuse — no notification posted, no bot run.
         all_ok &= print_check(
             "reuse", True,
             "found complete evidence for SMOKE-E2E-1/SMOKE-E2E-2 from a "
             "previous run; no new notifications posted")
     else:
-        for marker, body in MARKERS:  # always attempt both posts
+        for marker, body in pending:  # only markers still lacking evidence
             all_ok &= post_notification(repo_root, marker, body)
-        time.sleep(1.5)  # allow the db2 write to land
+        time.sleep(6.0)  # allow new db2 rows to land (RESEARCH.md: ~2-6 s)
         all_ok &= report_bot_run(1, run_bot(repo_root))
         records = read_events(log_path)
 
-        missing = [m for m, _ in MARKERS if best_marker_event(records, m) is None]
+        missing = [
+            marker for marker, _ in pending
+            if best_marker_event(records, marker) is None
+        ]
         if missing:  # bounded retry: at most two bot invocations total
-            time.sleep(3)
+            time.sleep(2)
             all_ok &= report_bot_run(2, run_bot(repo_root))
             records = read_events(log_path)
 
