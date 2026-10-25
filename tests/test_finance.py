@@ -198,6 +198,21 @@ class TestFinanceCurator(unittest.TestCase):
         self.assertEqual(result["reason"], "invalid_amount")
 
 
+    def test_curate_description_falls_back_to_title(self):
+        curator = FinanceCurator(categories=["outros"], bank_apps=[])
+        result = curator.curate(self.notif(body="Compra: R$ 10,00"), None)
+        self.assertEqual(result["transaction"]["description"], "Itaú")
+
+    def test_curate_raw_json_keeps_body_for_marker_matching(self):
+        curator = FinanceCurator(categories=["outros"], bank_apps=[])
+        result = curator.curate(self.notif(body="Compra aprovada: R$ 7,00 SMOKE-MARKER"), None)
+        self.assertEqual(result["status"], "ok")
+        tx = result["transaction"]
+        self.assertEqual(tx["amount"], Decimal("7"))
+        self.assertIn("SMOKE-MARKER", str(tx["raw"]))
+        self.assertEqual(tx["kind"], "gasto")
+
+
 class TestFinanceExtractorLLM(unittest.TestCase):
     """Tolerant LLM fallback extraction (mocked HTTP)."""
 
