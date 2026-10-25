@@ -1,3 +1,4 @@
 # Reflections Index
 
 - [llm-budget-smoke-idempotency.md](llm-budget-smoke-idempotency.md) — one live LLM classification per session; smoke script's per-marker reuse is load-bearing; unit suite must stay fully mocked; db2/osascript write lag ~2-6 s; event-log stage evidence lives inside `notification` events.
+- [phase2-finance-smoke-learnings.md](phase2-finance-smoke-learnings.md) — finance smoke: marker bodies must be unambiguously bank-flavored (person-like text gets classified `message` and rules-first legitimately skips finance); evidence readers unwrap JSONL record→event; reusable HTML reports require finance.db older than the report (mtime); `bot.py report` always spends one insights call.
