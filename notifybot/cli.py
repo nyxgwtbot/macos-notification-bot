@@ -8,11 +8,18 @@ import signal
 import subprocess
 import sys
 import time
-from typing import List
+from typing import List, Optional, Tuple
 
 from notifybot.actions import ActionDispatcher, resolve_telegram_config
 from notifybot.classifier import LLMClassifier
+from notifybot.finance import (
+    DEFAULT_CATEGORIES,
+    FinanceCurator,
+    FinanceExtractorLLM,
+    FinanceLedger,
+)
 from notifybot.reader import NotificationReader
+from notifybot.report import FinanceReporter, fmt_brl, validate_month
 from notifybot.router import LLMRouter, Router
 from notifybot.state import StateManager
 
@@ -272,7 +279,134 @@ def build_router(config: dict) -> Router:
     return Router(rules=config.get("rules", []), llm_router=llm_router)
 
 
+def build_finance_runtime(config: dict, dispatcher: ActionDispatcher) -> Optional[FinanceLedger]:
+    """
+    Wire the finance action into the dispatcher when config.finance.enabled.
+
+    Creates the SQLite ledger and the notification curator (regex + LLM
+    fallback extraction) and registers the 'finance' action handler that
+    writes curated transactions idempotently. Returns the ledger (kept
+    alive by the handler closure), or None when finance is disabled.
+    """
+    finance_cfg = config.get("finance", {}) or {}
+    if not finance_cfg.get("enabled", True):
+        return None
+
+    ollama_cfg = config.get("ollama", {})
+    router_cfg = config.get("router", {})
+    extractor = FinanceExtractorLLM(
+        url=ollama_cfg.get("url", "http://127.0.0.1:11434/api/chat"),
+        model=ollama_cfg.get("model", "glm-5.3-flash:cloud"),
+        timeout=float(router_cfg.get("timeout", 15.0)),
+    )
+    curator = FinanceCurator(
+        categories=finance_cfg.get("categories") or DEFAULT_CATEGORIES,
+        bank_apps=finance_cfg.get("bank_apps") or [],
+        extractor=extractor,
+    )
+    ledger = FinanceLedger(db_path=finance_cfg.get("ledger_db", "finance.db"))
+
+    def finance_handler(notif: dict, classification: dict, event: dict) -> str:
+        result = curator.curate(notif, classification)
+        if result["status"] != "ok":
+            event["finance"] = {
+                "status": result["status"],
+                "reason": result.get("reason"),
+            }
+            logger.info(
+                "Notificação financeira sem valor utilizável (rec_id=%s); IGNORADA (%s).",
+                result.get("rec_id"), result.get("reason"),
+            )
+            return "skipped"
+        tx = result["transaction"]
+        insert_status = ledger.insert_transaction(tx)
+        event["finance"] = {
+            "status": "ok",
+            "method": result["method"],
+            "stored": insert_status,
+            "rec_id": tx["rec_id"],
+            "amount": str(tx["amount"]),
+            "kind": tx["kind"],
+            "category": tx["category"],
+            "description": tx["description"],
+        }
+        if insert_status == "ignored":
+            logger.info(
+                "Transação duplicada no ledger (rec_id=%s); IGNORADA (idempotente).",
+                tx["rec_id"],
+            )
+        else:
+            logger.info(
+                "Gasto registrado: %s — %s (%s) [camada de extração: %s]",
+                fmt_brl(tx["amount"]),
+                tx["kind"],
+                tx["category"],
+                result["method"],
+            )
+        return "ok"
+
+    dispatcher.register_action("finance", finance_handler)
+    return ledger
+
+
+def cmd_report(config: dict, month: Optional[str], reports_dir: str = "reports") -> int:
+    """Handle `bot.py report [--month YYYY-MM]`: HTML report + markdown summary."""
+    finance_cfg = config.get("finance", {}) or {}
+    if not finance_cfg.get("enabled", True):
+        print("O plugin finance está desabilitado (config.finance.enabled = false).", file=sys.stderr)
+        return 2
+    try:
+        month = validate_month(month)
+    except ValueError as e:
+        print(f"Erro: {e}", file=sys.stderr)
+        return 2
+
+    ledger = FinanceLedger(db_path=finance_cfg.get("ledger_db", "finance.db"))
+    try:
+        tg_token, tg_chat_id = resolve_telegram_config(config.get("telegram"))
+        reporter = FinanceReporter(
+            ledger=ledger,
+            ollama_cfg=config.get("ollama", {}),
+            categories=finance_cfg.get("categories") or DEFAULT_CATEGORIES,
+            telegram_summary=bool(finance_cfg.get("telegram_summary", False)),
+            telegram_token=tg_token,
+            telegram_chat_id=tg_chat_id,
+            llm_timeout=float(config.get("router", {}).get("timeout", 15.0)),
+            reports_dir=reports_dir,
+        )
+        result = reporter.build(month)
+        print(result["markdown"])
+        logger.info("Relatório salvo em %s", result["html_path"])
+        if reporter.telegram_summary:
+            logger.info("Resumo via Telegram: %s", result["telegram"])
+    finally:
+        ledger.close()
+    return 0
+
+
 def main() -> int:
+    argv = sys.argv[1:]
+
+    # `python3 bot.py report [--month YYYY-MM]` subcommand (Phase 2)
+    if argv and argv[0] == "report":
+        parser = argparse.ArgumentParser(
+            prog="bot.py report",
+            description="Gera o relatório financeiro (curadoria de gastos) em HTML + markdown",
+        )
+        parser.add_argument("--config", default="config.json", help="Path to config.json")
+        parser.add_argument(
+            "--month",
+            default=None,
+            help="Mês do relatório no formato AAAA-MM (padrão: mês atual)",
+        )
+        args = parser.parse_args(argv[1:])
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+        )
+        config = load_config(args.config)
+        return cmd_report(config, args.month)
+
     parser = argparse.ArgumentParser(description="macOS Notification Bot")
     parser.add_argument("--config", default="config.json", help="Path to config.json")
     parser.add_argument(
@@ -330,13 +464,15 @@ def main() -> int:
         state_mgr.last_rec_id = args.watermark
 
     classifier = build_classifier(config)
-
     tg_token, tg_chat_id = resolve_telegram_config(config.get("telegram"))
     dispatcher = ActionDispatcher(
         log_file=log_file,
         telegram_token=tg_token,
         telegram_chat_id=tg_chat_id,
+        registry=config.get("actions", []),
     )
+    # Wire the finance action (no-op when config.finance.enabled is false)
+    build_finance_runtime(config, dispatcher)
 
     router = build_router(config)
 

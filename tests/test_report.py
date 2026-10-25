@@ -247,5 +247,81 @@ def month_label_prev(month: str) -> str:
     return previous_month(month)
 
 
+class TestCmdReport(unittest.TestCase):
+    """Offline CLI report subcommand (cmd_report) verification."""
+
+    def _config(self, tmpdir):
+        return {
+            "ollama": {"url": "http://127.0.0.1:11434/api/chat", "model": "m", "timeout": 5},
+            "router": {"min_confidence": 0.5, "timeout": 5},
+            "telegram": {"token": "", "chat_id": ""},
+            "finance": {
+                "enabled": True,
+                "ledger_db": os.path.join(tmpdir, "finance.db"),
+                "bank_apps": [],
+                "telegram_summary": False,
+                "categories": ["alimentacao", "outros"],
+            },
+        }
+
+    def test_cmd_report_writes_html_and_prints_markdown(self):
+        import contextlib
+        import io
+
+        from notifybot.cli import cmd_report
+        from notifybot.finance import FinanceLedger
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._config(tmpdir)
+            ledger = FinanceLedger(config["finance"]["ledger_db"])
+            ledger.insert_transaction(make_tx(5, "88.90", f"{validate_month(None)}-02T10:00:00-03:00",
+                                             category="alimentacao", description="Padaria"))
+            ledger.close()
+
+            reporter_dir = os.path.join(tmpdir, "reports")
+            with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cmd_report(config, validate_month(None), reports_dir=reporter_dir)
+            self.assertEqual(rc, 0)
+            html_path = os.path.join(reporter_dir, f"{validate_month(None)}.html")
+            self.assertTrue(os.path.exists(html_path))
+            html_content = open(html_path, encoding="utf-8").read()
+            self.assertGreaterEqual(html_content.count("<svg"), 3)
+            self.assertIn("Insights", html_content)
+            stdout_text = buf.getvalue()
+            self.assertIn("Relatório Financeiro", stdout_text)
+            self.assertIn("R$ 88,90", stdout_text)
+
+    def test_cmd_report_rejects_bad_month(self):
+        import contextlib
+        import io
+
+        from notifybot.cli import cmd_report
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = cmd_report(self._config(tmpdir), "2026-13", reports_dir=tmpdir)
+            self.assertEqual(rc, 2)
+            self.assertIn("Mês inválido", buf_err.getvalue())
+
+    def test_cmd_report_disabled_finance(self):
+        import contextlib
+        import io
+
+        from notifybot.cli import cmd_report
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._config(tmpdir)
+            config["finance"]["enabled"] = False
+            buf_err = io.StringIO()
+            with contextlib.redirect_stderr(buf_err):
+                rc = cmd_report(config, None, reports_dir=tmpdir)
+            self.assertEqual(rc, 2)
+            self.assertIn("desabilitado", buf_err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

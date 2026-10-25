@@ -267,5 +267,131 @@ class TestRegistryDrivenDispatcher(unittest.TestCase):
             self.assertEqual(results["log"], "ok")
 
 
+class TestRunCycleFinanceWiring(unittest.TestCase):
+    """Offline integration: run_cycle routes a bank notification to finance → ledger."""
+
+    def _make_synthetic_db(self, db_file):
+        import plistlib
+        import sqlite3
+        conn = sqlite3.connect(db_file)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE app (app_id INTEGER PRIMARY KEY, identifier VARCHAR, badge INTEGER);")
+        cur.execute(
+            "CREATE TABLE record (rec_id INTEGER PRIMARY KEY, app_id INTEGER, uuid BLOB, "
+            "data BLOB, delivered_date REAL, presented Bool);"
+        )
+        cur.execute("INSERT INTO app VALUES (1, 'com.itau', 0);")
+        sample = {
+            "app": "com.itau",
+            "date": 814583607.0,
+            "req": {
+                "titl": "Itaú",
+                "subt": "banco",
+                "body": "Compra aprovada: R$ 123,45 no iFood - Restaurante",
+            },
+        }
+        blob = plistlib.dumps(sample, fmt=plistlib.FMT_BINARY)
+        cur.execute("INSERT INTO record VALUES (99, 1, NULL, ?, 814583607.0, 1);", (blob,))
+        conn.commit()
+        conn.close()
+
+    def test_run_cycle_routes_finance_and_fills_ledger(self):
+        import datetime
+        import plistlib
+        import sqlite3 as sql3
+        from unittest.mock import MagicMock
+
+        from notifybot.actions import ActionDispatcher
+        from notifybot.cli import build_finance_runtime, run_cycle
+        from notifybot.finance import FinanceLedger
+        from notifybot.reader import NotificationReader
+        from notifybot.router import LLMRouter, Router
+        from notifybot.state import StateManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_file = os.path.join(tmpdir, "db")
+            self._make_synthetic_db(db_file)
+            state_file = os.path.join(tmpdir, "state.json")
+            log_file = os.path.join(tmpdir, "events.jsonl")
+            ledger_path = os.path.join(tmpdir, "finance.db")
+
+            config = {
+                "state_file": state_file,
+                "log_file": log_file,
+                "ollama": {"url": "http://127.0.0.1:11434/api/chat", "model": "m", "timeout": 5},
+                "router": {"min_confidence": 0.5, "timeout": 5},
+                "actions": [
+                    {"id": "log", "match_hint": "Registrar.", "type": "builtin", "enabled": True, "config": {}},
+                    {"id": "telegram", "match_hint": "Alertas pessoais.", "type": "builtin", "enabled": True, "config": {}},
+                    {"id": "finance", "match_hint": "Bancárias e gastos em R$.", "type": "builtin", "enabled": True, "config": {}},
+                ],
+                "rules": [],
+                "finance": {
+                    "enabled": True,
+                    "ledger_db": ledger_path,
+                    "bank_apps": [],
+                    "categories": ["alimentacao", "outros"],
+                    "telegram_summary": False,
+                },
+                "telegram": {"token": "", "chat_id": ""},
+            }
+
+            dispatcher = ActionDispatcher(
+                log_file=log_file, telegram_token="", telegram_chat_id="",
+                registry=config["actions"],
+            )
+            build_finance_runtime(config, dispatcher)
+            router = Router(
+                rules=[],
+                llm_router=LLMRouter(actions_registry=config["actions"], min_confidence=0.5, timeout=5),
+            )
+            state_mgr = StateManager(state_file=state_file)
+            reader = NotificationReader(db_path=db_file)
+            classifier = MagicMock()
+            classifier.classify.return_value = {
+                "category": "other", "urgency": "medium", "summary": "Compra no iFood",
+            }
+
+            with mock_ollama('{"action_id": "finance", "confidence": 0.95, "payload": {}}'):
+                processed = run_cycle(
+                    reader=reader, state_mgr=state_mgr, classifier=classifier,
+                    router=router, dispatcher=dispatcher, is_startup=True, mode="once",
+                )
+            self.assertEqual(processed, 1)
+
+            # Ledger row created with decimal-safe amount
+            ledger = FinanceLedger(ledger_path)
+            records = ledger.month_records(datetime.datetime.now().astimezone().strftime("%Y-%m"))
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["rec_id"], 99)
+            self.assertEqual(str(records[0]["amount"]), "123.45")
+            self.assertEqual(records[0]["kind"], "gasto")
+            self.assertEqual(records[0]["category"], "alimentacao")
+            ledger.close()
+
+            # Event line carries layer + finance evidence
+            with open(log_file, "r", encoding="utf-8") as f:
+                events = [json.loads(line.strip()) for line in f if line.strip()]
+            notif_events = [e for e in events if e.get("event") == "notification"]
+            self.assertEqual(len(notif_events), 1)
+            event = notif_events[0]
+            self.assertEqual(event["layer"], LAYER_LLM_ROUTER)
+            self.assertAlmostEqual(event["confidence"], 0.95)
+            self.assertEqual(event["finance"]["status"], "ok")
+            self.assertEqual(event["finance"]["method"], "regex")
+            self.assertEqual(event["finance"]["stored"], "inserted")
+            self.assertEqual(event["action_results"]["finance"], "ok")
+
+            # Idempotency: rerunning the same cycle adds no duplicate row
+            state_mgr2 = StateManager(state_file=state_file)
+            reader2 = NotificationReader(db_path=db_file)
+            processed2 = run_cycle(
+                reader=reader2, state_mgr=state_mgr2, classifier=classifier,
+                router=router, dispatcher=dispatcher, is_startup=False, mode="once",
+            )
+            self.assertEqual(processed2, 0)
+
+
+
 if __name__ == "__main__":
     unittest.main()
