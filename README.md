@@ -1,28 +1,46 @@
 # macOS Notification Bot
 
 A small, zero-dependency Python bot that reads macOS system notifications, classifies
-them with a local LLM, and routes them by rules: to the event log, to Telegram, or to
-external commands. Runs as a daemon or one-shot, with no special macOS permissions.
+them with a local LLM, and routes them in **two stages** — deterministic rules first,
+then an LLM-based action router (Router v2) that picks among a configurable action
+registry (event log, Telegram, finance curation, external commands). Includes a
+**finance tracking plugin** that extracts Brazilian bank-notification transactions
+(`R$ 1.234,56`-style amounts) into a local SQLite ledger and renders HTML reports with
+inline SVG charts and PT-BR insights. Runs as a daemon or one-shot, with no special
+macOS permissions.
 
 ## Overview
 
 The bot polls the macOS Notification Center SQLite database (`db2`) every couple of
 seconds, parses the binary plists stored in each record, sends the text to a local
-Ollama model for classification (category, urgency, one-line summary), matches the
-result against a top-down rule list, and runs the actions of the first matching rule.
+Ollama model for classification (category, urgency, one-line summary), routes the
+result in two stages, and runs the chosen actions:
+
+1. **Deterministic rules** (`config.json` `rules`) are evaluated top-down; the first
+   match wins and overrides everything else (backward compatible with Phase 1).
+2. **Non-matching notifications** go to the LLM router, which sees only the *enabled*
+   actions of the registry (`id` + `match_hint`) and answers
+   `{"action_id": ..., "confidence": ..., "payload": ...}`. Decisions with confidence
+   below `router.min_confidence` (default `0.5`), unknown ids, or any LLM failure fall
+   back to the `log` builtin.
 
 Key properties:
 
 - **Stdlib only.** Python 3.9 (the stock `/usr/bin/python3` on macOS 12 works), no pip
-  installs, no pyobjc, no private APIs.
+  installs, no pyobjc, no private APIs — the HTML reports draw charts with hand-rolled
+  inline SVG (no matplotlib).
 - **Zero TCC prompts.** It never asks for Accessibility, Full Disk Access, or screen
   recording. See [Permissions (zero TCC)](#permissions-zero-tcc).
 - **Graceful degradation.** If Ollama is unreachable or returns unparsable output, each
   notification still falls back to `category: "other"`, `urgency: "low"`, and a summary
-  taken from the title/body (truncated to 120 characters). The bot keeps running.
+  taken from the title/body (truncated to 120 characters); the router falls back to the
+  `log` action. The bot keeps running.
 - **Deduplication.** macOS writes a record when a notification is delivered and again
   when it is presented; the bot suppresses duplicates with a `rec_id` watermark plus a
   recent-UUID window, persisted atomically to `.bot_state.json`.
+- **Idempotent finance ledger.** Curated bank transactions are stored by `rec_id`
+  (`INSERT OR IGNORE`), so re-processing never duplicates a row; all monetary math
+  uses `decimal.Decimal`.
 
 Requirements:
 
@@ -35,7 +53,8 @@ Requirements:
 
 ## Architecture
 
-Short version: poll -> parse -> dedupe -> classify -> route -> act.
+Short version: poll -> parse -> dedupe -> classify -> route (rules, then LLM) -> act
+(+ finance plugin on money notifications).
 
 ```
 Notification Center db2 (SQLite + binary plists)
@@ -47,9 +66,18 @@ Dedupe: rec_id watermark + recent-UUID window  (.bot_state.json)
   v
 Classify via local Ollama (any error -> fallback: other / low / summary<=120)
   v
-Route: top-down rules, first match wins
+Route (two stages):
+  1. config.rules top-down, first match wins          -> layer "rule"
+  2. LLM router over enabled actions (id+match_hint)  -> layer "llm_router"
+     (low confidence / unknown id / LLM error -> "log" builtin
+      with layer "fallback_in_fallback")
   v
-Actions: log (events.jsonl) | telegram | command:<path> (JSON as argv[1], 30s timeout)
+Actions: log | telegram | finance | command:<path> / registry "command" actions
+             |                |
+      events.jsonl     FinanceCurator -> FinanceLedger (finance.db, idempotent)
+                                |
+                        `bot.py report` -> reports/<YYYY-MM>.html (inline SVG)
+                                        -> markdown summary (+ optional Telegram)
 ```
 
 Details worth knowing:
@@ -69,7 +97,7 @@ Details worth knowing:
 - **Config merge is shallow.** Any top-level key present in `config.json` replaces the
   built-in default entirely. If you supply an `ollama` object, specify all three keys
   (`url`, `model`, `timeout`); if you supply `telegram`, specify both `token` and
-  `chat_id`; `rules` are replaced as a whole.
+  `chat_id`; `rules`, `actions`, `router` and `finance` are replaced as a whole.
 
 ## Quick start
 
@@ -90,7 +118,11 @@ python3 bot.py --dump
 # 5. Run one poll cycle end-to-end (classification + routing + logging)
 python3 bot.py --once
 
-# 6. Run as a daemon (default mode). Ctrl-C stops it cleanly.
+# 6. Generate the finance report from the local ledger (see Finance tracking)
+python3 bot.py report                # current month
+python3 bot.py report --month 2026-10
+
+# 7. Run as a daemon (default mode). Ctrl-C stops it cleanly.
 python3 bot.py
 ```
 
@@ -125,6 +157,8 @@ When no credentials are configured, `telegram` actions are skipped with a logged
 | `--config <path>` | Use this JSON config instead of `config.json` |
 | `--db-path <path>` | Override the Notification Center `db2` database path (advanced) |
 | `--watermark <int>` | Override the starting `last_rec_id` watermark for this run (advanced, see Troubleshooting) |
+| `report` | Subcommand: `python3 bot.py report [--month AAAA-MM]` — writes `reports/<month>.html`, prints the PT-BR markdown summary, and optionally sends it via Telegram (`finance.telegram_summary`) |
+| `--month <AAAA-MM>` | Month of the `report` subcommand (default: current month); invalid months exit with code 2 |
 
 ## Configuration
 
@@ -144,6 +178,42 @@ Default `config.json` (verbatim from the repo):
     "token": "",
     "chat_id": ""
   },
+  "router": {
+    "min_confidence": 0.5,
+    "timeout": 15.0
+  },
+  "actions": [
+    {
+      "id": "log",
+      "match_hint": "Ação padrão: apenas registrar a notificação no histórico, sem nenhuma consequência externa.",
+      "type": "builtin",
+      "enabled": true,
+      "config": {}
+    },
+    {
+      "id": "telegram",
+      "match_hint": "Enviar alerta pessoal no Telegram: mensagens diretas de contatos, urgências altas e avisos importantes que merecem atenção imediata.",
+      "type": "builtin",
+      "enabled": true,
+      "config": {}
+    },
+    {
+      "id": "finance",
+      "match_hint": "Notificações bancárias e de finanças pessoais para curadoria de gastos: compras aprovadas, Pix enviado ou recebido, pagamentos, débitos, faturas, estornos e qualquer notificação com valores em R$.",
+      "type": "builtin",
+      "enabled": true,
+      "config": {}
+    },
+    {
+      "id": "example_command",
+      "match_hint": "Exemplo de ação externa: executar um programa local com o payload da notificação em argv[1]. Desabilitada por padrão.",
+      "type": "command",
+      "enabled": false,
+      "config": {
+        "command": "/path/to/prog"
+      }
+    }
+  ],
   "rules": [
     {
       "name": "high_urgency",
@@ -165,13 +235,24 @@ Default `config.json` (verbatim from the repo):
         "category": ["promo", "system"]
       },
       "actions": ["log"]
-    },
-    {
-      "name": "default",
-      "condition": {},
-      "actions": ["log"]
     }
-  ]
+  ],
+  "finance": {
+    "enabled": true,
+    "ledger_db": "finance.db",
+    "bank_apps": [],
+    "telegram_summary": false,
+    "categories": [
+      "alimentacao",
+      "transporte",
+      "compras",
+      "saude",
+      "lazer",
+      "servicos",
+      "assinaturas",
+      "outros"
+    ]
+  }
 }
 ```
 
@@ -182,23 +263,32 @@ Configuration keys:
 | `poll_interval` | float (seconds) | `2.0` | Daemon sleep between poll cycles |
 | `state_file` | path | `.bot_state.json` | Dedup watermark + recent UUID window; created at runtime |
 | `log_file` | path | `logs/events.jsonl` | JSONL event log (one JSON object per line; directory is created if missing) |
-| `ollama.url` | URL | `http://127.0.0.1:11434/api/chat` | Classification endpoint (Ollama `POST /api/chat`, `stream: false`) |
-| `ollama.model` | string | `glm-5.3-flash:cloud` | Model name the request must use |
+| `ollama.url` | URL | `http://127.0.0.1:11434/api/chat` | Classification/routing endpoint (Ollama `POST /api/chat`, `stream: false`) |
+| `ollama.model` | string | `glm-5.3-flash:cloud` | Model name every LLM request must use |
 | `ollama.timeout` | float (seconds) | `30.0` | HTTP timeout for one classification call |
 | `telegram.token` | string | `""` | Bot token. Falls back to env `TELEGRAM_BOT_TOKEN` first, then `TG_BOT_TOKEN` |
 | `telegram.chat_id` | string | `""` | Target chat. Falls back to the first entry of comma-split env `TELEGRAM_ALLOWED_USERS`, then `TG_CHAT_ID` |
-| `rules` | list | see above | Ordered routing rules; first match wins |
+| `router.min_confidence` | float 0–1 | `0.5` | Router v2 decisions below this confidence fall back to `log` |
+| `router.timeout` | float (seconds) | `15.0` | Strict HTTP timeout for one router/finance-extraction/insights call |
+| `actions` | list | see above | Extensible action registry consumed by the LLM router (details below) |
+| `rules` | list | see above | Ordered deterministic rules evaluated BEFORE the LLM router |
+| `finance.enabled` | bool | `true` | Master switch for the finance plugin |
+| `finance.ledger_db` | path | `finance.db` | SQLite ledger path (created at runtime) |
+| `finance.bank_apps` | list of strings | `[]` | Allowlist of app/bundle substrings; **empty = ingest from every app** the router decides is finance-related |
+| `finance.telegram_summary` | bool | `false` | When true, `bot.py report` also sends the text summary via Telegram |
+| `finance.categories` | list | 8 categories above | Category vocabulary for curation and reports; unknown categories map to `outros` |
 
 Note on overrides: the merge is shallow. `{"ollama": {"model": "..."} }` would discard
 the default `url` and `timeout`. When customizing `ollama.*`, list all three keys;
-when customizing `telegram.*`, list both.
+when customizing `telegram.*`, list both; when customizing `router`/`finance`/`actions`,
+include the keys you care about plus the defaults you want to keep.
 
 ## Rules
 
-Rules are evaluated top-down in the order they appear in `config.json`; the first rule
-whose condition matches decides the extra actions. The local event log always records
-the notification: the `event` line is appended unconditionally, whatever the rule's
-`actions` list contains.
+Rules are the **first routing stage** and are evaluated top-down in the order they
+appear in `config.json`; the first rule whose condition matches decides the actions and
+skips the LLM router entirely. The local event log always records the notification: the
+`event` line is appended unconditionally, whatever the rule's `actions` list contains.
 
 Condition semantics:
 
@@ -206,10 +296,13 @@ Condition semantics:
   the notification record. A key that exists in neither means the rule cannot match.
 - String comparison is case-insensitive.
 - A list value means "matches any of these" (`"category": ["promo", "system"]` is an OR).
-- An empty condition `{}` always matches; put such a catch-all rule last.
+- An empty condition `{}` always matches. **The shipped config has no catch-all rule
+  on purpose** so unmatched notifications flow into the LLM router. If you add one,
+  put it last and be aware it will suppress Router v2.
 - No glob/wildcard or substring matching: values are compared for equality only.
-- If no rule matches at all (for example, you removed the default rule), the bot
-  applies a built-in fallthrough named `default_fallthrough` with `["log"]`.
+- If no rule matches, the notification goes to **Router v2** (LLM router). When the
+  router cannot decide either (low confidence, unknown id, Ollama down), the built-in
+  fallthrough routes to `["log"]`.
 
 Condition keys and where they come from:
 
@@ -231,15 +324,110 @@ Available actions (a rule lists any combination; `telegram` always runs before a
 | --- | --- |
 | `log` | Effectively a no-op marker: the `event` JSON line and the human-readable stderr line for every processed notification are written regardless of the rule's `actions`, and `action_results.log` is always `ok` |
 | `telegram` | Send a formatted message via the Telegram Bot API; always executed before any `command:<path>` actions (listed order is not honored for telegram-vs-command); status is `ok`, `skipped` (no credentials), or `error: ...` |
-| `command:<path>` | Run an external command with a JSON serialization of the event as `argv[1]` (not stdin). 30-second timeout; exit code 0 -> `ok`, non-zero -> `exit_<code>`, otherwise `timeout` / `error: ...` |
+| `finance` | Curate the notification as a bank transaction (regex first, LLM fallback extraction) and store it in `finance.db`; executed only when registered by the finance plugin (i.e. `finance.enabled` is true) |
+| `command:<path>` | Legacy Phase 1 form: run an external command with a JSON serialization of the event as `argv[1]` (not stdin). 30-second timeout; exit code 0 -> `ok`, non-zero -> `exit_<code>`, otherwise `timeout` / `error: ...` |
+| registry action ids | Any id from the `actions` registry works in rules too; registry entries of type `command` run `config.command` with the event JSON in `argv[1]` |
+
+## Router v2 (LLM actions)
+
+When no deterministic rule matches, the notification is decided by the LLM router
+(`notifybot/router.py`). Everything is explainable in the event log:
+
+- The prompt contains **only the enabled actions'** `id` + `match_hint` (both in
+  PT-BR), the notification fields, and its classification. Disabled or unknown actions
+  are never offered and never executed.
+- The model answers the JSON `{"action_id": "...", "confidence": 0.0-1.0,
+  "payload": {...}}`. Parsing is tolerant (markdown fences, stray text, confidence
+  given as a percentage).
+- Decisions with `confidence < router.min_confidence` or with a non-registered id fall
+  back to the `log` builtin.
+- Every notification event line records the routing **layer**:
+  - `"rule"` — a deterministic rule matched,
+  - `"llm_router"` — the LLM chose a registered action,
+  - `"fallback_in_fallback"` — the router itself fell back to `log`
+    (`confidence` + the failure `reason` in the LLMRouter decision are kept in the
+    event's `confidence` / router payload fields).
+
+### Example: registering an action
+
+```json
+{
+  "id": "example_command",
+  "match_hint": "Exemplo de ação externa: executar um programa local com o payload da notificação em argv[1].",
+  "type": "command",
+  "enabled": true,
+  "config": { "command": "/usr/local/bin/meu_script.sh" }
+}
+```
+
+The `match_hint` is the contract with the LLM: describe, in PT-BR, *which
+notifications belong to this action*. The LLM reads only the hints, so a good hint is
+worth ten rules.
+
+## Finance tracking (curadoria de gastos)
+
+The `finance` action turns bank/spending notifications into a local ledger — the
+repo's default registry ships the owner's example: *"notificações bancárias →
+curadoria de gastos"*.
+
+Pipeline (`notifybot/finance.py`):
+
+1. **Regex-first extraction** of Brazilian amounts across `title`, `subtitle` and
+   `body`: `R$ 1.234,56`, `R$ 1234,56`, `R$ 1234.56`, `R$ 50,00`, `R$ 45`,
+   `R$ 1.234` (thousands), and bare decimals (`compra de 30,00`). Currency-prefixed
+   values win over bare ones; integers without separators (`final 1234`) are ignored.
+2. **Transaction kind** via Brazilian banking keywords: `gasto` (compra aprovada, Pix
+   enviado, débito, fatura...), `recebimento` (Pix recebido, estorno, reembolso...),
+   `outro` otherwise. `recebimento` is checked first so "pagamento recebido" is
+   classified as income.
+3. **Category** mapped to the configured vocabulary (`alimentacao`, `transporte`,
+   `compras`, `saude`, `lazer`, `servicos`, `assinaturas`, `outros`) with keyword
+   heuristics (iFood → `alimentacao`, "Mercado Livre" → `compras`, Netflix →
+   `assinaturas`...); unknown categories fall back to `outros`.
+4. **LLM fallback extraction** when the regex finds no amount: a strict-timeout
+   Ollama call returns `{amount, kind, category, description}`; failures skip cleanly
+   (`no_amount` / `invalid_amount` — no row is stored).
+5. **Ledger** (`finance.db`, SQLite): `expenses(rec_id PRIMARY KEY, ts, bundle,
+   amount REAL, kind, category, description, raw_json)`. Insertion is idempotent by
+   `rec_id` (`INSERT OR IGNORE`); `ts` is ISO-8601 in **local time**; all aggregation
+   uses `decimal.Decimal`.
+6. **Event log evidence**: the notification line gains a `finance` object with
+   `status`, `method` (`regex` / `llm`), `stored` (`inserted` / `ignored`),
+   `amount`, `kind`, `category` — this is what `scripts/smoke_finance.py` verifies.
+
+### Report command
+
+```bash
+python3 bot.py report               # current month
+python3 bot.py report --month 2026-10
+```
+
+Writes `reports/<AAAAMM>.html` and prints a PT-BR markdown summary to stdout. The HTML
+report contains, all as hand-rolled inline SVG (no external libs):
+
+- **Gastos por categoria** — horizontal bar chart with BRL value labels;
+- **Distribuição por categoria** — donut chart with percentage legend;
+- **Evolução diária (acumulado)** — cumulative daily spend line;
+- **Insights** — 3 to 5 PT-BR bullets seeded with computed stats (dominant category,
+  biggest expense, busiest day, month-over-month delta when the previous month has
+  data), generated via Ollama; a deterministic PT-BR fallback keeps the section alive
+  when the LLM is unreachable;
+- **Transações** — full table of the month (date, amount, kind, category,
+  description).
+
+Semantics: **"Total gasto" = `gasto` + `outro` rows**; `recebimento` rows stay in the
+ledger and the transaction table (and appear as "Recebimentos: +R$ ...") but are
+excluded from expense charts. With `finance.telegram_summary: true`, the markdown
+summary is also sent to Telegram (plain text; missing credentials are a clean skip).
 
 The default rules shipped in `config.json` are shown verbatim in the
 [Configuration](#configuration) section above.
 
 ### Example: custom rule
 
-To route banking app notifications to a local script, add a rule above the catch-all.
-Both a condition on `app` and classification keys can coexist (all keys must match):
+To route banking app notifications to a local script deterministically, add a rule at
+the top of the list. Both a condition on `app` and classification keys can coexist
+(all keys must match):
 
 ```json
 {
@@ -276,11 +464,21 @@ Notification event:
 ```json
 {"event": "notification", "timestamp": "...", "rec_id": ..., "app": ..., "uuid": ...,
  "title": ..., "subtitle": ..., "body": ..., "classification": {"category": ..., "urgency": ..., "summary": ...},
- "rule_matched": ..., "actions": [...], "action_results": {...}}
+ "rule_matched": ..., "layer": "rule|llm_router|fallback_in_fallback", "confidence": ...,
+ "router_payload": {...}, "actions": [...], "action_results": {...}}
 ```
 
-An optional top-level `"telegram"` key appears only when a `telegram` action ran for
-that notification; its value is `"ok"`, `"skipped"`, or `"error: ..."`.
+- `layer` records which routing stage decided: `"rule"` (a deterministic rule
+  matched; `rule_matched` holds its name), `"llm_router"` (the LLM chose a registered
+  action, with `confidence` in `0..1`), or `"fallback_in_fallback"` (the router itself
+  fell back to the `log` builtin — `confidence` may still carry the LLM's value, and
+  the router payload keeps the failure reason).
+- `rule_matched` is `"none"` when no deterministic rule matched.
+- An optional top-level `"telegram"` key appears only when a `telegram` action ran for
+  that notification; its value is `"ok"`, `"skipped"`, or `"error: ..."`.
+- An optional top-level `"finance"` key appears when a finance action ran; it carries
+  `status` (`ok`/`skipped`), `method` (`regex`/`llm`), `stored` (`inserted`/`ignored`),
+  `rec_id`, `amount`, `kind`, `category` and `description`.
 
 Real sample line from this repo's log:
 
@@ -326,9 +524,24 @@ notification history, so treat this file as the bot's durable archive of what it
    ```
 
 6. **Telegram shows `skipped` in the log.** No token/chat_id could be resolved. The
-   precedence is `config.json telegram.token` > `TELEGRAM_BOT_TOKEN` > `TG_BOT_TOKEN`,
-   and `config.json telegram.chat_id` > first entry of `TELEGRAM_ALLOWED_USERS` >
-   `TG_CHAT_ID`. Unconfigured Telegram is a clean skip, not a failure.
+    precedence is `config.json telegram.token` > `TELEGRAM_BOT_TOKEN` > `TG_BOT_TOKEN`,
+    and `config.json telegram.chat_id` > first entry of `TELEGRAM_ALLOWED_USERS` >
+    `TG_CHAT_ID`. Unconfigured Telegram is a clean skip, not a failure.
+
+7. **Everything routes to `log` with layer `fallback_in_fallback`.** The Router v2 LLM
+    call failed, timed out (`router.timeout`, default 15 s), or the confidence was
+    below `router.min_confidence`. Check `curl http://127.0.0.1:11434/api/tags`.
+
+8. **No report after `bot.py report`, or empty insights.** The `finance` plugin only
+    stores rows for notifications the router decided are finance-related. Verify that
+    `finance.enabled` is `true`, that bank notifications actually carry `R$` values
+    (regex needs a decimal separator for bare amounts), and that `finance.db` exists
+    after a fresh `--once`. Ollama-unreachable runs still produce the report with
+    deterministic PT-BR insights.
+
+9. **Reset the finance ledger.** Rows are keyed by `rec_id`, so re-processing a
+    notification never duplicates. To start over, stop the bot and delete the SQLite
+    file (`rm finance.db` plus `-wal`/`-shm` siblings if present) — it is gitignored.
 
 ## Permissions (zero TCC)
 
@@ -374,36 +587,62 @@ synthetic binary plist fixture):
 python3 -m unittest discover -s tests
 ```
 
-End-to-end smoke test:
+End-to-end smoke tests:
 
 ```bash
-python3 scripts/smoke_e2e.py
+python3 scripts/smoke_e2e.py      # Phase 1 pipeline: ingest -> classify -> route -> log
+python3 scripts/smoke_finance.py  # Phase 2 finance: 3 synthetic bank notifications ->
+                                  #   ledger rows in finance.db -> reports/<month>.html
 ```
 
-What it does: posts 2 demo notifications via `osascript`, runs `bot.py --once`, and
-verifies the pipeline evidence (ingestion, classification, routing) in
+`scripts/smoke_e2e.py`: posts 2 demo notifications via `osascript`, runs `bot.py --once`,
+and verifies the pipeline evidence (ingestion, classification, routing) in
 `logs/events.jsonl`. A Telegram result of `SKIPPED` (because credentials are not set in
 your environment) is acceptable and is not a failure. The script is idempotent: on
 reruns it reuses prior evidence and does not post or classify again.
 
+`scripts/smoke_finance.py`: posts 3 synthetic bank notifications with distinct `R$`
+amounts via `osascript`, runs `bot.py --once` (bounded to 2 runs; db2 rows settle for
+~2-6 s), verifies each marker has routed evidence (`layer` field) plus a matching
+`finance.db` row, generates the monthly report via `bot.py report`, and asserts the
+HTML contains 3+ `<svg>` elements, an `Insights` section, and the marker amounts.
+Idempotent exactly like the e2e smoke: complete evidence (routed + finance event +
+ledger row) means the marker is never re-posted, so reruns consume zero LLM calls and
+never regenerate the report unless it is missing.
+
 ## Project layout
 
 ```
-bot.py                  Everything: db2 reader, plist parser, state manager, classifier,
-                        rule router, action dispatcher, CLI
-config.json             Runtime configuration (polling, Ollama, Telegram, rules)
-tests/                  Offline unit suite:
+bot.py                  Thin CLI entrypoint (forwards to notifybot.cli.main)
+notifybot/              Implementation package:
+  parser.py               binary plist decoding, CoreData timestamps, UUID helpers
+  reader.py               Notification Center db2 snapshot reader
+  state.py                watermark + recent-UUID dedup manager
+  classifier.py           Ollama classification with tolerant JSON parsing
+  router.py               Router v2: deterministic rules + LLM action router
+  actions.py              action dispatcher (log/telegram/command/registry/handlers)
+  finance.py              FinanceCurator (regex + LLM fallback) + FinanceLedger (SQLite)
+  report.py               inline SVG chart engine + FinanceReporter (HTML/markdown/PT-BR insights)
+  cli.py                  CLI logic: poll loop wiring, `report` subcommand, config defaults
+config.json             Runtime configuration (polling, Ollama, Telegram, router,
+                        actions registry, finance, rules)
+tests/                  Offline unit suite (router, finance, report, bot):
                           python3 -m unittest discover -s tests
 scripts/
-  smoke_e2e.py          End-to-end smoke test:
+  smoke_e2e.py          Phase 1 end-to-end smoke test:
                           python3 scripts/smoke_e2e.py
+  smoke_finance.py      Phase 2 finance end-to-end smoke test:
+                          python3 scripts/smoke_finance.py
 PLAN.md                 Implementation plan (steps, acceptance criteria, risk notes)
+PLAN-PHASE2.md          Phase 2 plan (Router v2 + finance plugin)
 RESEARCH.md             Architecture findings: approach evaluation, zero-TCC rationale,
                         Monterey vs Sequoia sections, AI routing notes
 .bot_state.json         Runtime state (watermark + recent UUIDs) — gitignored
+finance.db              SQLite finance ledger — gitignored; created by the bot
 logs/
   events.jsonl          Runtime event log (JSONL) — gitignored; created by the bot
+reports/                Generated monthly HTML reports — gitignored
 ```
 
-The two runtime artifacts, `.bot_state.json` and `logs/`, are generated in place and
-listed in `.gitignore`; do not commit them.
+The runtime artifacts (`.bot_state.json`, `logs/`, `finance.db` and `reports/`) are
+generated in place and listed in `.gitignore`; do not commit them.
