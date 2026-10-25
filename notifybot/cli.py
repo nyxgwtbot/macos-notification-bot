@@ -10,10 +10,10 @@ import sys
 import time
 from typing import List
 
-from notifybot.actions import ActionDispatcher
+from notifybot.actions import ActionDispatcher, resolve_telegram_config
 from notifybot.classifier import LLMClassifier
 from notifybot.reader import NotificationReader
-from notifybot.router import RuleRouter
+from notifybot.router import LLMRouter, Router
 from notifybot.state import StateManager
 
 logger = logging.getLogger("notification_bot")
@@ -23,7 +23,7 @@ def run_cycle(
     reader: NotificationReader,
     state_mgr: StateManager,
     classifier: LLMClassifier,
-    router: RuleRouter,
+    router: Router,
     dispatcher: ActionDispatcher,
     is_startup: bool = False,
     mode: str = "daemon",
@@ -51,8 +51,16 @@ def run_cycle(
             continue
 
         classification = classifier.classify(notif)
-        rule_name, actions = router.evaluate(notif, classification)
-        dispatcher.dispatch(actions, notif, classification, rule_name)
+        decision = router.route(notif, classification)
+        dispatcher.dispatch(
+            decision["actions"],
+            notif,
+            classification,
+            rule_name=decision.get("rule_matched") or "none",
+            layer=decision.get("layer"),
+            confidence=decision.get("confidence"),
+            router_payload=decision.get("payload"),
+        )
 
         state_mgr.record_seen(rec_id, notif_uuid)
         state_mgr.save()
@@ -240,6 +248,30 @@ def dump_notifications(reader: NotificationReader, count: int = 10) -> None:
         )
 
 
+def build_classifier(config: dict) -> LLMClassifier:
+    """Build the LLM classifier from the ollama config section."""
+    ollama_cfg = config.get("ollama", {})
+    return LLMClassifier(
+        url=ollama_cfg.get("url", "http://127.0.0.1:11434/api/chat"),
+        model=ollama_cfg.get("model", "glm-5.3-flash:cloud"),
+        timeout=float(ollama_cfg.get("timeout", 30.0)),
+    )
+
+
+def build_router(config: dict) -> Router:
+    """Build the two-stage Router v2: deterministic rules first, LLM router otherwise."""
+    ollama_cfg = config.get("ollama", {})
+    router_cfg = config.get("router", {})
+    llm_router = LLMRouter(
+        actions_registry=config.get("actions", []),
+        url=ollama_cfg.get("url", "http://127.0.0.1:11434/api/chat"),
+        model=ollama_cfg.get("model", "glm-5.3-flash:cloud"),
+        timeout=float(router_cfg.get("timeout", 15.0)),
+        min_confidence=float(router_cfg.get("min_confidence", 0.5)),
+    )
+    return Router(rules=config.get("rules", []), llm_router=llm_router)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="macOS Notification Bot")
     parser.add_argument("--config", default="config.json", help="Path to config.json")
@@ -297,12 +329,7 @@ def main() -> int:
     if args.watermark is not None:
         state_mgr.last_rec_id = args.watermark
 
-    ollama_cfg = config.get("ollama", {})
-    classifier = LLMClassifier(
-        url=ollama_cfg.get("url", "http://127.0.0.1:11434/api/chat"),
-        model=ollama_cfg.get("model", "glm-5.3-flash:cloud"),
-        timeout=float(ollama_cfg.get("timeout", 30.0)),
-    )
+    classifier = build_classifier(config)
 
     tg_token, tg_chat_id = resolve_telegram_config(config.get("telegram"))
     dispatcher = ActionDispatcher(
@@ -311,7 +338,7 @@ def main() -> int:
         telegram_chat_id=tg_chat_id,
     )
 
-    router = RuleRouter(rules=config.get("rules", []))
+    router = build_router(config)
 
     if args.once:
         run_cycle(

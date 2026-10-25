@@ -77,9 +77,14 @@ def evaluate_record(record: Dict[str, Any]) -> Dict[str, Any]:
     results = event.get("action_results")
     results = results if isinstance(results, dict) else {}
     rule = event.get("rule_matched")
+    layer = event.get("layer")
     classified = isinstance(summary, str) and summary.strip() != ""
+    # Routing evidence: a named rule match, or Router v2 layer metadata
+    # ("rule" | "llm_router" | "fallback_in_fallback").
+    routed_rule = isinstance(rule, str) and rule.strip() != "" and rule != "none"
+    routed_layer = layer in ("rule", "llm_router", "fallback_in_fallback")
     routed = (
-        isinstance(rule, str) and rule.strip() != ""
+        (routed_rule or routed_layer)
         and isinstance(actions, list) and len(actions) > 0
         and results.get("log") == "ok"
     )
@@ -90,6 +95,7 @@ def evaluate_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "category": cls.get("category"),
         "urgency": cls.get("urgency"),
         "rule": rule if isinstance(rule, str) else "",
+        "layer": layer if isinstance(layer, str) else "",
         "actions": actions if isinstance(actions, list) else [],
         "telegram": event.get("telegram", results.get("telegram")),
     }
@@ -218,8 +224,8 @@ def report_marker(marker: str, record: Optional[Dict[str, Any]]) -> bool:
          % (c["summary"], c["category"], c["urgency"], raw)
          if c["classified"] else "classification.summary empty/missing | %s" % raw),
         ("routed[%s]" % marker, c["routed"],
-         "rule_matched=%r actions=%r action_results.log='ok' | %s"
-         % (c["rule"], c["actions"], raw)
+         "layer=%r rule_matched=%r actions=%r action_results.log='ok' | %s"
+         % (c["layer"], c["rule"], c["actions"], raw)
          if c["routed"] else "incomplete routing evidence | %s" % raw),
     ]
     telegram = c["telegram"]

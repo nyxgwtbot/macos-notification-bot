@@ -158,9 +158,16 @@ class ActionDispatcher:
         actions: List[str],
         notif: dict,
         classification: dict,
-        rule_name: str,
+        rule_name: str = "none",
+        layer: Optional[str] = None,
+        confidence: Optional[float] = None,
+        router_payload: Optional[dict] = None,
     ) -> Dict[str, str]:
-        """Dispatch actions according to rule results."""
+        """Dispatch actions according to the routed decision.
+
+        layer: "rule" | "llm_router" | "fallback_in_fallback" (Router v2).
+        confidence / router_payload carry LLM router decision metadata.
+        """
         results: Dict[str, str] = {}
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
@@ -176,6 +183,9 @@ class ActionDispatcher:
             "body": notif.get("body"),
             "classification": classification,
             "rule_matched": rule_name,
+            "layer": layer,
+            "confidence": confidence if confidence is not None else None,
+            "router_payload": dict(router_payload or {}),
             "actions": actions,
         }
 
@@ -198,7 +208,8 @@ class ActionDispatcher:
 
         # Write to stderr
         readable_line = (
-            f"[{now_iso}] [REGRA: {rule_name}] [AÇÕES: {','.join(actions)}] "
+            f"[{now_iso}] [CAMADA: {layer or 'n/a'}] [REGRA: {rule_name}] "
+            f"[AÇÕES: {','.join(actions)}] "
             f"{notif.get('app', 'app')} - {notif.get('title', '')}: {notif.get('body', '')} "
             f"(Resumo: {classification.get('summary', '')})"
         )
