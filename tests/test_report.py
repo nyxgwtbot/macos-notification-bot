@@ -194,7 +194,9 @@ class TestFinanceReporter(unittest.TestCase):
         self.assertIn("R$ 123,45", html_content)  # table evidence
         md = result["markdown"]
         self.assertIn("Relatório Financeiro", md)
-        self.assertIn("R$ 1.558,01", md)  # 123.45+200+1234.56
+        # 123.45 + 1234.56 (gastos) — the recebimento row is NOT summed into total
+        self.assertIn("R$ 1.358,01", md)
+        self.assertIn("**Recebimentos:** +R$ 200,00", md)
         self.assertIn("## Insights", md)
         self.assertIn("anterior", md)  # MoM comparison present
         self.assertIn("R$ 50,00", md)  # previous month total present
@@ -240,6 +242,20 @@ class TestFinanceReporter(unittest.TestCase):
         ])
         self.assertIn("Nenhuma transação registrada", result["html"])
         self.assertGreaterEqual(result["html"].count("<svg"), 3)  # empty-state svgs
+
+    def test_report_income_kept_out_of_category_charts(self):
+        """/recebimento rows stay in the ledger/table but out of expense charts."""
+        now_month = validate_month(None)
+        self.ledger.insert_transaction(make_tx(6, "300.00", f"{now_month}-21T10:00:00-03:00",
+                                               category="saude", kind="recebimento",
+                                               description="Pix recebido"))
+        reporter = FinanceReporter(ledger=self.ledger, reports_dir=self._tmp.name)
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+            result = reporter.build(month=now_month)
+        md = result["markdown"]
+        self.assertIn("+R$ 500,00", md)  # 200 (farmacia) + 300 recebimentos
+        self.assertIn("R$ 1.358,01", md)  # gasto total unchanged
+        self.assertNotIn("saude: R$ 300,00", md)  # income not a category bar
 
 
 def month_label_prev(month: str) -> str:

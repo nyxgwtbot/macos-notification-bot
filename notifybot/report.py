@@ -327,9 +327,14 @@ class FinanceReporter:
     # ---------- stats ----------
 
     def compute_stats(self, month: str) -> dict:
-        totals = self.ledger.month_totals(month)
+        """Monthly stats: expense views (gasto+outro) plus recebimentos."""
+        totals = self.ledger.month_totals(month, kinds=("gasto", "outro"))
+        total_records = self.ledger.month_records(month, kinds=("recebimento",))
+        receb_total = sum(
+            (Decimal(str(r["amount"])) for r in total_records), Decimal("0")
+        )
         prev_month = previous_month(month)
-        prev_totals = self.ledger.month_totals(prev_month)
+        prev_totals = self.ledger.month_totals(prev_month, kinds=("gasto", "outro"))
         prev_total = prev_totals["total"]
         prev_has_data = prev_totals["count"] > 0
 
@@ -366,12 +371,14 @@ class FinanceReporter:
             "month": month,
             "total": total,
             "count": totals["count"],
-            "by_category": by_category,
-            "by_day": by_day,
+            "by_category": totals["by_category"],
+            "by_day": totals["by_day"],
             "biggest": biggest,
             "dominant_category": dominant_category,
             "dominant_value": dominant_value,
             "busiest_day": busiest_day,
+            "receb_total": receb_total,
+            "receb_count": len(total_records),
             "prev_month": prev_month,
             "prev_total": prev_total,
             "prev_has_data": prev_has_data,
@@ -383,21 +390,29 @@ class FinanceReporter:
     def fallback_insights(self, stats: dict) -> List[str]:
         """Deterministic PT-BR insights (used when the LLM is unreachable)."""
         insights: List[str] = []
-        if stats["count"] == 0:
+        if stats["count"] == 0 and stats["receb_count"] == 0:
             return [
                 "Nenhuma transação registrada neste mês — acompanhe as notificações "
                 "bancárias para começar a curadoria de gastos.",
             ]
-        insights.append(
-            f"Total do mês: {fmt_brl(stats['total'])} em {stats['count']} transação(ões)."
-        )
+        if stats["count"] > 0:
+            insights.append(
+                f"Total gasto no mês: {fmt_brl(stats['total'])} em {stats['count']} transação(ões)."
+            )
+        else:
+            insights.append("Nenhum gasto registrado neste mês.")
+        if stats["receb_count"] > 0:
+            insights.append(
+                f"Recebimentos no mês: +{fmt_brl(stats['receb_total'])} "
+                f"({stats['receb_count']} transação(ões))."
+            )
         if stats["dominant_category"]:
             dom = stats["dominant_category"]
             dom_val = stats["dominant_value"]
             share = (dom_val / stats["total"] * Decimal("100")) if stats["total"] > 0 else Decimal("0")
             insights.append(
                 f"Categoria dominante: {dom} ({fmt_brl(dom_val)}, "
-                f"{fmt_pct(share)} do total)."
+                f"{fmt_pct(share)} do total gasto)."
             )
         if stats["biggest"]:
             big = stats["biggest"]
@@ -421,8 +436,13 @@ class FinanceReporter:
         lines = [
             f"Mês da análise: {stats['month']}",
             f"Total gasto: {fmt_brl(stats['total'])}",
-            f"Número de transações: {stats['count']}",
+            f"Número de transações de gasto: {stats['count']}",
         ]
+        if stats["receb_count"] > 0:
+            lines.append(
+                f"Recebimentos do mês: +{fmt_brl(stats['receb_total'])} "
+                f"({stats['receb_count']} transação(ões))"
+            )
         for cat, val in sorted(
             stats["by_category"].items(), key=lambda kv: kv[1], reverse=True
         )[:5]:
@@ -507,9 +527,14 @@ class FinanceReporter:
             "<body><div class='wrap'>",
             f"<h1>{_escape(title)}</h1>",
             "<div class='card'><strong>Resumo do mês</strong><br>",
-            f"Total: <strong>{_escape(fmt_brl(stats['total']))}</strong> em "
+            f"Total gasto: <strong>{_escape(fmt_brl(stats['total']))}</strong> em "
             f"{stats['count']} transação(ões).",
         ]
+        if stats["receb_count"] > 0:
+            parts.append(
+                f"<br>Recebimentos: <strong>+{_escape(fmt_brl(stats['receb_total']))}</strong> "
+                f"em {stats['receb_count']} transação(ões)."
+            )
         if stats["prev_has_data"] and stats["mom_delta"] is not None:
             direction = "acima" if stats["mom_delta"] >= 0 else "abaixo"
             parts.append(
@@ -568,8 +593,14 @@ class FinanceReporter:
         lines = [
             f"# Relatório Financeiro — {month_label_pt(month)}",
             "",
-            f"**Total:** {fmt_brl(stats['total'])} · **Transações:** {stats['count']}",
+            f"**Total gasto:** {fmt_brl(stats['total'])} · "
+            f"**Transações:** {stats['count']}",
         ]
+        if stats["receb_count"] > 0:
+            lines.append(
+                f"**Recebimentos:** +{fmt_brl(stats['receb_total'])} "
+                f"({stats['receb_count']} transação(ões))"
+            )
         if stats["prev_has_data"] and stats["mom_delta"] is not None:
             direction = "acima" if stats["mom_delta"] >= 0 else "abaixo"
             lines.append(

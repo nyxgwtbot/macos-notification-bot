@@ -91,18 +91,25 @@ class FinanceLedger:
             cur = self.conn.execute(self.INSERT_SQL, row)
         return "inserted" if cur.rowcount == 1 else "ignored"
 
-    def month_records(self, month: str) -> List[dict]:
+    def month_records(self, month: str, kinds: Optional[List[str]] = None) -> List[dict]:
         """All ledger rows whose local ts string starts with 'YYYY-MM'.
 
-        Filtered via substr(ts, 1, 7) so local-time ISO strings are never
-        re-normalized (SQLite date math could shift days across months
-        with a UTC offset).
+        kinds filters by transaction kind (e.g. ("gasto", "outro") for expense
+        views); None keeps every kind. Filtered via substr(ts, 1, 7) so
+        local-time ISO strings are never re-normalized (SQLite date math
+        could shift days across months with a UTC offset).
         """
-        cur = self.conn.execute(
+        sql = (
             "SELECT rec_id, ts, bundle, amount, kind, category, description, raw_json "
-            "FROM expenses WHERE substr(ts, 1, 7) = ? ORDER BY ts ASC",
-            (month,),
+            "FROM expenses WHERE substr(ts, 1, 7) = ?"
         )
+        params = [month]
+        if kinds:
+            placeholders = ",".join("?" for _ in kinds)
+            sql += f" AND kind IN ({placeholders})"
+            params.extend(kinds)
+        sql += " ORDER BY ts ASC"
+        cur = self.conn.execute(sql, params)
         records = []
         for rec_id, ts, bundle, amount, kind, category, description, raw_json in cur.fetchall():
             records.append(
@@ -119,12 +126,17 @@ class FinanceLedger:
             )
         return records
 
-    def month_totals(self, month: str) -> dict:
-        """Decimal-safe monthly aggregates (total, by_category, by_day, max_tx)."""
-        records = self.month_records(month)
+    def month_totals(self, month: str, kinds: Optional[List[str]] = None) -> dict:
+        """Decimal-safe monthly aggregates (total, by_category, by_day, by_kind, max_tx).
+
+        kinds filters to expense views (e.g. ("gasto", "outro")); None keeps
+        every kind. All sums use decimal.Decimal over str(amount).
+        """
+        records = self.month_records(month, kinds=kinds)
         total = Decimal("0")
         by_category = {}
         by_day = {}
+        by_kind = {}
         max_tx = None
         max_amount = Decimal("-1")
         for r in records:
@@ -135,6 +147,8 @@ class FinanceLedger:
             day = r["ts"][:10] if r["ts"] else ""
             if day:
                 by_day[day] = by_day.get(day, Decimal("0")) + amount
+            kind = r["kind"]
+            by_kind[kind] = by_kind.get(kind, Decimal("0")) + amount
             if amount > max_amount:
                 max_amount = amount
                 max_tx = r
@@ -144,6 +158,7 @@ class FinanceLedger:
             "total": total,
             "by_category": by_category,
             "by_day": by_day,
+            "by_kind": by_kind,
             "max_tx": max_tx,
         }
 
