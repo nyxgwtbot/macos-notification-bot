@@ -34,7 +34,7 @@ MARKERS: List[Dict[str, str]] = [
     {
         "marker": "SMOKE-FIN-2",
         "title": "SMOKE-FIN-2 Banco",
-        "body": "SMOKE-FIN-2 pix recebido de R$ 200,00 de Maria Souza",
+        "body": "SMOKE-FIN-2 transacao bancaria: pix recebido de R$ 200,00 na sua conta corrente",
         "amount": "200.00",
         "brl": "R$ 200,00",
     },
@@ -107,9 +107,11 @@ def marker_event(
     return best
 
 
-def event_routing_ok(event: Optional[Dict[str, Any]]) -> bool:
-    if not event:
+def event_routing_ok(record: Optional[Dict[str, Any]]) -> bool:
+    """Routing evidence from a JSONL record (record wrapper with 'event' key)."""
+    if not record:
         return False
+    event = record.get("event") or {}
     layer = event.get("layer")
     if layer in ("rule", "llm_router", "fallback_in_fallback"):
         return True
@@ -117,9 +119,10 @@ def event_routing_ok(event: Optional[Dict[str, Any]]) -> bool:
     return isinstance(rule, str) and rule.strip() != "" and rule != "none"
 
 
-def event_finance_ok(event: Optional[Dict[str, Any]]) -> bool:
-    if not event:
+def event_finance_ok(record: Optional[Dict[str, Any]]) -> bool:
+    if not record:
         return False
+    event = record.get("event") or {}
     finance = event.get("finance")
     return isinstance(finance, dict) and finance.get("status") == "ok"
 
@@ -211,19 +214,19 @@ def run_bot(repo_root: Path, mode: str = "--once") -> Dict[str, Any]:
                 "error": "bot.py failed to start: %s" % exc}
 
 
-def report_bot_run(number: int, result: Dict[str, Any]) -> bool:
+def report_bot_run(number: Any, result: Dict[str, Any]) -> bool:
     output = (result["stdout"] + "\n" + result["stderr"]).strip()
     if result["ok"]:
         note = "exit 0"
         if "IGNORADA (token ou chat_id ausentes)" in output:
             note += "; telegram SKIPPED (acceptable)"
-        return print_check("bot run %d" % number, True, note)
+        return print_check("bot run %s" % number, True, note)
     evidence = result["error"]
     if not evidence:
         tail = (result["stderr"] or result["stdout"]).strip()
         evidence = "exit %s; stderr tail: %s" % (
             result["returncode"], truncate(tail, 400) or "(empty)")
-    return print_check("bot run %d" % number, False, evidence)
+    return print_check("bot run %s" % number, False, evidence)
 
 
 def main() -> int:
@@ -262,28 +265,30 @@ def main() -> int:
     # Per-marker evidence: routing layer, finance ingestion, ledger row.
     for item in MARKERS:
         marker = item["marker"]
-        event = marker_event(records, marker)
-        routed = event_routing_ok(event)
-        finance_ingested = event_finance_ok(event)
+        record = marker_event(records, marker)
+        routed = event_routing_ok(record)
+        finance_ingested = event_finance_ok(record)
         rows = ledger_rows_by_marker(db_path, marker)
         amount_rows = [r for r in rows if r["amount"] == Decimal(item["amount"])]
 
-        if event is None:
+        if record is None:
             all_ok &= print_check(f"routed[{marker}]", False, "no notification event with marker")
+            all_ok &= print_check(f"finance[{marker}]", False, "no notification event with marker")
         else:
+            event = record["event"]
             layer = event.get("layer")
             all_ok &= print_check(
                 f"routed[{marker}]", routed,
                 "layer=%s actions=%s confidence=%s | %s"
                 % (layer, event.get("actions"), event.get("confidence"),
-                   truncate(event["raw"]))
-                if routed else "no routing evidence | %s" % truncate(event["raw"]),
+                   truncate(record["raw"]))
+                if routed else "no routing evidence | %s" % truncate(record["raw"]),
             )
-        all_ok &= print_check(
-            f"finance[{marker}]", finance_ingested,
-            "finance event: %s" % truncate((event or {}).get("finance"))
-            if finance_ingested else "no finance OK evidence in event",
-        )
+            all_ok &= print_check(
+                f"finance[{marker}]", finance_ingested,
+                "finance event: %s" % truncate(event.get("finance"))
+                if finance_ingested else "no finance OK evidence in event",
+            )
         if amount_rows:
             row = amount_rows[0]
             all_ok &= print_check(
@@ -299,9 +304,18 @@ def main() -> int:
                 % (item["brl"], len(rows)),
             )
 
-    # Report generation: reuse the existing HTML when present, else generate.
-    if not report_path.exists():
+    # Report generation: reuse the existing HTML when fresh (ledger unchanged
+    # since generation), regenerate when missing or stale.
+    report_fresh = report_path.exists()
+    if report_fresh and db_path.exists():
+        report_fresh = db_path.stat().st_mtime < report_path.stat().st_mtime
+    if not report_fresh:
         all_ok &= report_bot_run("report", run_bot(repo_root, mode="report"))
+    else:
+        all_ok &= print_check(
+            "reuse[report]", True,
+            "reports/%s.html already exists and is newer than finance.db" % month,
+        )
     html = ""
     if report_path.exists():
         try:
