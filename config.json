@@ -1,0 +1,42 @@
+{
+  "poll_interval": 2.0,
+  "state_file": ".bot_state.json",
+  "log_file": "logs/events.jsonl",
+  "ollama": {
+    "url": "http://127.0.0.1:11434/api/chat",
+    "model": "glm-5.3-flash:cloud",
+    "timeout": 30.0
+  },
+  "telegram": {
+    "token": "",
+    "chat_id": ""
+  },
+  "rules": [
+    {
+      "name": "high_urgency",
+      "condition": {
+        "urgency": ["high"]
+      },
+      "actions": ["log", "telegram"]
+    },
+    {
+      "name": "messages",
+      "condition": {
+        "category": ["message"]
+      },
+      "actions": ["log", "telegram"]
+    },
+    {
+      "name": "promo_or_system",
+      "condition": {
+        "category": ["promo", "system"]
+      },
+      "actions": ["log"]
+    },
+    {
+      "name": "default",
+      "condition": {},
+      "actions": ["log"]
+    }
+  ]
+}

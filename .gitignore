@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Bot state and runtime logs
+.bot_state.json
+logs/
+
+# System / Runner artifacts
+.agent_runner_prompt.md
+.DS_Store
