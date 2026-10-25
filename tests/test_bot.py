@@ -105,6 +105,48 @@ class TestPlistParserAndReader(unittest.TestCase):
             self.assertIn(1, reader.app_cache)
             self.assertEqual(reader.app_cache[1], "com.example.testapp")
 
+    def test_app_cache_prefilled_from_table_and_blob_missing_app(self):
+        """Covers the prefill path where the blob lacks an `app` key, served from the app table."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_file = os.path.join(tmpdir, "db")
+            conn = sqlite3.connect(db_file)
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE app (app_id INTEGER PRIMARY KEY, identifier VARCHAR, badge INTEGER);")
+            cur.execute("CREATE TABLE record (rec_id INTEGER PRIMARY KEY, app_id INTEGER, uuid BLOB, data BLOB, delivered_date REAL, presented Bool);")
+
+            cur.execute("INSERT INTO app VALUES (1, 'com.example.tableapp', 0);")
+
+            raw_uuid = uuid.uuid4().bytes
+            sample_data = {
+                "date": 814583607.0,
+                "req": {
+                    "titl": "Table App",
+                    "subt": "",
+                    "body": "no app key here",
+                },
+            }
+            blob = plistlib.dumps(sample_data, fmt=plistlib.FMT_BINARY)
+            cur.execute("INSERT INTO record VALUES (10, 1, ?, ?, 814583607.0, 1);", (raw_uuid, blob))
+            conn.commit()
+            conn.close()
+
+            reader = bot.NotificationReader(db_path=db_file)
+            notifs = reader.fetch_notifications(since_rec_id=0)
+
+            self.assertEqual(len(notifs), 1)
+            n = notifs[0]
+            self.assertEqual(n["app"], "com.example.tableapp")
+            self.assertEqual(n["title"], "Table App")
+
+            # Cache reflects a warm prefill from the snapshot's app table.
+            self.assertIn(1, reader.app_cache)
+            self.assertEqual(reader.app_cache[1], "com.example.tableapp")
+
+            # Second fetch exercises the warm-cache fast path.
+            again = reader.fetch_notifications(since_rec_id=0)
+            self.assertEqual(len(again), 1)
+            self.assertEqual(again[0]["app"], "com.example.tableapp")
+
     def test_missing_plist_keys_graceful_handling(self):
         """Ensures notifications with missing req keys don't trigger KeyErrors."""
         with tempfile.TemporaryDirectory() as tmpdir:

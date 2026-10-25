@@ -178,10 +178,13 @@ class NotificationReader:
             # Prefill app_cache from the snapshot's app table so bundle-id
             # resolution has a warm entry for every known app_id, even when
             # the record blob already embeds an `app` value.
-            prefill = conn.cursor()
-            prefill.execute("SELECT app_id, identifier FROM app")
-            for row_app_id, row_identifier in prefill:
-                self.app_cache[row_app_id] = row_identifier or ""
+            try:
+                prefill = conn.cursor()
+                prefill.execute("SELECT app_id, identifier FROM app")
+                for row_app_id, row_identifier in prefill:
+                    self.app_cache[row_app_id] = row_identifier or ""
+            except Exception as e:
+                logger.debug("Failed to prefill app cache from app table: %s", e)
 
             order = "DESC" if reverse else "ASC"
             sql = f"SELECT rec_id, app_id, uuid, data, delivered_date, presented FROM record WHERE rec_id > ? ORDER BY rec_id {order}"
