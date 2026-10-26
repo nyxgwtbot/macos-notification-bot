@@ -1,0 +1,135 @@
+/*
+ * Notification Bot Desktop — theme variables.
+ * Mirrors the hydranote variables.css pattern (Ionic token overrides layered
+ * on top of the dark.system.css palette), with a calmer single-accent
+ * palette: teal (bot/liveness) + semantic colors for chips.
+ * http://ionicframework.com/docs/theming/
+ */
+
+:root {
+  /* ========================================
+     BASE BACKGROUNDS
+     ======================================== */
+  --nb-bg-deepest: #12171d;
+  --nb-bg-deep: #181f28;
+  --nb-bg-surface: #1e2732;
+  --nb-bg-elevated: #262f3c;
+  --nb-bg-hover: #2e3947;
+
+  --nb-border-subtle: #1e2833;
+  --nb-border-default: #2a3544;
+  --nb-border-strong: #3a4860;
+
+  --nb-text-primary: #e8eef5;
+  --nb-text-secondary: #9aa5b5;
+  --nb-text-muted: #6b7685;
+
+  /* ========================================
+     PRIMARY ACCENT — Teal (bot heartbeat)
+     ======================================== */
+  --nb-teal: #3eb8a0;
+  --nb-teal-light: #52c9b3;
+  --nb-teal-dark: #2d9a85;
+  --nb-teal-muted: rgba(62, 184, 160, 0.15);
+
+  /* ========================================
+     SEMANTIC COLORS (chips / badges)
+     ======================================== */
+  --nb-info: #58a6ff;
+  --nb-info-muted: rgba(88, 166, 255, 0.15);
+
+  --nb-warning: #d29922;
+  --nb-warning-muted: rgba(210, 153, 34, 0.15);
+
+  --nb-danger: #f85149;
+  --nb-danger-muted: rgba(248, 81, 73, 0.15);
+
+  --nb-green: #3fb950;
+  --nb-green-muted: rgba(63, 185, 80, 0.15);
+
+  --nb-purple: #a371d9;
+  --nb-purple-muted: rgba(163, 113, 217, 0.15);
+
+  --nb-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  /* ========================================
+     IONIC OVERRIDES
+     ======================================== */
+  --ion-background-color: var(--nb-bg-deepest);
+  --ion-text-color: var(--nb-text-primary);
+
+  --ion-color-primary: var(--nb-teal);
+  --ion-color-primary-rgb: 62, 184, 160;
+  --ion-color-primary-contrast: #0d1418;
+  --ion-color-primary-contrast-rgb: 13, 20, 24;
+  --ion-color-primary-shade: var(--nb-teal-dark);
+  --ion-color-primary-tint: var(--nb-teal-light);
+
+  --ion-color-secondary: var(--nb-info);
+  --ion-color-secondary-rgb: 88, 166, 255;
+  --ion-color-secondary-contrast: #0d1418;
+  --ion-color-secondary-contrast-rgb: 13, 20, 24;
+  --ion-color-secondary-shade: #3e93e6;
+  --ion-color-secondary-tint: #74bdfb;
+
+  --ion-color-success: var(--nb-green);
+  --ion-color-success-rgb: 63, 185, 80;
+  --ion-color-success-contrast: #0d1418;
+  --ion-color-success-contrast-rgb: 13, 20, 24;
+
+  --ion-color-warning: var(--nb-warning);
+  --ion-color-warning-rgb: 210, 153, 34;
+  --ion-color-warning-contrast: #0d1418;
+  --ion-color-warning-contrast-rgb: 13, 20, 24;
+
+  --ion-color-danger: var(--nb-danger);
+  --ion-color-danger-rgb: 248, 81, 73;
+  --ion-color-danger-contrast: #ffffff;
+  --ion-color-danger-contrast-rgb: 255, 255, 255;
+
+  --ion-color-medium: var(--nb-text-secondary);
+  --ion-color-medium-rgb: 154, 165, 181;
+  --ion-color-medium-contrast: #0d1418;
+  --ion-color-medium-contrast-rgb: 13, 20, 24;
+
+  --ion-color-light: var(--nb-bg-elevated);
+  --ion-color-light-rgb: 38, 47, 60;
+  --ion-color-light-contrast: var(--nb-text-primary);
+  --ion-color-light-contrast-rgb: 232, 238, 245;
+
+  --ion-toolbar-background: var(--nb-bg-deep);
+  --ion-toolbar-color: var(--nb-text-primary);
+  --ion-toolbar-border-color: var(--nb-border-default);
+
+  --ion-item-background: var(--nb-bg-surface);
+  --ion-item-color: var(--nb-text-primary);
+
+  --ion-card-background: var(--nb-bg-surface);
+  --ion-card-color: var(--nb-text-primary);
+
+  --ion-tab-bar-background: var(--nb-bg-deep);
+  --ion-tab-bar-color: var(--nb-text-muted);
+  --ion-tab-bar-color-selected: var(--nb-teal);
+
+  --ion-content-background-alt: var(--nb-bg-deep);
+}
+
+/* Neutral-scheme step grid so chips/toasts look right in system light mode too. */
+@media (prefers-color-scheme: light) {
+  :root {
+    --ion-background-color: #f6f7f9;
+    --ion-text-color: #1b2430;
+
+    --ion-toolbar-background: #ffffff;
+    --ion-toolbar-color: #1b2430;
+    --ion-item-background: #ffffff;
+    --ion-card-background: #ffffff;
+    --ion-tab-bar-background: #ffffff;
+    --ion-tab-bar-color: #6b7685;
+
+    --nb-bg-surface: #ffffff;
+    --nb-bg-deep: #eef1f5;
+    --nb-border-subtle: #e3e8ee;
+    --nb-border-default: #d0d7de;
+  }
+}
