@@ -16,3 +16,12 @@ reports/
 # System / Runner artifacts
 .agent_runner_prompt.md
 .DS_Store
+
+# Desktop UI (Electron) build artifacts
+desktop/node_modules/
+desktop/dist/
+desktop/electron/node_modules/
+desktop/electron/build/
+desktop/electron/app/
+desktop/electron/tmp-profile/
+desktop/tmp/
