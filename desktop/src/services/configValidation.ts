@@ -53,7 +53,7 @@ export function validateRuleConditionKeys(rules: BotRule[] | null | undefined, i
         );
       }
       const value = condition[key];
-      if (!(typeof value === 'string' || isStrList(value, false))) {
+      if (!(typeof value === 'string' || isStrList(value))) {
         details.push(`regra '${rule.name ?? index}': valores de '${key}' devem ser string ou lista de strings`);
       }
     }
@@ -97,14 +97,24 @@ export function validateConfigDraft(config: unknown): string[] {
   }
   const config0 = config as BotConfig;
 
+  for (const section of ['ollama', 'telegram', 'router', 'finance'] as const) {
+    const value = config0[section];
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      details.push(`seção '${section}' deve ser um objeto`);
+    }
+  }
+  for (const section of ['actions', 'rules'] as const) {
+    if (!Array.isArray(config0[section])) {
+      details.push(`seção '${section}' deve ser uma lista`);
+    }
+  }
+
   if (!isNumber(config0.poll_interval as number) || (config0.poll_interval as number) <= 0) {
     details.push("'poll_interval' deve ser um número > 0");
   }
 
   const ollama = config0.ollama;
-  if (!ollama || typeof ollama !== 'object') {
-    details.push("seção 'ollama' é obrigatória");
-  } else {
+  if (ollama && typeof ollama === 'object') {
     if (!isNonEmptyStr(ollama.url)) details.push("'ollama.url' deve ser uma string não vazia");
     if (!isNonEmptyStr(ollama.model)) details.push("'ollama.model' deve ser uma string não vazia");
     if (!isNumber(ollama.timeout) || ollama.timeout <= 0) {
@@ -113,9 +123,7 @@ export function validateConfigDraft(config: unknown): string[] {
   }
 
   const routerCfg = config0.router;
-  if (!routerCfg || typeof routerCfg !== 'object') {
-    details.push("seção 'router' é obrigatória");
-  } else {
+  if (routerCfg && typeof routerCfg === 'object') {
     if (!isNumber(routerCfg.min_confidence) || routerCfg.min_confidence < 0 || routerCfg.min_confidence > 1) {
       details.push("'router.min_confidence' deve ser um número entre 0 e 1");
     }
@@ -141,7 +149,7 @@ export function validateConfigDraft(config: unknown): string[] {
     if (typeof finance.telegram_summary !== 'boolean') {
       details.push("'finance.telegram_summary' deve ser booleano");
     }
-    if (!isStrList(finance.categories, false) || finance.categories.length === 0) {
+    if (!isStrList(finance.categories) || finance.categories.length === 0) {
       details.push("'finance.categories' deve ser uma lista de strings não vazias");
     }
   }

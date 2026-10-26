@@ -162,7 +162,7 @@ export class NotifyClient {
 
   // #9
   postTestNotify(): Promise<TestNotifyResponse> {
-    return this.request('POST', '/api/test-notify');
+    return this.request('POST', '/api/test-notify', {});
   }
 
   /**

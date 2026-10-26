@@ -7,12 +7,17 @@
 export function formatBrl(value: number | string | null | undefined): string {
   const num = typeof value === 'number' ? value : Number.parseFloat(String(value ?? ''));
   if (!Number.isFinite(num)) return 'R$ 0,00';
-  return num.toLocaleString('pt-BR', {
-    style: 'currency',
-    currency: 'BRL',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2
-  });
+  // Node ICU renders the pt-BR currency separator as U+202F; normalize to a
+  // plain space so the string matches notifybot/report.fmt_brl exactly.
+  return num
+    .toLocaleString('pt-BR', {
+      style: 'currency',
+      currency: 'BRL',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    })
+    .replace(/\u202F/g, ' ')
+    .replace(/\u00A0/g, ' ');
 }
 
 /** '2026-10' -> [2026, 10]; throws on bad month strings. */
@@ -61,6 +66,8 @@ export function monthLabelPt(month: string): string {
 /** Signed MoM delta percentage in PT-BR: '+12,4%' / '-3,1%' (null when undefined). */
 export function formatMomDelta(delta: number | null | undefined): string | null {
   if (delta === null || delta === undefined || !Number.isFinite(delta)) return null;
-  const text = `${Math.abs(delta).toLocaleString('pt-BR', { maximumFractionDigits: 1 })}%`;
+  // Explicit single-decimal rounding (deterministic across ICU versions).
+  const magnitude = Math.round(Math.abs(delta) * 10) / 10;
+  const text = `${magnitude.toLocaleString('pt-BR', { maximumFractionDigits: 1 })}%`;
   return `${delta >= 0 ? '+' : '-'}${text}`;
 }
