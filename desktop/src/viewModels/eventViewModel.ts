@@ -1,0 +1,102 @@
+/**
+ * Event -> row presentation mapping for the Dashboard live feed
+ * (tests: tests/unit/eventViewModel.spec.ts).
+ */
+
+import type { BotEvent, Classification } from '@/types/bot';
+
+export type LayerValue = 'rule' | 'llm_router' | 'fallback_in_fallback' | '';
+
+export interface EventRow {
+  /** Stable dedupe key across polls (notifications by rec_id, startup by ts). */
+  key: string;
+  kind: 'notification' | 'startup';
+  recId: number | null;
+  timestamp: string;
+  app: string;
+  title: string;
+  category: string;
+  urgency: string;
+  summary: string;
+  layer: LayerValue;
+  layerLabel: string;
+  ruleMatched: string;
+  actions: string[];
+  confidencePct: string | null;
+  telegramStatus: string | null;
+  financeStatus: string | null;
+}
+
+const LAYER_LABELS: Record<string, string> = {
+  rule: 'Regra',
+  llm_router: 'Router LLM',
+  fallback_in_fallback: 'Fallback'
+};
+
+/** Deterministic key for dedup across polls. */
+export function eventKey(event: BotEvent): string {
+  if (event.event === 'startup') return `startup:${event.timestamp ?? ''}`;
+  return `notification:${event.rec_id ?? event.timestamp ?? ''}`;
+}
+
+/** 0..1 fraction -> '87%'; anything else -> null. */
+export function confidenceToPct(confidence: number | null | undefined): string | null {
+  if (typeof confidence !== 'number' || !Number.isFinite(confidence)) return null;
+  if (confidence < 0 || confidence > 1) return null;
+  return `${Math.round(confidence * 100)}%`;
+}
+
+/** Classifier fallback semantics: other/low with title/body-derived summary. */
+function classificationOf(event: BotEvent): { category: string; urgency: string; summary: string } {
+  const cls = (event.classification ?? {}) as Partial<Classification> & Record<string, unknown>;
+  const category = typeof cls.category === 'string' && cls.category !== '' ? cls.category : 'other';
+  const urgency = typeof cls.urgency === 'string' && cls.urgency !== '' ? cls.urgency : 'low';
+  let summary = typeof cls.summary === 'string' ? cls.summary : '';
+  if (summary === '') {
+    const fallback = String(event.title ?? '') || String(event.body ?? '');
+    summary = fallback.length > 120 ? `${fallback.slice(0, 119)}…` : fallback;
+  }
+  return { category, urgency, summary };
+}
+
+export function eventToRow(event: BotEvent): EventRow {
+  const kind: EventRow['kind'] = event.event === 'startup' ? 'startup' : 'notification';
+  const layer = typeof event.layer === 'string' ? (event.layer as LayerValue) : '';
+  const cls = classificationOf(event);
+  const finance = event.finance;
+  const results = event.action_results;
+  return {
+    key: eventKey(event),
+    kind,
+    recId: typeof event.rec_id === 'number' ? event.rec_id : null,
+    timestamp: event.timestamp ?? '',
+    app: String(event.app ?? '') || (kind === 'startup' ? 'bot' : '—'),
+    title: String(event.title ?? ''),
+    category: cls.category,
+    urgency: cls.urgency,
+    summary: kind === 'startup' ? `Bot iniciado no modo '${event.mode ?? 'daemon'}'` : cls.summary,
+    layer: kind === 'startup' ? '' : layer,
+    layerLabel: kind === 'startup' ? '' : LAYER_LABELS[layer] ?? layer,
+    ruleMatched:
+      typeof event.rule_matched === 'string' && event.rule_matched !== '' && event.rule_matched !== 'none'
+        ? event.rule_matched
+        : '',
+    actions: Array.isArray(event.actions) ? event.actions.map(String) : [],
+    confidencePct: kind === 'startup' ? null : confidenceToPct(event.confidence),
+    telegramStatus: typeof event.telegram === 'string' ? event.telegram : (results?.telegram ?? null),
+    financeStatus: finance && typeof finance.status === 'string' ? buildFinanceLabel(finance) : null
+  };
+}
+
+function buildFinanceLabel(finance: NonNullable<BotEvent['finance']>): string {
+  const parts = [String(finance.status ?? '')];
+  if (finance.method) parts.push(String(finance.method));
+  if (finance.stored) parts.push(String(finance.stored));
+  if (finance.reason) parts.push(String(finance.reason));
+  return parts.filter((p) => p !== '').join(':');
+}
+
+/** Is this row a chip-worthy alert (telegram failed / finance error)? */
+export function isErrorStatus(status: string | null): boolean {
+  return typeof status === 'string' && status.startsWith('error');
+}
