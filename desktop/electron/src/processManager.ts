@@ -172,9 +172,16 @@ export class PythonProcessManager {
           }
         });
       }
-      // Give the server a beat, then probe ourselves.
-      await new Promise((resolve) => setTimeout(resolve, 1200));
-      if (await this.probeApi(port)) {
+      // Cold python start can take >1s (imports); poll up to ~4s.
+      let up = false;
+      for (let probeIndex = 0; probeIndex < 8; probeIndex += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        if (await this.probeApi(port)) {
+          up = true;
+          break;
+        }
+      }
+      if (up) {
         this.apiAdopted = false;
         this.apiPort = port;
         this.apiStartedAt = Date.now();
