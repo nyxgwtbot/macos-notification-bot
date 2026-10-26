@@ -283,7 +283,12 @@ def validate_config_payload(body: Any) -> List[str]:
                             f"regra '{rule_name}': valores de '{cond_key}' devem ser "
                             "string ou lista de strings"
                         )
-            if not _is_str_list(rule.get("actions"), allow_empty=False):
+            rule_actions = rule.get("actions")
+            if (
+                not isinstance(rule_actions, list)
+                or len(rule_actions) == 0
+                or not _is_str_list(rule_actions, allow_empty=False)
+            ):
                 details.append(f"regra '{rule_name}': actions deve ser uma lista de strings não vazias")
 
     finance = body.get("finance")
@@ -397,10 +402,11 @@ def read_events_tail(
         if kind == EVENT_KIND_STARTUP and event_kind != EVENT_KIND_STARTUP:
             continue
         if since is not None:
+            # Filtered reads are strictly rec_id-cursored: events without a
+            # rec_id (startup lines) only ever appear on unfiltered reads —
+            # clients would otherwise re-fetch them on every poll.
             rec_id = event.get("rec_id")
-            # Events without rec_id (startup) can't be cursor-filtered; they
-            # pass through and clients dedupe them by timestamp.
-            if isinstance(rec_id, int) and rec_id <= since:
+            if not isinstance(rec_id, int) or rec_id <= since:
                 continue
         filtered.append(event)
         if len(filtered) >= limit:
@@ -759,8 +765,8 @@ class BotApiRuntime:
             "markdown": result["markdown"],
         }
 
-    # #9 POST /api/test-notify
-    def test_notify(self) -> dict:
+    # #9 POST /api/test-notify (body ignored; kept for uniform dispatch)
+    def test_notify(self, body: Any = None) -> dict:
         from notifybot.cli import trigger_test_notifications
 
         stdout, stderr = io.StringIO(), io.StringIO()

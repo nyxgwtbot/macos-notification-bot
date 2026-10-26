@@ -45,6 +45,9 @@ export interface BotEvent {
   action_results?: Record<string, string>;
   telegram?: string | null;
   finance?: FinanceEventStatus;
+  // startup events carry these instead of the notification fields:
+  mode?: 'daemon' | 'once' | string;
+  watermark?: number | null;
 }
 
 /** GET /api/health response. */
