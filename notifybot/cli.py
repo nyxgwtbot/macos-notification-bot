@@ -407,6 +407,35 @@ def main() -> int:
         config = load_config(args.config)
         return cmd_report(config, args.month)
 
+    # `python3 bot.py api [--port N]` subcommand (Desktop UI) — serves the
+    # local JSON API for the Electron desktop app. Never spawns/manages the
+    # daemon and never touches db2 (see notifybot/api.py).
+    if argv and argv[0] == "api":
+        parser = argparse.ArgumentParser(
+            prog="bot.py api",
+            description="Serve a API JSON local para o desktop UI (loopback apenas)",
+        )
+        parser.add_argument("--config", default="config.json", help="Path to config.json")
+        parser.add_argument(
+            "--port",
+            type=int,
+            default=None,
+            help="Porta da API (padrão 4769; sobrescrita por NOTIFYBOT_API_PORT)",
+        )
+        parser.add_argument(
+            "--host",
+            default=None,
+            help="Host (padrão 127.0.0.1; apenas loopback é permitido)",
+        )
+        args = parser.parse_args(argv[1:])
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+        )
+        from notifybot.api import serve
+
+        return serve(config_path=args.config, host=args.host, port=args.port)
+
     parser = argparse.ArgumentParser(description="macOS Notification Bot")
     parser.add_argument("--config", default="config.json", help="Path to config.json")
     parser.add_argument(

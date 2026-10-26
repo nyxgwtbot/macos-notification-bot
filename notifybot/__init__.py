@@ -9,6 +9,7 @@ Modules (Phase 2 layout, per PLAN-PHASE2.md):
 - actions:    action dispatcher (log, telegram, command, registry actions)
 - finance:    bank-notification transaction curator + SQLite ledger
 - report:     SVG chart engine + finance HTML/markdown reporting
+- api:        local JSON API server for the desktop UI (bot.py api, loopback only)
 - cli:        CLI entrypoint logic (bot.py is the thin executable)
 """
 
