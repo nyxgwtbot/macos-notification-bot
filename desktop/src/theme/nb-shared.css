@@ -134,6 +134,42 @@
 }
 
 /* ========================================
+   FILTER CHIPS — the shared 3-chip kind filter row (Status feed + Logs
+   header). Same tinted-chip DNA as the status chips above: 2px micro-inner
+   padding, radius-sm, micro type; the selected option wears the teal info
+   tint, unselected stays neutral, hover brightens via --nb-bg-hover.
+   Native buttons (role=group + aria-pressed) so keyboard toggling is free.
+   ======================================== */
+.nb-filter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--nb-space-1);
+}
+.nb-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px var(--nb-space-2); /* 2px micro-inner exception */
+  border-radius: var(--nb-radius-sm);
+  font-size: var(--nb-fs-micro);
+  font-weight: 600;
+  line-height: 1.45;
+  white-space: nowrap;
+  border: 1px solid transparent;
+  background: var(--nb-bg-elevated);
+  color: var(--nb-text-secondary);
+  cursor: pointer;
+}
+.nb-filter-chip:hover {
+  background: var(--nb-bg-hover);
+}
+.nb-filter-chip[data-active='true'] {
+  background: var(--nb-info-muted);
+  color: var(--nb-info);
+  border-color: transparent;
+}
+
+/* ========================================
    PAGE HEADER PATTERN (X1) — one shared structure: single-row title at
    --nb-fs-title-lg (18px/600) with inline actions, --nb-space-3 vertical
    padding, hairline bottom border. Views opt in via .nb-page-header on

@@ -7,6 +7,16 @@ import type { BotEvent, Classification } from '@/types/bot';
 
 export type LayerValue = 'rule' | 'llm_router' | 'fallback_in_fallback' | '';
 
+/** Match the /api/events `kind=` values accepted by notifybot/api.py. */
+export type EventKindValue = 'all' | 'notification' | 'startup';
+
+/** The 3-chip filter row (Status feed + Logs kind filter share the labels). */
+export const EVENT_KIND_OPTIONS: ReadonlyArray<{ value: EventKindValue; label: string }> = [
+  { value: 'all', label: 'All' },
+  { value: 'notification', label: 'Events' },
+  { value: 'startup', label: 'Startup' }
+];
+
 export interface EventRow {
   /** Stable dedupe key across polls (notifications by rec_id, startup by ts). */
   key: string;
@@ -25,6 +35,30 @@ export interface EventRow {
   confidencePct: string | null;
   telegramStatus: string | null;
   financeStatus: string | null;
+  /** The untouched event dict — the expandable row shows it pretty-printed. */
+  raw: BotEvent;
+}
+
+/** Expanded-row payload cap: keep the head, trim the tail (display only). */
+const PAYLOAD_PREVIEW_MAX_CHARS = 2048;
+
+export interface PayloadPreview {
+  text: string;
+  truncatedChars: number;
+}
+
+/** Pretty-printed event payload for the expanded row, trimmed at 2 KB. */
+export function payloadPreview(event: BotEvent, maxChars = PAYLOAD_PREVIEW_MAX_CHARS): PayloadPreview {
+  let text: string;
+  try {
+    text = JSON.stringify(event, null, 2);
+  } catch (err) {
+    text = String(event); // cyclic/throwing payload — degrade, never crash a render
+  }
+  if (text.length > maxChars) {
+    return { text: text.slice(0, maxChars), truncatedChars: text.length - maxChars };
+  }
+  return { text, truncatedChars: 0 };
 }
 
 const LAYER_LABELS: Record<string, string> = {
@@ -84,7 +118,8 @@ export function eventToRow(event: BotEvent): EventRow {
     actions: Array.isArray(event.actions) ? event.actions.map(String) : [],
     confidencePct: kind === 'startup' ? null : confidenceToPct(event.confidence),
     telegramStatus: typeof event.telegram === 'string' ? event.telegram : (results?.telegram ?? null),
-    financeStatus: finance && typeof finance.status === 'string' ? buildFinanceLabel(finance) : null
+    financeStatus: finance && typeof finance.status === 'string' ? buildFinanceLabel(finance) : null,
+    raw: event
   };
 }
 

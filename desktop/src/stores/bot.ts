@@ -6,7 +6,7 @@
 
 import { defineStore } from 'pinia';
 
-import { notifyClient, errorText } from '@/services/notifyClient';
+import { notifyClient, errorText, type EventKind } from '@/services/notifyClient';
 import type { NotifyDaemonStatus } from '@/notify';
 import { eventToRow, eventKey, type EventRow } from '@/viewModels/eventViewModel';
 import type {
@@ -39,6 +39,8 @@ interface BotState {
   feedLoading: boolean;
   sinceCursor: number | null;
   lastFeedSuccessAt: string | null;
+  /** Live feed kind filter ('all' = no server-side kind param). */
+  feedKind: EventKind;
   // daemon process (Electron bridge only)
   daemon: NotifyDaemonStatus | null;
   daemonError: string | null;
@@ -76,6 +78,7 @@ export const useBotStore = defineStore('bot', {
     feedLoading: false,
     sinceCursor: null,
     lastFeedSuccessAt: null,
+    feedKind: 'all',
     daemon: null,
     daemonError: null,
     daemonBusy: false,
@@ -130,10 +133,16 @@ export const useBotStore = defineStore('bot', {
       }
     },
 
-    /** Incremental feed poll: `since` cursor + dedupe by event key. */
+    /** Incremental feed poll: `since` cursor + dedupe by event key. The kind
+     * filter travels with every poll so the 2s loop keeps it applied. */
     async pollFeed(limit = 100) {
       try {
-        const response = await notifyClient.getEvents({ since: this.sinceCursor ?? undefined, limit });
+        const options: { since?: number; limit: number; kind?: EventKind } = {
+          limit,
+          since: this.sinceCursor ?? undefined
+        };
+        if (this.feedKind !== 'all') options.kind = this.feedKind;
+        const response = await notifyClient.getEvents(options);
         for (const raw of response.events) {
           const event: BotEvent = raw;
           this.appendToFeed(event);
@@ -160,6 +169,15 @@ export const useBotStore = defineStore('bot', {
       if (this.events.length > EVENTS_RING_MAX) {
         this.events.splice(0, this.events.length - EVENTS_RING_MAX);
       }
+    },
+
+    /** Feed kind filter change: full reload (resetFeed clears the ring and the
+     * `since` cursor), then one immediate poll — the 2s poller keeps running. */
+    async setFeedKind(kind: EventKind) {
+      if (this.feedKind === kind) return;
+      this.feedKind = kind;
+      this.resetFeed();
+      await this.pollFeed();
     },
 
     /** Daemon process status via the Electron bridge (null in browser dev). */

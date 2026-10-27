@@ -4,7 +4,9 @@ import {
   confidenceToPct,
   eventKey,
   eventToRow,
-  isErrorStatus
+  isErrorStatus,
+  payloadPreview,
+  EVENT_KIND_OPTIONS
 } from '../../src/viewModels/eventViewModel';
 import type { BotEvent } from '../../src/types/bot';
 
@@ -114,6 +116,44 @@ describe('confidenceToPct', () => {
     expect(confidenceToPct(null)).toBe(null);
     expect(confidenceToPct(undefined)).toBe(null);
     expect(confidenceToPct(Number.NaN)).toBe(null);
+  });
+});
+
+describe('payloadPreview', () => {
+  test('pretty-prints the raw event payload under the 2K cap', () => {
+    const event = notifEvent();
+    const preview = payloadPreview(event);
+    expect(preview.truncatedChars).toBe(0);
+    expect(preview.text).toContain('"event": "notification"');
+    expect(preview.text).toContain('"rec_id": 42');
+    expect(preview.text.startsWith('{')).toBe(true);
+  });
+
+  test('trims the tail past 2048 chars and reports the overflow', () => {
+    const event = notifEvent({ body: 'x'.repeat(4000) });
+    const preview = payloadPreview(event);
+    expect(preview.text.length).toBe(2048);
+    expect(preview.truncatedChars).toBeGreaterThan(0);
+  });
+
+  test('never throws on a non-serializable payload', () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const preview = payloadPreview(cyclic as unknown as BotEvent);
+    expect(typeof preview.text).toBe('string');
+  });
+});
+
+describe('EVENT_KIND_OPTIONS / raw passthrough', () => {
+  test('kinds mirror the /api/events kind= values (all | notification | startup)', () => {
+    expect(EVENT_KIND_OPTIONS.map((option) => option.value)).toEqual(['all', 'notification', 'startup']);
+    expect(EVENT_KIND_OPTIONS.map((option) => option.label)).toEqual(['All', 'Events', 'Startup']);
+  });
+
+  test('eventToRow keeps the untouched raw event for the expandable payload', () => {
+    const event = notifEvent({ confidence: 0.3, body: 'full body' });
+    const row = eventToRow(event);
+    expect(row.raw).toBe(event); // identity, not a copy
   });
 });
 

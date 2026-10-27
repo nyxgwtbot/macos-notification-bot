@@ -15,6 +15,21 @@
     </ion-header>
 
     <ion-content class="nb-content">
+      <!-- Feed kind filter chips: server-side `kind=` on /api/events, full reload per change -->
+      <div class="nb-filter-row" role="group" aria-label="Filter events by kind">
+        <button
+          v-for="option in EVENT_KIND_OPTIONS"
+          :key="option.value"
+          type="button"
+          class="nb-filter-chip"
+          :data-active="store.feedKind === option.value"
+          :aria-pressed="store.feedKind === option.value"
+          @click="onKindChange(option.value)"
+        >
+          {{ option.label }}
+        </button>
+      </div>
+
       <!-- offline banner: API down -> explicit banner + retry, never blank -->
       <div v-if="store.apiDown" class="nb-offline">
         <ion-spinner v-if="store.feedLoading" name="crescent" />
@@ -100,8 +115,20 @@
       </p>
 
       <div v-if="store.events.length > 0" class="nb-feed">
-        <div v-for="row in feedRows" :key="row.key" class="nb-event" :class="{ 'nb-event-startup': row.kind === 'startup' }">
+        <div
+          v-for="row in feedRows"
+          :key="row.key"
+          class="nb-event"
+          :class="{ 'nb-event-startup': row.kind === 'startup', 'nb-event-open': expandedRows.has(row.key) }"
+          role="button"
+          tabindex="0"
+          :aria-expanded="expandedRows.has(row.key)"
+          :aria-label="'Expand raw payload for ' + (row.app || row.kind)"
+          @click="toggleExpand(row.key)"
+          @keydown.enter.prevent="toggleExpand(row.key)"
+        >
           <div class="nb-event-top">
+            <ion-icon class="nb-event-chev" aria-hidden="true" :icon="chevronForwardOutline" />
             <span class="nb-app">{{ row.app }}</span>
             <span class="nb-when">{{ formatIsoShort(row.timestamp) }}</span>
             <span v-if="row.recId !== null" class="nb-recid">rec_id {{ row.recId }}</span>
@@ -122,6 +149,23 @@
               <span v-for="action in row.actions" :key="action" class="nb-action">{{ action }}</span>
             </div>
           </template>
+          <!-- expand: raw event payload, pretty-printed, 2 KB tail-trim, full copy on hover -->
+          <div
+            v-if="expandedRows.has(row.key)"
+            class="nb-event-raw"
+            role="region"
+            :aria-label="'Raw payload for ' + (row.app || row.kind)"
+            @click.stop
+          >
+            <button class="nb-raw-copy" aria-label="Copy raw payload" @click="copyRaw(row)">
+              <ion-icon aria-hidden="true" :icon="copyOutline" />
+              <span v-if="copiedKey === row.key" class="nb-raw-copied">Copied</span>
+            </button>
+            <pre class="nb-event-raw-text">{{ rawPreview(row).text }}</pre>
+            <span v-if="rawPreview(row).truncatedChars > 0" class="nb-event-raw-note">
+              … {{ rawPreview(row).truncatedChars }} chars trimmed (2 KB display cap) — copy takes the full payload
+            </span>
+          </div>
         </div>
       </div>
     </ion-content>
@@ -129,7 +173,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
 import {
   IonBadge,
   IonButton,
@@ -146,18 +190,59 @@ import {
   IonTitle,
   IonToolbar
 } from '@ionic/vue';
-import { cloudOfflineOutline, pulseOutline } from 'ionicons/icons';
+import { chevronForwardOutline, cloudOfflineOutline, copyOutline, pulseOutline } from 'ionicons/icons';
 
 import { useBotStore } from '@/stores/bot';
 import { usePolling } from '@/composables/usePolling';
+import { copyText } from '@/utils/clipboard';
 import { formatBytes, formatIsoShort, formatUptime } from '@/utils/time';
 import { formatApiPort } from '@/viewModels/statusViewModel';
+import {
+  EVENT_KIND_OPTIONS,
+  payloadPreview,
+  type EventKindValue,
+  type EventRow
+} from '@/viewModels/eventViewModel';
 
 const store = useBotStore();
 
 const daemonBridge = computed(() => typeof window !== 'undefined' && !!window.notifyAPI?.daemon);
 
 const feedRows = computed(() => [...store.events].reverse());
+
+/** Event expand state: per-row key, component-local (like the chat tool chips). */
+const expandedRows = reactive(new Set<string>());
+const copiedKey = ref<string | null>(null);
+
+function toggleExpand(key: string): void {
+  if (expandedRows.has(key)) {
+    expandedRows.delete(key);
+  } else {
+    expandedRows.add(key);
+  }
+}
+
+function rawPreview(row: EventRow) {
+  return payloadPreview(row.raw);
+}
+
+async function copyRaw(row: EventRow): Promise<void> {
+  try {
+    const text = JSON.stringify(row.raw, null, 2);
+    if (await copyText(text)) {
+      copiedKey.value = row.key;
+      window.setTimeout(() => {
+        if (copiedKey.value === row.key) copiedKey.value = null;
+      }, 1200);
+    }
+  } catch (err) {
+    console.debug('payload copy failed', err);
+  }
+}
+
+function onKindChange(kind: EventKindValue): void {
+  void store.setFeedKind(kind);
+}
 
 const apiPortDisplay = computed(() =>
   formatApiPort({
@@ -236,6 +321,12 @@ onUnmounted(() => {
   padding-inline-end: var(--nb-space-4);
 }
 
+/* feed kind filter: sits directly under the page header (uses the shared
+   .nb-filter-chips / .nb-filter-chip classes from theme/nb-shared.css) */
+.nb-filter-row {
+  margin: 0 0 var(--nb-space-3);
+}
+
 .nb-cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -306,6 +397,76 @@ onUnmounted(() => {
   border-radius: var(--nb-radius-md);
   padding: var(--nb-space-2) var(--nb-space-3);
   background: var(--ion-card-background);
+  /* click-to-expand target: pointer + hover tint, collapsed height kept */
+  cursor: pointer;
+}
+.nb-event:hover {
+  border-color: var(--nb-border-strong);
+}
+.nb-event:focus-visible {
+  outline: 2px solid var(--nb-info);
+  outline-offset: 2px;
+}
+/* chevron in the meta gutter: rotates 90° when the row is open */
+.nb-event-chev {
+  flex: none;
+  font-size: 12px;
+  margin-top: 2px;
+  color: var(--nb-text-secondary);
+  transition: transform 120ms ease;
+}
+.nb-event-open .nb-event-chev {
+  transform: rotate(90deg);
+}
+/* expanded raw payload: elevated inset + mono micro + full-payload copy */
+.nb-event-raw {
+  position: relative;
+  margin-top: var(--nb-space-2);
+  padding: var(--nb-space-2) var(--nb-space-3);
+  border-radius: var(--nb-radius-sm);
+  background: var(--nb-bg-elevated);
+}
+.nb-event-raw-text {
+  margin: 0;
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-micro);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 240px;
+  overflow-y: auto;
+  color: var(--nb-text-primary);
+}
+.nb-event-raw-note {
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-muted);
+}
+/* copy affordance is noise at rest — same hover reveal as the log rows */
+.nb-raw-copy {
+  position: absolute;
+  top: var(--nb-space-1);
+  right: var(--nb-space-1);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nb-space-1);
+  background: none;
+  border: none;
+  color: var(--nb-text-secondary);
+  cursor: pointer;
+  padding: 2px var(--nb-space-1); /* 2px micro-inner exception */
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.nb-event-raw:hover .nb-raw-copy,
+.nb-raw-copy:focus-visible {
+  opacity: 1;
+}
+.nb-raw-copy:hover {
+  color: var(--nb-text-primary);
+}
+.nb-raw-copied {
+  font-size: var(--nb-fs-micro);
+  color: var(--ion-color-success);
 }
 .nb-event-startup {
   opacity: 0.65;
