@@ -19,16 +19,114 @@
         <ion-button size="small" fill="outline" @click="discard">Retry</ion-button>
       </div>
 
-      <!-- Telegram: strictly read-only, secrets never enter config.json via the UI -->
-      <ion-card>
-        <ion-card-header><ion-card-title>Telegram (env-only)</ion-card-title></ion-card-header>
+      <!-- Bot & Ollama: the app's own provider config — first card of Settings -->
+      <ion-card v-if="store.config">
+        <ion-card-header><ion-card-title>Bot &amp; Ollama</ion-card-title></ion-card-header>
         <ion-card-content>
           <p class="nb-muted">
-            Tokens are not editable here: they come from environment variables —
-            <code>TELEGRAM_BOT_TOKEN</code>/<code>TG_BOT_TOKEN</code> and
-            <code>TELEGRAM_ALLOWED_USERS</code>/<code>TG_CHAT_ID</code>. Secrets never enter
-            <code>config.json</code> through the UI (the server rejects non-empty values for these fields).
+            Provider the in-app agent uses for chat, classification and finance insights.
           </p>
+          <div class="nb-field">
+            <div class="nb-field-slot nb-span-2">
+              <ion-input
+                label="Ollama URL"
+                label-placement="stacked"
+                :class="{ 'nb-input-bad': !!fieldErrors.ollamaUrl }"
+                :aria-invalid="fieldErrors.ollamaUrl ? true : undefined"
+                :value="draft.ollamaUrl"
+                @ionInput="onOllamaUrlInput"
+              />
+              <p v-if="fieldErrors.ollamaUrl" class="nb-field-error">{{ fieldErrors.ollamaUrl }}</p>
+              <p class="nb-field-help">Endpoint of the local Ollama daemon.</p>
+            </div>
+            <div class="nb-field-slot">
+              <ion-input
+                label="Ollama model"
+                label-placement="stacked"
+                :class="{ 'nb-input-bad': !!fieldErrors.ollamaModel }"
+                :aria-invalid="fieldErrors.ollamaModel ? true : undefined"
+                :value="draft.ollamaModel"
+                @ionInput="onOllamaModelInput"
+              />
+              <p v-if="fieldErrors.ollamaModel" class="nb-field-error">{{ fieldErrors.ollamaModel }}</p>
+              <p class="nb-field-help">Model used for chat, classification and router calls (cloud-tagged models are proxied).</p>
+            </div>
+            <div class="nb-field-slot">
+              <ion-input
+                label="Ollama timeout (s)"
+                label-placement="stacked"
+                type="number"
+                inputmode="decimal"
+                :class="{ 'nb-input-bad': !!fieldErrors.ollamaTimeout }"
+                :aria-invalid="fieldErrors.ollamaTimeout ? true : undefined"
+                :value="draft.ollamaTimeout"
+                @ionInput="onOllamaTimeoutInput"
+              />
+              <p v-if="fieldErrors.ollamaTimeout" class="nb-field-error">{{ fieldErrors.ollamaTimeout }}</p>
+              <p class="nb-field-help">Seconds per provider call.</p>
+            </div>
+            <div class="nb-field-slot">
+              <ion-input
+                label="router.min_confidence (0–1)"
+                label-placement="stacked"
+                type="number"
+                inputmode="decimal"
+                :class="{ 'nb-input-bad': !!fieldErrors.minConfidence }"
+                :aria-invalid="fieldErrors.minConfidence ? true : undefined"
+                :value="draft.minConfidence"
+                @ionInput="onMinConfidenceInput"
+              />
+              <p v-if="fieldErrors.minConfidence" class="nb-field-error">{{ fieldErrors.minConfidence }}</p>
+              <p class="nb-field-help">Confidence floor for LLM-routed actions.</p>
+            </div>
+            <div class="nb-field-slot">
+              <ion-input
+                label="poll_interval (s)"
+                label-placement="stacked"
+                type="number"
+                inputmode="decimal"
+                :class="{ 'nb-input-bad': !!fieldErrors.pollInterval }"
+                :aria-invalid="fieldErrors.pollInterval ? true : undefined"
+                :value="draft.pollInterval"
+                @ionInput="onPollIntervalInput"
+              />
+              <p v-if="fieldErrors.pollInterval" class="nb-field-error">{{ fieldErrors.pollInterval }}</p>
+              <p class="nb-field-help">Seconds between daemon polls.</p>
+            </div>
+          </div>
+          <!-- iterC: unmapped server 400 details never surface verbatim
+               (api.py details are PT-BR) — one muted generic line instead -->
+          <p v-if="unmappedSaveDetails.length > 0" class="nb-muted nb-save-reject-note">
+            The server rejected the config — check the values
+          </p>
+          <!-- ST4: SAVE lives in the card footer row, aligned right (it saves the whole config);
+               success = transient "Saved" flash (2s, label back) — validation is inline per field.
+               iterC restart-to-apply: tinted banner next to SAVE, only when an ollama/router/poll
+               value changed vs the last-loaded config. -->
+          <div class="nb-card-footer nb-save-row">
+            <span v-if="store.lastSavedAt" class="nb-saved-at">saved at {{ formatIsoShort(store.lastSavedAt) }}</span>
+            <div v-if="showRestartRow" class="nb-restart-apply">
+              <span class="nb-restart-apply-label" title="The daemon reads config only at boot">
+                Restart the daemon to apply
+              </span>
+              <ion-button
+                size="small"
+                fill="outline"
+                class="nb-restart-btn"
+                :class="{ 'nb-restart-armed': restartArmed }"
+                :disabled="store.daemonBusy"
+                aria-label="Restart daemon to apply the saved config"
+                @click="onSaveRestartClick"
+              >
+                <ion-spinner v-if="store.daemonBusy" name="crescent" />
+                <template v-else>{{ restartArmed ? 'Confirm restart?' : 'Restart' }}</template>
+              </ion-button>
+            </div>
+            <ion-button fill="solid" class="nb-save-btn" :class="{ 'nb-save-flash': saveFlash }" :disabled="store.configSaving" @click="save">
+              <ion-spinner v-if="store.configSaving" name="crescent" />
+              <template v-else>{{ saveFlash ? 'Saved' : 'Save' }}</template>
+            </ion-button>
+          </div>
         </ion-card-content>
       </ion-card>
 
@@ -69,109 +167,6 @@
       </ion-card>
 
       <template v-if="store.config">
-        <!-- structured editors -->
-        <ion-card>
-          <ion-card-header><ion-card-title>Bot &amp; Ollama</ion-card-title></ion-card-header>
-          <ion-card-content>
-            <div class="nb-field">
-              <div class="nb-field-slot">
-                <ion-input
-                  label="Ollama URL"
-                  label-placement="stacked"
-                  :class="{ 'nb-input-bad': !!fieldErrors.ollamaUrl }"
-                  :aria-invalid="fieldErrors.ollamaUrl ? true : undefined"
-                  :value="draft.ollamaUrl"
-                  @ionInput="onOllamaUrlInput"
-                />
-                <p v-if="fieldErrors.ollamaUrl" class="nb-field-error">{{ fieldErrors.ollamaUrl }}</p>
-              </div>
-              <div class="nb-field-slot">
-                <ion-input
-                  label="Ollama model"
-                  label-placement="stacked"
-                  :class="{ 'nb-input-bad': !!fieldErrors.ollamaModel }"
-                  :aria-invalid="fieldErrors.ollamaModel ? true : undefined"
-                  :value="draft.ollamaModel"
-                  @ionInput="onOllamaModelInput"
-                />
-                <p v-if="fieldErrors.ollamaModel" class="nb-field-error">{{ fieldErrors.ollamaModel }}</p>
-              </div>
-              <div class="nb-field-slot">
-                <ion-input
-                  label="Ollama timeout (s)"
-                  label-placement="stacked"
-                  type="number"
-                  inputmode="decimal"
-                  :class="{ 'nb-input-bad': !!fieldErrors.ollamaTimeout }"
-                  :aria-invalid="fieldErrors.ollamaTimeout ? true : undefined"
-                  :value="draft.ollamaTimeout"
-                  @ionInput="onOllamaTimeoutInput"
-                />
-                <p v-if="fieldErrors.ollamaTimeout" class="nb-field-error">{{ fieldErrors.ollamaTimeout }}</p>
-              </div>
-              <div class="nb-field-slot">
-                <ion-input
-                  label="router.min_confidence (0–1)"
-                  label-placement="stacked"
-                  type="number"
-                  inputmode="decimal"
-                  :class="{ 'nb-input-bad': !!fieldErrors.minConfidence }"
-                  :aria-invalid="fieldErrors.minConfidence ? true : undefined"
-                  :value="draft.minConfidence"
-                  @ionInput="onMinConfidenceInput"
-                />
-                <p v-if="fieldErrors.minConfidence" class="nb-field-error">{{ fieldErrors.minConfidence }}</p>
-              </div>
-              <div class="nb-field-slot">
-                <ion-input
-                  label="poll_interval (s)"
-                  label-placement="stacked"
-                  type="number"
-                  inputmode="decimal"
-                  :class="{ 'nb-input-bad': !!fieldErrors.pollInterval }"
-                  :aria-invalid="fieldErrors.pollInterval ? true : undefined"
-                  :value="draft.pollInterval"
-                  @ionInput="onPollIntervalInput"
-                />
-                <p v-if="fieldErrors.pollInterval" class="nb-field-error">{{ fieldErrors.pollInterval }}</p>
-              </div>
-            </div>
-            <!-- iterC: unmapped server 400 details never surface verbatim
-                 (api.py details are PT-BR) — one muted generic line instead -->
-            <p v-if="unmappedSaveDetails.length > 0" class="nb-muted nb-save-reject-note">
-              The server rejected the config — check the values
-            </p>
-            <!-- ST4: SAVE lives in the card footer row, aligned right (it saves the whole config);
-                 success = transient "Saved" flash (2s, label back) — validation is inline per field.
-                 iterC restart-to-apply: tinted banner next to SAVE, only when an ollama/router/poll
-                 value changed vs the last-loaded config. -->
-            <div class="nb-card-footer nb-save-row">
-              <span v-if="store.lastSavedAt" class="nb-saved-at">saved at {{ formatIsoShort(store.lastSavedAt) }}</span>
-              <div v-if="showRestartRow" class="nb-restart-apply">
-                <span class="nb-restart-apply-label" title="The daemon reads config only at boot">
-                  Restart the daemon to apply
-                </span>
-                <ion-button
-                  size="small"
-                  fill="outline"
-                  class="nb-restart-btn"
-                  :class="{ 'nb-restart-armed': restartArmed }"
-                  :disabled="store.daemonBusy"
-                  aria-label="Restart daemon to apply the saved config"
-                  @click="onSaveRestartClick"
-                >
-                  <ion-spinner v-if="store.daemonBusy" name="crescent" />
-                  <template v-else>{{ restartArmed ? 'Confirm restart?' : 'Restart' }}</template>
-                </ion-button>
-              </div>
-              <ion-button fill="solid" class="nb-save-btn" :class="{ 'nb-save-flash': saveFlash }" :disabled="store.configSaving" @click="save">
-                <ion-spinner v-if="store.configSaving" name="crescent" />
-                <template v-else>{{ saveFlash ? 'Saved' : 'Save' }}</template>
-              </ion-button>
-            </div>
-          </ion-card-content>
-        </ion-card>
-
         <!-- action registry -->
         <ion-card>
           <ion-card-header><ion-card-title>Actions</ion-card-title></ion-card-header>
@@ -238,6 +233,7 @@
             <template v-else>
               <ion-textarea
                 class="nb-raw-json"
+                :class="{ 'nb-raw-bad': !!rawError }"
                 aria-label="JSON rules"
                 :auto-grow="true"
                 :rows="14"
@@ -260,6 +256,19 @@
         </div>
         <div v-if="restartNote" class="nb-banner nb-banner-warn">{{ restartNote }}</div>
       </template>
+
+      <!-- Telegram: strictly read-only, secrets never enter config.json via the UI -->
+      <ion-card>
+        <ion-card-header><ion-card-title>Telegram (env-only)</ion-card-title></ion-card-header>
+        <ion-card-content>
+          <p class="nb-muted">
+            Tokens are not editable here: they come from environment variables —
+            <code>TELEGRAM_BOT_TOKEN</code>/<code>TG_BOT_TOKEN</code> and
+            <code>TELEGRAM_ALLOWED_USERS</code>/<code>TG_CHAT_ID</code>. Secrets never enter
+            <code>config.json</code> through the UI (the server rejects non-empty values for these fields).
+          </p>
+        </ion-card-content>
+      </ion-card>
     </ion-content>
   </ion-page>
 </template>
@@ -742,12 +751,23 @@ onUnmounted(() => {
   height: var(--nb-space-6);
 }
 /* ST2: Bot & Ollama fields read as editable inputs — elevated surface,
-   strong hairline, radius, focus ring; labels stay small/muted (Ion stacked) */
+   strong hairline, radius, focus ring; labels stay small/muted (Ion stacked).
+   R4: 2-column grid — Ollama URL spans both columns (row 1); model + timeout
+   pair on row 2, router.min_confidence + poll_interval on row 3 (R4: the old
+   1-col 520px stack inside a ~1100px card is gone). */
 .nb-field {
-  display: flex;
-  flex-direction: column;
-  gap: var(--nb-space-2);
-  max-width: 520px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--nb-space-2) var(--nb-space-4);
+}
+.nb-field .nb-span-2 {
+  grid-column: 1 / -1;
+}
+/* R4: one-line muted help under each config field */
+.nb-field-help {
+  margin: var(--nb-space-1) 0 0;
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-secondary);
 }
 .nb-field ion-input {
   background: var(--nb-bg-elevated);
@@ -800,9 +820,29 @@ onUnmounted(() => {
   padding: 0 var(--nb-space-1);
   border-radius: var(--nb-radius-sm);
 }
+/* R4: raw JSON mode parity — same boxed input treatment + focus ring as the
+   config fields, monospace kept; while a raw parse error is live the textarea
+   wears the same danger pair (error line stays inline under the editor) */
 .nb-raw-json {
   font-family: var(--nb-mono);
   font-size: var(--nb-fs-micro);
+  background: var(--nb-bg-elevated);
+  border: 1px solid var(--nb-border-strong);
+  border-radius: var(--nb-radius-md);
+  padding: var(--nb-space-2) var(--nb-space-3);
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+.nb-raw-json:focus-within {
+  border-color: var(--nb-info);
+  box-shadow: 0 0 0 2px var(--nb-info-muted);
+}
+.nb-raw-json.nb-raw-bad {
+  border-color: var(--nb-danger);
+  background-color: var(--nb-danger-muted);
+}
+.nb-raw-json.nb-raw-bad:focus-within {
+  border-color: var(--nb-danger);
+  box-shadow: 0 0 0 2px var(--nb-danger-muted);
 }
 /* ST4: right-aligned save footer inside the Bot & Ollama card
    (.nb-card-footer supplies the 12px top inset) */
