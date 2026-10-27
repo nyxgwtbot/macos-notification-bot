@@ -2,8 +2,10 @@ import { describe, expect, test } from 'vitest';
 
 import {
   KNOWN_RULE_FIELDS,
+  splitDetailsByField,
   validateActionEntries,
   validateConfigDraft,
+  validateDraftFields,
   validateRuleConditionKeys
 } from '../../src/services/configValidation';
 import type { ActionEntry, BotConfig, BotRule } from '../../src/types/bot';
@@ -193,5 +195,77 @@ describe('full draft edge cases', () => {
   test('non-object drafts rejected with a single message', () => {
     expect(validateConfigDraft(null)).toEqual(['config deve ser um objeto']);
     expect(validateConfigDraft('str')).toEqual(['config deve ser um objeto']);
+  });
+});
+
+describe('validateDraftFields (loop2 iterB inline rules)', () => {
+  const valid = {
+    ollamaUrl: 'http://127.0.0.1:11434/api/chat',
+    ollamaModel: 'llama3',
+    ollamaTimeout: '30',
+    minConfidence: '0.5',
+    pollInterval: '2'
+  };
+
+  test('all valid entries pass', () => {
+    expect(validateDraftFields(valid)).toEqual({});
+  });
+
+  test('url requires a non-empty http(s) address', () => {
+    expect(validateDraftFields({ ...valid, ollamaUrl: '' }).ollamaUrl).toContain('non-empty');
+    expect(validateDraftFields({ ...valid, ollamaUrl: '127.0.0.1:11434' }).ollamaUrl).toContain('http:// or https://');
+    expect(validateDraftFields({ ...valid, ollamaUrl: 'ftp://x' }).ollamaUrl).toContain('http:// or https://');
+    expect(validateDraftFields({ ...valid, ollamaUrl: 'https://ollama.lan' }).ollamaUrl).toBeUndefined();
+  });
+
+  test('model, timeout, min_confidence and poll_interval follow the API rules', () => {
+    expect(validateDraftFields({ ...valid, ollamaModel: '  ' }).ollamaModel).toContain('empty');
+    expect(validateDraftFields({ ...valid, ollamaTimeout: '0' }).ollamaTimeout).toContain('> 0');
+    expect(validateDraftFields({ ...valid, ollamaTimeout: 'abc' }).ollamaTimeout).toContain('> 0');
+    expect(validateDraftFields({ ...valid, minConfidence: '1.2' }).minConfidence).toContain('between 0 and 1');
+    expect(validateDraftFields({ ...valid, minConfidence: '-0.1' }).minConfidence).toContain('between 0 and 1');
+    expect(validateDraftFields({ ...valid, pollInterval: 'abc' }).pollInterval).toContain('> 0');
+    expect(validateDraftFields({ ...valid, pollInterval: '0' }).pollInterval).toContain('> 0');
+  });
+});
+
+describe('splitDetailsByField (save response -> inline field mapping)', () => {
+  test('maps server/PT field details to their field with English rule text', () => {
+    const { fieldErrors, unmapped } = splitDetailsByField([
+      "'ollama.url' deve ser uma string não vazia",
+      "'router.min_confidence' deve ser um número entre 0 e 1",
+      "'poll_interval' deve ser um número > 0",
+      "'ollama.timeout' deve ser um número > 0",
+      "'ollama.model' deve ser uma string não vazia"
+    ]);
+    expect(fieldErrors.ollamaUrl).toContain('Ollama URL');
+    expect(fieldErrors.ollamaModel).toContain('model');
+    expect(fieldErrors.ollamaTimeout).toContain('> 0');
+    expect(fieldErrors.minConfidence).toContain('between 0 and 1');
+    expect(fieldErrors.pollInterval).toContain('> 0');
+    expect(unmapped).toEqual([]);
+  });
+
+  test('keeps non-field details in the unmapped banner list', () => {
+    const { fieldErrors, unmapped } = splitDetailsByField([
+      "regra 'x': campo de condição desconhecido 'weird' (permitidos: app)",
+      "'ollama.model' deve ser uma string não vazia"
+    ]);
+    expect(fieldErrors.ollamaModel).toBeDefined();
+    expect(unmapped).toHaveLength(1);
+    expect(unmapped[0]).toContain('desconhecido');
+  });
+
+  test('maps the bare 400 error text when details are absent', () => {
+    const { fieldErrors } = splitDetailsByField(["config inválida: 'poll_interval' deve ser um número > 0"]);
+    expect(fieldErrors.pollInterval).toBeDefined();
+  });
+
+  test('first field detail wins on duplicates', () => {
+    const { fieldErrors } = splitDetailsByField([
+      "'ollama.url' deve ser uma string não vazia",
+      "'ollama.url' outro detalhe"
+    ]);
+    expect(fieldErrors.ollamaUrl).toContain('Ollama URL');
   });
 });

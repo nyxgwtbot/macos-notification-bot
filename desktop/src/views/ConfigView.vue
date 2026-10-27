@@ -74,50 +74,91 @@
           <ion-card-header><ion-card-title>Bot &amp; Ollama</ion-card-title></ion-card-header>
           <ion-card-content>
             <div class="nb-field">
-              <ion-input
-                label="Ollama URL"
-                label-placement="stacked"
-                :value="draft.ollamaUrl"
-                @ionInput="onOllamaUrlInput"
-              />
-              <ion-input
-                label="Ollama model"
-                label-placement="stacked"
-                :value="draft.ollamaModel"
-                @ionInput="onOllamaModelInput"
-              />
-              <ion-input
-                label="Ollama timeout (s)"
-                label-placement="stacked"
-                type="number"
-                inputmode="decimal"
-                :value="draft.ollamaTimeout"
-                @ionInput="onOllamaTimeoutInput"
-              />
-              <ion-input
-                label="router.min_confidence (0–1)"
-                label-placement="stacked"
-                type="number"
-                inputmode="decimal"
-                :value="draft.minConfidence"
-                @ionInput="onMinConfidenceInput"
-              />
-              <ion-input
-                label="poll_interval (s)"
-                label-placement="stacked"
-                type="number"
-                inputmode="decimal"
-                :value="draft.pollInterval"
-                @ionInput="onPollIntervalInput"
-              />
+              <div class="nb-field-slot">
+                <ion-input
+                  label="Ollama URL"
+                  label-placement="stacked"
+                  :class="{ 'nb-input-bad': !!fieldErrors.ollamaUrl }"
+                  :aria-invalid="fieldErrors.ollamaUrl ? true : undefined"
+                  :value="draft.ollamaUrl"
+                  @ionInput="onOllamaUrlInput"
+                />
+                <p v-if="fieldErrors.ollamaUrl" class="nb-field-error">{{ fieldErrors.ollamaUrl }}</p>
+              </div>
+              <div class="nb-field-slot">
+                <ion-input
+                  label="Ollama model"
+                  label-placement="stacked"
+                  :class="{ 'nb-input-bad': !!fieldErrors.ollamaModel }"
+                  :aria-invalid="fieldErrors.ollamaModel ? true : undefined"
+                  :value="draft.ollamaModel"
+                  @ionInput="onOllamaModelInput"
+                />
+                <p v-if="fieldErrors.ollamaModel" class="nb-field-error">{{ fieldErrors.ollamaModel }}</p>
+              </div>
+              <div class="nb-field-slot">
+                <ion-input
+                  label="Ollama timeout (s)"
+                  label-placement="stacked"
+                  type="number"
+                  inputmode="decimal"
+                  :class="{ 'nb-input-bad': !!fieldErrors.ollamaTimeout }"
+                  :aria-invalid="fieldErrors.ollamaTimeout ? true : undefined"
+                  :value="draft.ollamaTimeout"
+                  @ionInput="onOllamaTimeoutInput"
+                />
+                <p v-if="fieldErrors.ollamaTimeout" class="nb-field-error">{{ fieldErrors.ollamaTimeout }}</p>
+              </div>
+              <div class="nb-field-slot">
+                <ion-input
+                  label="router.min_confidence (0–1)"
+                  label-placement="stacked"
+                  type="number"
+                  inputmode="decimal"
+                  :class="{ 'nb-input-bad': !!fieldErrors.minConfidence }"
+                  :aria-invalid="fieldErrors.minConfidence ? true : undefined"
+                  :value="draft.minConfidence"
+                  @ionInput="onMinConfidenceInput"
+                />
+                <p v-if="fieldErrors.minConfidence" class="nb-field-error">{{ fieldErrors.minConfidence }}</p>
+              </div>
+              <div class="nb-field-slot">
+                <ion-input
+                  label="poll_interval (s)"
+                  label-placement="stacked"
+                  type="number"
+                  inputmode="decimal"
+                  :class="{ 'nb-input-bad': !!fieldErrors.pollInterval }"
+                  :aria-invalid="fieldErrors.pollInterval ? true : undefined"
+                  :value="draft.pollInterval"
+                  @ionInput="onPollIntervalInput"
+                />
+                <p v-if="fieldErrors.pollInterval" class="nb-field-error">{{ fieldErrors.pollInterval }}</p>
+              </div>
             </div>
-            <!-- ST4: SAVE lives in the card footer row, aligned right (it saves the whole config) -->
+            <!-- ST4: SAVE lives in the card footer row, aligned right (it saves the whole config);
+                 success = transient "Saved" flash (2s, label back) — validation is inline per field -->
             <div class="nb-card-footer nb-save-row">
               <span v-if="store.lastSavedAt" class="nb-saved-at">saved at {{ formatIsoShort(store.lastSavedAt) }}</span>
-              <ion-button fill="solid" :disabled="store.configSaving" @click="save">
+              <ion-button fill="solid" class="nb-save-btn" :class="{ 'nb-save-flash': saveFlash }" :disabled="store.configSaving" @click="save">
                 <ion-spinner v-if="store.configSaving" name="crescent" />
-                <template v-else>Save</template>
+                <template v-else>{{ saveFlash ? 'Saved' : 'Save' }}</template>
               </ion-button>
+            </div>
+            <!-- post-save restart: double-arm (mirrors the Dashboard pattern), inline, no dialog -->
+            <div v-if="showRestartRow" class="nb-save-restart-row">
+              <ion-button
+                size="small"
+                fill="outline"
+                class="nb-restart-btn"
+                :class="{ 'nb-restart-armed': restartArmed }"
+                :disabled="store.daemonBusy"
+                @click="onSaveRestartClick"
+              >
+                <ion-spinner v-if="store.daemonBusy" name="crescent" />
+                <template v-else>{{ restartArmed ? 'Confirm restart?' : 'Restart daemon' }}</template>
+              </ion-button>
+              <span class="nb-muted">The daemon reads config only at boot — restart to apply the saved changes.</span>
             </div>
           </ion-card-content>
         </ion-card>
@@ -200,19 +241,19 @@
         </ion-card>
 
         <!-- validation + server errors -->
-        <div v-if="validationErrors.length > 0" class="nb-banner nb-banner-err">
+        <div v-if="validationBannerErrors.length > 0" class="nb-banner nb-banner-err">
           <div>
             <strong>Fix before saving:</strong>
             <ul class="nb-details">
-              <li v-for="detail in validationErrors" :key="detail">{{ detail }}</li>
+              <li v-for="detail in validationBannerErrors" :key="detail">{{ detail }}</li>
             </ul>
           </div>
         </div>
-        <div v-if="store.configSaveErrors.length > 0" class="nb-banner nb-banner-err">
+        <div v-if="saveBannerErrors.length > 0" class="nb-banner nb-banner-err">
           <div>
             <strong>Server rejected the change (400):</strong>
             <ul class="nb-details">
-              <li v-for="detail in store.configSaveErrors" :key="detail">{{ detail }}</li>
+              <li v-for="detail in saveBannerErrors" :key="detail">{{ detail }}</li>
             </ul>
           </div>
         </div>
@@ -223,9 +264,8 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
 import {
-  alertController,
   IonBadge,
   IonButton,
   IonButtons,
@@ -251,7 +291,13 @@ import { refreshOutline } from 'ionicons/icons';
 
 import { useBotStore } from '@/stores/bot';
 import { notifyClient, errorText } from '@/services/notifyClient';
-import { validateConfigDraft, validateRuleConditionKeys } from '@/services/configValidation';
+import {
+  splitDetailsByField,
+  validateConfigDraft,
+  validateRuleConditionKeys,
+  validateDraftFields,
+  type ConfigFieldKey
+} from '@/services/configValidation';
 import { formatIsoShort } from '@/utils/time';
 import {
   buttonLabel,
@@ -343,6 +389,70 @@ const draft = reactive<ConfigDraft>({
 const validationErrors = ref<string[]>([]);
 const rawError = ref<string | null>(null);
 const restartNote = ref<string | null>(null);
+/** Inline field errors (red border + message under the input): merged from
+ * the client pre-check and the server 400 details[]. */
+const fieldErrors = ref<Partial<Record<ConfigFieldKey, string>>>({});
+/** Success flash: "Saved" tint on the button for 2s, then label back. */
+const saveFlash = ref(false);
+let saveFlashTimer: number | null = null;
+/** Post-save restart affordance: double-arm like the Dashboard button, no dialog. */
+const RESTART_ARM_MS = 3000;
+const restartArmed = ref(false);
+const restartPending = ref(false);
+let restartArmTimer: number | null = null;
+
+const saveBannerErrors = computed<string[]>(() => {
+  const { unmapped } = splitDetailsByField(store.configSaveErrors);
+  // no details[] -> carry the 400 error text itself into the mapping
+  if (store.configSaveErrors.length === 0 && store.configError && store.config) {
+    const text = store.configError;
+    return splitDetailsByField([text]).unmapped;
+  }
+  return unmapped;
+});
+const validationBannerErrors = computed<string[]>(() => splitDetailsByField(validationErrors.value).unmapped);
+
+const restartBridge = computed(() => typeof window !== 'undefined' && !!window.notifyAPI?.daemon);
+const showRestartRow = computed(() => restartBridge.value && restartPending.value);
+
+function clearSaveFlashTimer(): void {
+  if (saveFlashTimer !== null) {
+    window.clearTimeout(saveFlashTimer);
+    saveFlashTimer = null;
+  }
+}
+
+function clearRestartArmTimer(): void {
+  if (restartArmTimer !== null) {
+    window.clearTimeout(restartArmTimer);
+    restartArmTimer = null;
+  }
+}
+
+function disarmRestart(): void {
+  restartArmed.value = false;
+  clearRestartArmTimer();
+}
+
+function onSaveRestartClick(): void {
+  if (!restartArmed.value) {
+    restartArmed.value = true;
+    clearRestartArmTimer();
+    restartArmTimer = window.setTimeout(disarmRestart, RESTART_ARM_MS);
+    return;
+  }
+  disarmRestart();
+  restartPending.value = false;
+  void store.restartDaemon().then(() => store.pollDaemon());
+}
+
+function clearFieldError(key: ConfigFieldKey): void {
+  if (fieldErrors.value[key] !== undefined) {
+    const next = { ...fieldErrors.value };
+    delete next[key];
+    fieldErrors.value = next;
+  }
+}
 
 /** Ionic input/textarea events carry { value?: string | null }. */
 type IonValueEvent = CustomEvent<{ value?: string | null }>;
@@ -369,6 +479,7 @@ function buildDraft(config: BotConfig): void {
   draft.rawRules = JSON.stringify(draft.rules, null, 2);
   rawError.value = null;
   validationErrors.value = [];
+  fieldErrors.value = {};
 }
 
 function buildPayload(): BotConfig {
@@ -405,11 +516,26 @@ function buildPayload(): BotConfig {
   };
 }
 
-const onOllamaUrlInput = (event: IonValueEvent) => (draft.ollamaUrl = textOf(event));
-const onOllamaModelInput = (event: IonValueEvent) => (draft.ollamaModel = textOf(event));
-const onOllamaTimeoutInput = (event: IonValueEvent) => (draft.ollamaTimeout = textOf(event));
-const onMinConfidenceInput = (event: IonValueEvent) => (draft.minConfidence = textOf(event));
-const onPollIntervalInput = (event: IonValueEvent) => (draft.pollInterval = textOf(event));
+const onOllamaUrlInput = (event: IonValueEvent) => {
+  draft.ollamaUrl = textOf(event);
+  clearFieldError('ollamaUrl');
+};
+const onOllamaModelInput = (event: IonValueEvent) => {
+  draft.ollamaModel = textOf(event);
+  clearFieldError('ollamaModel');
+};
+const onOllamaTimeoutInput = (event: IonValueEvent) => {
+  draft.ollamaTimeout = textOf(event);
+  clearFieldError('ollamaTimeout');
+};
+const onMinConfidenceInput = (event: IonValueEvent) => {
+  draft.minConfidence = textOf(event);
+  clearFieldError('minConfidence');
+};
+const onPollIntervalInput = (event: IonValueEvent) => {
+  draft.pollInterval = textOf(event);
+  clearFieldError('pollInterval');
+};
 
 function onActionToggle(event: CustomEvent<{ checked: boolean }>, index: number): void {
   if (draft.actions[index]) draft.actions[index].enabled = event.detail.checked;
@@ -473,35 +599,14 @@ function condValueText(value: string | string[]): string {
 
 function discard(): void {
   validationErrors.value = [];
+  fieldErrors.value = {};
+  disarmRestart();
+  restartPending.value = false;
   if (store.config) {
     void store.loadConfig().then(() => {
       if (store.config) buildDraft(store.config);
     });
   }
-}
-
-async function confirmRestart(): Promise<void> {
-  const bridge = window.notifyAPI?.daemon;
-  if (!bridge) {
-    restartNote.value =
-      'Config saved. Restart the daemon manually (`python3 bot.py`) — process manager is available only in the Electron app.';
-    return;
-  }
-  const alert = await alertController.create({
-    header: 'Restart daemon?',
-    message: 'The daemon reads config only at boot. Restart now to apply the changes?',
-    buttons: [
-      { text: 'Later', role: 'cancel' },
-      {
-        text: 'Restart',
-        role: 'destructive',
-        handler: () => {
-          void store.restartDaemon();
-        }
-      }
-    ]
-  });
-  await alert.present();
 }
 
 async function save(): Promise<void> {
@@ -518,11 +623,45 @@ async function save(): Promise<void> {
     validationErrors.value = [err instanceof Error ? err.message : String(err)];
     return;
   }
-  validationErrors.value = validateConfigDraft(payload);
-  if (validationErrors.value.length > 0) return;
+  // Inline-only validation (no browser alert): client rules first, then the
+  // full server-mirror pass, both mapped onto the offending fields.
+  const clientErrors = validateConfigDraft(payload);
+  const mappedClient = splitDetailsByField(clientErrors).fieldErrors;
+  const fieldChecks = validateDraftFields({
+    ollamaUrl: draft.ollamaUrl,
+    ollamaModel: draft.ollamaModel,
+    ollamaTimeout: draft.ollamaTimeout,
+    minConfidence: draft.minConfidence,
+    pollInterval: draft.pollInterval
+  });
+  fieldErrors.value = { ...mappedClient, ...fieldChecks };
+  validationErrors.value = clientErrors;
+  // pre-existing blocking rule stays: any client-mirror violation (fields,
+  // actions, rules…) blocks the round-trip; non-field leftovers hit the banner
+  if (clientErrors.length > 0 || Object.keys(fieldChecks).length > 0) return;
   const ok = await store.saveConfig(payload);
   if (ok) {
-    await confirmRestart();
+    // success: transient "Saved" flash (2s, label back)
+    clearSaveFlashTimer();
+    saveFlash.value = true;
+    saveFlashTimer = window.setTimeout(() => {
+      saveFlash.value = false;
+      saveFlashTimer = null;
+    }, 2000);
+    // post-save restart: double-arm affordance (electron bridge only)
+    if (restartBridge.value) {
+      disarmRestart();
+      restartPending.value = true;
+    } else {
+      restartNote.value =
+        'Config saved. Restart the daemon manually (`python3 bot.py`) — process manager is available only in the Electron app.';
+    }
+  } else {
+    // server 400: map the details[] (or the bare error text) onto fields;
+    // non-field details stay in the banner
+    const candidates =
+      store.configSaveErrors.length > 0 ? store.configSaveErrors : store.configError ? [store.configError] : [];
+    fieldErrors.value = { ...fieldErrors.value, ...splitDetailsByField(candidates).fieldErrors };
   }
 }
 
@@ -531,6 +670,11 @@ onMounted(async () => {
   await store.loadConfig();
   if (store.config) buildDraft(store.config);
   await connectorsTask;
+});
+
+onUnmounted(() => {
+  clearSaveFlashTimer();
+  disarmRestart();
 });
 </script>
 
@@ -631,6 +775,48 @@ onMounted(async () => {
 .nb-save-row {
   justify-content: flex-end;
   gap: var(--nb-space-3);
+}
+/* inline field validation: red border + message line below the offender */
+.nb-field-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.nb-field .nb-input-bad {
+  border-color: var(--nb-danger);
+}
+.nb-field .nb-input-bad:focus-within {
+  border-color: var(--nb-danger);
+  box-shadow: 0 0 0 2px var(--nb-danger-muted);
+}
+.nb-field-error {
+  margin: 0 0 var(--nb-space-1);
+  padding-left: var(--nb-space-1);
+  font-size: var(--nb-fs-micro);
+  color: var(--ion-color-danger);
+}
+/* success flash: ok tint pair on the save button for 2s */
+.nb-save-flash {
+  --background: var(--nb-chip-ok-bg);
+  --color: var(--nb-chip-ok-fg);
+  --border-width: 1px;
+  --border-style: solid;
+  --border-color: var(--nb-green);
+}
+/* post-save restart affordance: double-arm button + inline note (no dialog) */
+.nb-save-restart-row {
+  display: flex;
+  align-items: center;
+  gap: var(--nb-space-3);
+  margin-top: var(--nb-space-2);
+  padding-top: var(--nb-space-2);
+  border-top: 1px solid var(--nb-border-subtle);
+}
+.nb-save-restart-row .nb-restart-armed {
+  --background: var(--nb-chip-warn-bg);
+  --border-color: var(--nb-warning);
+  --color: var(--nb-chip-warn-fg);
+  --box-shadow: none;
 }
 .nb-saved-at {
   font-size: var(--nb-fs-secondary);

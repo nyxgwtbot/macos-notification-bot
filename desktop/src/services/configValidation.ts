@@ -12,6 +12,95 @@ export const KNOWN_RULE_FIELDS = ['app', 'title', 'subtitle', 'body', 'category'
 
 const ACTION_TYPES = ['builtin', 'command'];
 
+/** The five editable structured config fields (ConfigView, loop2 iterB). */
+export type ConfigFieldKey = 'ollamaUrl' | 'ollamaModel' | 'ollamaTimeout' | 'minConfidence' | 'pollInterval';
+
+export interface ConfigDraftFields {
+  ollamaUrl: string;
+  ollamaModel: string;
+  ollamaTimeout: string;
+  minConfidence: string;
+  pollInterval: string;
+}
+
+/** Canonical English rule text per field (server details are PT; the UI copy
+ * stays English per mission). */
+const FIELD_RULE_TEXT: Record<ConfigFieldKey, string> = {
+  ollamaUrl: 'Ollama URL must be a non-empty http(s)://… address.',
+  ollamaModel: 'Ollama model must not be empty.',
+  ollamaTimeout: 'Ollama timeout must be a number > 0.',
+  minConfidence: 'min_confidence must be a number between 0 and 1.',
+  pollInterval: 'poll_interval must be a number > 0.'
+};
+
+/** Server detail snippets (notifybot/api.py validate_config_payload wording)
+ * that identify exactly one field. */
+const FIELD_DETAIL_PATTERNS: ReadonlyArray<{ key: ConfigFieldKey; re: RegExp }> = [
+  { key: 'ollamaUrl', re: /'ollama\.url'/ },
+  { key: 'ollamaModel', re: /'ollama\.model'/ },
+  { key: 'ollamaTimeout', re: /'ollama\.timeout'/ },
+  { key: 'minConfidence', re: /'router\.min_confidence'/ },
+  { key: 'pollInterval', re: /'poll_interval'/ }
+];
+
+function parseFiniteNumber(text: string): number | null {
+  if (text.trim() === '') return null;
+  const value = Number(text);
+  return Number.isFinite(value) ? value : null;
+}
+
+/** Per-field rule check for the structured editor inputs (client-side rules:
+ * url http(s), model non-empty, timeout > 0, min_confidence 0–1,
+ * poll_interval > 0 — the server does not enforce the scheme). */
+export function validateDraftFields(fields: ConfigDraftFields): Partial<Record<ConfigFieldKey, string>> {
+  const errors: Partial<Record<ConfigFieldKey, string>> = {};
+
+  const url = fields.ollamaUrl.trim();
+  if (url === '') {
+    errors.ollamaUrl = FIELD_RULE_TEXT.ollamaUrl;
+  } else if (!/^https?:\/\//i.test(url)) {
+    errors.ollamaUrl = 'Ollama URL must start with http:// or https://.';
+  }
+
+  if (fields.ollamaModel.trim() === '') errors.ollamaModel = FIELD_RULE_TEXT.ollamaModel;
+
+  const timeout = parseFiniteNumber(fields.ollamaTimeout);
+  if (timeout === null || timeout <= 0) errors.ollamaTimeout = FIELD_RULE_TEXT.ollamaTimeout;
+
+  const minConfidence = parseFiniteNumber(fields.minConfidence);
+  if (minConfidence === null || minConfidence < 0 || minConfidence > 1) {
+    errors.minConfidence = FIELD_RULE_TEXT.minConfidence;
+  }
+
+  const pollInterval = parseFiniteNumber(fields.pollInterval);
+  if (pollInterval === null || pollInterval <= 0) errors.pollInterval = FIELD_RULE_TEXT.pollInterval;
+
+  return errors;
+}
+
+/**
+ * Map a save response's details[] (or a 400 error text) to the specific
+ * field: each detail identifies at most one field. Unmatched details come
+ * back too so non-field errors keep their banner. English canonical texts
+ * are used for the inline message; full detail strings still surface
+ * through the banner. */
+export function splitDetailsByField(details: string[]): {
+  fieldErrors: Partial<Record<ConfigFieldKey, string>>;
+  unmapped: string[];
+} {
+  const fieldErrors: Partial<Record<ConfigFieldKey, string>> = {};
+  const unmapped: string[] = [];
+  for (const detail of details) {
+    const match = FIELD_DETAIL_PATTERNS.find((entry) => entry.re.test(detail));
+    if (match && fieldErrors[match.key] === undefined) {
+      fieldErrors[match.key] = FIELD_RULE_TEXT[match.key];
+    } else if (!match) {
+      unmapped.push(detail);
+    }
+  }
+  return { fieldErrors, unmapped };
+}
+
 function isNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
