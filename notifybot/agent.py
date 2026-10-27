@@ -1,9 +1,19 @@
 """In-process agent tool loop for the desktop Chat tab.
 
 One turn = load/create session -> loop (<= MAX_TOOL_TURNS): global budget
-check -> LLM call -> strict one-JSON-per-turn parse (one protocol-reminder
-retry) -> tool dispatch or final answer -> append-only JSONL persistence
+check -> LLM call -> strict one-JSON-per-turn parse (reminder retry) -> tool
+dispatch or final answer -> append-only JSONL persistence
 under ``<config_dir>/data/agent_sessions/<session_id>.jsonl``.
+
+Context hygiene + drift guards (post-8f0ae727 fix):
+
+- history tool rows re-send args with LARGE values redacted to a short
+  ``args_summary`` marker (the full args stay only in the session jsonl);
+- when the last successful tool is ``dashboard.create``, the next prompt
+  carries a targeted continuation recipe (the exact ``server.serve`` template
+  with the real artifact id) instead of only the generic protocol reminder;
+- every raw model output is persisted BEFORE parsing as an ``assistant_raw``
+  row (``raw_model_output`` capped at ~8 KB) for drift post-mortems.
 
 LLM injection: ``run_turn(runtime, session_id, message, llm_fn=None)``.
 ``llm_fn(messages) -> str`` — an exception raised by ``llm_fn`` is converted
@@ -44,12 +54,36 @@ SESSION_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 AGENT_MESSAGE_MAX_BYTES = 8192
 MOCK_ENV = "NOTIFYBOT_SMOKE_AGENT_MOCK"
 
+# Raw model outputs are persisted per LLM call (drift post-mortems use real
+# data), each row capped at ~8 KB; bigger outputs keep their head + marker.
+RAW_MODEL_OUTPUT_MAX_BYTES = 8192
+# Tool args larger than this are REDACTED in the model context (a size marker
+# replaces the value); the full args live only in the session jsonl.
+TOOL_ARG_INLINE_MAX_CHARS = 160
+
 PROMPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_prompt.md")
 
-PROTOCOL_REMINDER = (
+REMINDER_PREFIX = "[protocol reminder] "
+
+PROTOCOL_REMINDER = REMINDER_PREFIX + (
     "Your previous reply was NOT one valid protocol JSON object. Reply again with "
     'EXACTLY ONE JSON object \u2014 either {"tool": "<name>", "args": {...}} or '
     '{"answer": "<pt-br text>", "urls": [...]} \u2014 with no prose and no markdown fences.'
+)
+
+# Targeted recipe re-anchoring (drift fix for the post-dashboard.create turn):
+# when the last successful tool in context is dashboard.create, this template
+# (with the REAL artifact id substituted) replaces the generic reminder —
+# generic-only reminders let glm-5.3-flash drift into prose twice and kill the
+# pipeline before server.serve/answer.
+SERVE_CONTINUATION_TEMPLATE = (
+    REMINDER_PREFIX
+    + "The tool result shows the dashboard was created successfully. Reply NOW with "
+    "EXACTLY ONE JSON object \u2014 no prose, no markdown fences. The required next step is:\n"
+    '{"tool": "server.serve", "args": {"action": "ensure", "artifact_id": "{artifact_id}"}}\n'
+    "After the server.serve result arrives, reply with the final answer shape:\n"
+    '{"answer": "<short pt-br text>", "urls": ["<the url from the server.serve result>"]}. '
+    "Never repeat dashboard.create and never call other tools before server.serve."
 )
 
 _TRUNCATED_MARKER = (
@@ -222,6 +256,93 @@ def truncate_tool_result_text(text: str, budget: int = TOOL_RESULT_MAX_BYTES) ->
     return piece + marker
 
 
+_RAW_OUTPUT_TRUNCATED_MARKER = (
+    "\n...[raw model output truncated \u2014 kept {kept} of {total} bytes]"
+)
+_RAW_OUTPUT_RESERVE_BYTES = 128
+
+
+def truncate_raw_model_output(text: str, budget: int = RAW_MODEL_OUTPUT_MAX_BYTES) -> str:
+    """Persist-safe truncation of one RAW model output (capped at ~8 KB) so
+    protocol-drift post-mortems always have the real bytes the model produced."""
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= budget:
+        return text
+    keep = max(budget - _RAW_OUTPUT_RESERVE_BYTES, 0)
+    piece = encoded[:keep].decode("utf-8", errors="ignore")
+    marker = _RAW_OUTPUT_TRUNCATED_MARKER.format(kept=len(piece.encode("utf-8")), total=len(encoded))
+    return piece + marker
+
+
+def _stored_arg_marker(key: str, size: int) -> str:
+    return f"<{key}: {size} bytes stored in the session file, not re-sent>"
+
+
+def summarize_tool_args(args: Any) -> str:
+    """Deterministic, short summary of a tool call's args for the LLM context.
+
+    Large string/JSON values (e.g. the ~6 KB HTML echoed by dashboard.create)
+    collapse to a size marker so the context never re-carries the full payload;
+    small values stay verbatim. Returns "" when NOTHING was redacted — the
+    caller then keeps rendering the original args JSON (small tools unchanged).
+    """
+    if not isinstance(args, dict) or not args:
+        return ""
+    redacted: Dict[str, Any] = {}
+    changed = False
+    for key, value in args.items():
+        if isinstance(value, str):
+            if len(value.encode("utf-8")) <= TOOL_ARG_INLINE_MAX_CHARS:
+                redacted[str(key)] = value
+            else:
+                redacted[str(key)] = _stored_arg_marker(str(key), len(value.encode("utf-8")))
+                changed = True
+        else:
+            rendered = json.dumps(value, ensure_ascii=False, default=str)
+            if len(rendered.encode("utf-8")) <= TOOL_ARG_INLINE_MAX_CHARS:
+                redacted[str(key)] = value
+            else:
+                redacted[str(key)] = _stored_arg_marker(str(key), len(rendered.encode("utf-8")))
+                changed = True
+    if not changed:
+        return ""
+    return json.dumps(redacted, ensure_ascii=False, default=str)
+
+
+def _artifact_id_of(result: Any) -> Optional[str]:
+    """Full artifact id when a tool result produced one, else None."""
+    if isinstance(result, dict):
+        artifact_id = result.get("artifact_id")
+        if isinstance(artifact_id, str) and artifact_id:
+            return artifact_id
+    return None
+
+
+def continuation_reminder_for(records: List[dict]) -> Optional[str]:
+    """Targeted recipe re-anchoring: when the NEWEST meaningful record is a
+    SUCCESSFUL ``dashboard.create`` step, return the continuation recipe with
+    the real artifact id; otherwise None (the generic PROTOCOL_REMINDER path
+    stays untouched for every other state). Raw bookkeeping rows are skipped."""
+    record: Any = None
+    for known_record in reversed(records):
+        if isinstance(known_record, dict) and known_record.get("role") == "assistant_raw":
+            continue
+        record = known_record
+        break
+    if not isinstance(record, dict):
+        return None
+    if record.get("role") != "assistant" or "tool" not in record:
+        return None
+    if record.get("tool") != "dashboard.create" or record.get("error") is not None:
+        return None
+    artifact_id = _artifact_id_of(record.get("result"))
+    if not artifact_id:
+        return None
+    return SERVE_CONTINUATION_TEMPLATE.replace("{artifact_id}", artifact_id)
+
+
 def build_context(
     system_prompt: str,
     records: List[dict],
@@ -247,10 +368,20 @@ def build_context(
                 }
             )
         elif role == "assistant" and "tool" in record:
-            lines = [
-                "tool_call: "
-                + json.dumps({"tool": record.get("tool"), "args": record.get("args", {})}, ensure_ascii=False)
-            ]
+            # Context hygiene: large tool args (the ~6 KB dashboard HTML) are
+            # redacted to a short deterministic marker — only small args are
+            # ever re-sent verbatim. The RESULT row stays intact (small) so
+            # the artifact id remains discoverable.
+            args_summary = summarize_tool_args(record.get("args"))
+            call_view: Dict[str, Any] = {"tool": record.get("tool")}
+            if args_summary:
+                call_view["args_summary"] = args_summary
+                artifact_id = _artifact_id_of(record.get("result"))
+                if artifact_id:
+                    call_view["artifact_hint"] = f"{artifact_id[:8]}\u2026html"
+            else:
+                call_view["args"] = record.get("args", {})
+            lines = ["tool_call: " + json.dumps(call_view, ensure_ascii=False)]
             if record.get("error") is not None:
                 lines.append("tool_error: " + json.dumps({"error": record.get("error")}, ensure_ascii=False))
             else:
@@ -260,7 +391,7 @@ def build_context(
                     + truncate_tool_result_text(json.dumps(result, ensure_ascii=False, default=str))
                 )
             rendered.append({"role": "assistant", "content": "\n".join(lines)})
-        # unknown record shapes (future) are skipped, never crash the loop
+        # unknown record shapes (future: raw bookkeeping rows) are skipped
     return [{"role": "system", "content": system_prompt}] + rendered[-window:]
 
 
@@ -325,9 +456,13 @@ def _mock_llm(messages: List[dict]) -> str:
     """Deterministic scripted LLM for the API smoke (TEST/SMOKE-ONLY)."""
     user_text = ""
     for message in reversed(messages):
-        if message.get("role") == "user":
-            user_text = str(message.get("content", ""))
-            break
+        if message.get("role") != "user":
+            continue
+        # Reminder/continuation messages are loop bookkeeping, not the request.
+        if str(message.get("content", "")).startswith(REMINDER_PREFIX):
+            continue
+        user_text = str(message.get("content", ""))
+        break
 
     tool_calls = 0
     last_call_name: Optional[str] = None
@@ -506,25 +641,53 @@ def run_turn(
             answer_text = budget_answer
             break
 
+        continuation = continuation_reminder_for(records)
+        extra_messages: List[dict] = []
+        if continuation is not None:
+            # Recipe re-anchoring: right after a successful dashboard.create
+            # the next prompt carries the exact server.serve continuation.
+            extra_messages.append({"role": "user", "content": continuation})
+
         try:
-            raw = resolve_llm(build_context(system_prompt, records))
+            raw = resolve_llm(build_context(system_prompt, records) + extra_messages)
         except Exception as e:  # noqa: BLE001 - graceful LLM failure, never a 500
             logger.warning("Agent LLM call failed: %s", e)
             answer_text = llm_down_answer
             break
 
+        # Observability: persist the RAW output of every LLM call before
+        # parsing (phase-tagged; cap ~8 KB) so drift post-mortems use real data.
+        store.append(
+            session_id,
+            {
+                "role": "assistant_raw",
+                "phase": "attempt",
+                "raw_model_output": truncate_raw_model_output(str(raw)),
+            },
+        )
+
         parsed = parse_model_json(raw)
         if parsed is None:
-            # One protocol-reminder retry (does not consume a tool turn; the
-            # reminder is NOT persisted to the session).
+            # One retry, not persisted to the session. When the drift happened
+            # right after dashboard.create, the retry re-anchors with the
+            # targeted continuation recipe instead of the generic reminder.
+            retry_tail = continuation if continuation is not None else PROTOCOL_REMINDER
             try:
                 retry_raw = resolve_llm(
-                    build_context(system_prompt, records) + [{"role": "user", "content": PROTOCOL_REMINDER}]
+                    build_context(system_prompt, records) + [{"role": "user", "content": retry_tail}]
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("Agent LLM protocol-retry failed: %s", e)
                 answer_text = llm_down_answer
                 break
+            store.append(
+                session_id,
+                {
+                    "role": "assistant_raw",
+                    "phase": "protocol_retry",
+                    "raw_model_output": truncate_raw_model_output(str(retry_raw)),
+                },
+            )
             parsed = parse_model_json(retry_raw)
             if parsed is None:
                 answer_text = (

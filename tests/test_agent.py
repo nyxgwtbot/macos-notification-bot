@@ -20,9 +20,14 @@ import urllib.request
 from tests.test_api import ApiServerFixture, valid_config_payload
 from notifybot.agent import (
     AgentSessionStore,
+    RAW_MODEL_OUTPUT_MAX_BYTES,
+    REMINDER_PREFIX,
     build_context,
+    continuation_reminder_for,
     parse_model_json,
     run_turn,
+    summarize_tool_args,
+    truncate_raw_model_output,
     truncate_tool_result_text,
 )
 from notifybot.agent_tools import (
@@ -37,6 +42,13 @@ URL_RE = re.compile(r"^http://127\.0\.0\.1:(\d+)/([0-9a-f]{32})\.html$")
 DASHBOARD_HTML = (
     "<!DOCTYPE html><html><head><title>Health Dashboard</title></head>"
     "<body><h1>Health Dashboard</h1><p>ok</p></body></html>"
+)
+# Large-but-valid dashboard body (> TOOL_ARG_INLINE_MAX_CHARS) whose unique
+# marker must never surface back into the model context after redaction.
+DRIFT_HTML_SENTINEL = "SENTINEL-BODY-7c4f"
+LARGE_HTML = (
+    "<!DOCTYPE html><html><head><title>Finance Dashboard</title></head>"
+    f"<body><h1>Finance</h1><p>{DRIFT_HTML_SENTINEL * 12}</p></body></html>"
 )
 
 
@@ -83,6 +95,16 @@ def find_last_tool_result(messages, tool_name):
                 except ValueError:
                     continue
     return {}
+
+
+def serve_from_recipe_reminder(messages):
+    """Simulates the true-model recovery: read the real artifact id straight
+    out of the continuation reminder the loop appended (last user message)."""
+    reminder = str(messages[-1].get("content", ""))
+    assert reminder.startswith(REMINDER_PREFIX), reminder
+    match = re.search(r'"artifact_id": "([0-9a-f]{32})"', reminder)
+    assert match, reminder
+    return json.dumps({"tool": "server.serve", "args": {"action": "ensure", "artifact_id": match.group(1)}})
 
 
 # ---- runtime factory ------------------------------------------------------------
@@ -166,11 +188,15 @@ class TestDashboardChainSuccess(unittest.TestCase):
         self.assertIn("text/html", resp.headers.get("Content-Type", ""))
         self.assertIn("<title>Health Dashboard</title>", body)
 
-        # Session persisted: user + 3 tool steps + answer.
+        # Session persisted: user + [(raw row per LLM call), tool step] ×3
+        # + answer. Raw rows (assistant_raw) capture every model output.
         records = AgentSessionStore(self.runtime.config_dir).load(response["session_id"])
         self.assertIsNotNone(records)
         self.assertEqual([r.get("role") for r in records],
-                         ["user", "assistant", "assistant", "assistant", "assistant"])
+                         ["user", "assistant_raw", "assistant",
+                          "assistant_raw", "assistant",
+                          "assistant_raw", "assistant",
+                          "assistant_raw", "assistant"])
         self.assertIn("answer", records[-1])
         self.assertEqual(records[-1]["urls"], response["urls"])
         server_status = self.runtime.agent_registry.list()
@@ -198,7 +224,7 @@ class TestMaxTurnsGuard(unittest.TestCase):
             self.assertIn("atingi o limite", response["answer"])
             self.assertIn("6 passos", response["answer"])
             records = AgentSessionStore(runtime.config_dir).load(response["session_id"])
-            self.assertEqual(len(records), 8)  # user + 6 steps + guard answer
+            self.assertEqual(len(records), 14)  # user + 6×(raw, step) + guard answer
 
 
 class TestUnparsableRetry(unittest.TestCase):
@@ -224,8 +250,14 @@ class TestUnparsableRetry(unittest.TestCase):
             self.assertEqual(response["turn"], [])
             self.assertEqual(response["answer"], "Olá! Como posso ajudar hoje?")
             records = AgentSessionStore(runtime.config_dir).load(response["session_id"])
-            self.assertEqual([r.get("role") for r in records], ["user", "assistant"])
+            self.assertEqual([r.get("role") for r in records],
+                             ["user", "assistant_raw", "assistant_raw", "assistant"])
             self.assertNotIn("EXACTLY ONE JSON object", records[0]["content"])
+            # Both drift outputs were persisted as raw rows (post-mortem data).
+            self.assertEqual([r["phase"] for r in records[1:3]], ["attempt", "protocol_retry"])
+            self.assertIn("markdown", records[1]["raw_model_output"])
+            # The retry raw row holds the exact escaped JSON the model produced.
+            self.assertIn("Como posso ajudar hoje?", records[2]["raw_model_output"])
 
     def test_two_failures_error_answer_and_session_kept(self):
         with tempfile.TemporaryDirectory() as root:
@@ -237,6 +269,183 @@ class TestUnparsableRetry(unittest.TestCase):
             records = AgentSessionStore(runtime.config_dir).load(response["session_id"])
             self.assertIsNotNone(records)
             self.assertEqual(records[-1]["answer"], response["answer"])
+
+
+class TestDriftAfterCreateGuard(unittest.TestCase):
+    """Regression (real run 8f0ae727): after dashboard.create ok, the model
+    replies TWO unparsable outputs even WITH the serve continuation reminder —
+    guard answer fires, artifact exists, url NOT delivered."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runtime = make_runtime(self.tmp.name)
+        self.addCleanup(self.runtime.agent_registry.stop)
+
+    def test_drift_guard_artifact_kept_url_not_delivered(self):
+        llm = ScriptedLLM(
+            [
+                json.dumps(
+                    {
+                        "tool": "dashboard.create",
+                        "args": {"title": "Finance Month", "html": LARGE_HTML, "data_source": "app.data:finance_summary"},
+                    }
+                ),
+                "Já montei o dashboard financeiro deste mês, ele ficou pronto! 🎉",
+                "Vou exibir o dashboard agora na aba do aplicativo para você.",
+            ]
+        )
+        response = run_turn(self.runtime, None, "Crie um dashboard financeiro deste mês", llm_fn=llm)
+        self.assertEqual(llm.call_count, 3)
+
+        # Guard answer (second-failure behavior preserved) and NO delivered url.
+        self.assertIn("formato JSON", response["answer"])
+        self.assertEqual(response["urls"], [])
+        # Only the create step ran; serve/answer never happened.
+        self.assertEqual([step["tool"] for step in response["turn"]], ["dashboard.create"])
+
+        # The artifact was already persisted and remains on disk.
+        artifact_id = response["turn"][0]["result"]["artifact_id"]
+        self.assertTrue(os.path.isfile(os.path.join(self.runtime.artifacts_dir(), f"{artifact_id}.html")))
+
+        # The post-create attempt prompt AND the drift retry were re-anchored
+        # with the targeted server.serve recipe (real id), not the generic one.
+        attempt_tail = llm.calls[1][-1]
+        self.assertEqual(attempt_tail["role"], "user")
+        self.assertTrue(attempt_tail["content"].startswith(REMINDER_PREFIX))
+        self.assertIn('"tool": "server.serve"', attempt_tail["content"])
+        retry_tail = llm.calls[2][-1]
+        self.assertTrue(retry_tail["content"].startswith(REMINDER_PREFIX))
+        self.assertIn('"tool": "server.serve", "args": {"action": "ensure", "artifact_id"', retry_tail["content"])
+        self.assertIn(artifact_id, retry_tail["content"])  # real id substituted
+        self.assertNotIn("previous reply was NOT one valid protocol JSON object", retry_tail["content"])
+
+        # Session roles: user, raw(create call), create, raw(attempt),
+        # raw(protocol_retry), guard answer — drift outputs persisted.
+        records = AgentSessionStore(self.runtime.config_dir).load(response["session_id"])
+        self.assertEqual([r.get("role") for r in records],
+                         ["user", "assistant_raw", "assistant", "assistant_raw", "assistant_raw", "assistant"])
+        raw_rows = [r for r in records if r.get("role") == "assistant_raw"]
+        self.assertEqual([r["phase"] for r in raw_rows], ["attempt", "attempt", "protocol_retry"])
+        self.assertIn("Já montei", raw_rows[1]["raw_model_output"])
+        self.assertIn("Vou exibir", raw_rows[2]["raw_model_output"])
+        self.assertEqual(records[-1]["answer"], response["answer"])
+
+
+class TestRecoveryAfterCreate(unittest.TestCase):
+    """Recovery path: unparsable output once post-create, then the targeted
+    recipe reminder leads the model back to server.serve -> full URL works."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runtime = make_runtime(self.tmp.name)
+        self.addCleanup(self.runtime.agent_registry.stop)
+
+    def test_one_drift_output_recovers_via_serve_recipe(self):
+        llm = ScriptedLLM(
+            [
+                json.dumps(
+                    {
+                        "tool": "dashboard.create",
+                        "args": {"title": "Finance Month", "html": LARGE_HTML, "data_source": "app.data:finance_summary"},
+                    }
+                ),
+                "Pronto! O dashboard financeiro deste mês já está disponível.",  # drift attempt 1
+                serve_from_recipe_reminder,  # recovery on the recipe reminder
+                lambda messages: json.dumps(
+                    {
+                        "answer": "Aqui está o dashboard financeiro deste mês, pronto na aba Chat.",
+                        "urls": [find_last_tool_result(messages, "server.serve")["url"]],
+                    }
+                ),
+            ]
+        )
+        response = run_turn(self.runtime, None, "Crie um dashboard financeiro deste mês", llm_fn=llm)
+        self.assertEqual(llm.call_count, 4)
+        self.assertEqual([step["tool"] for step in response["turn"]], ["dashboard.create", "server.serve"])
+        self.assertEqual(response["answer"], "Aqui está o dashboard financeiro deste mês, pronto na aba Chat.")
+
+        # answer.urls[0] works end-to-end (HTTP GET 200 on the artifact).
+        match = URL_RE.match(response["urls"][0])
+        self.assertIsNotNone(match, response["urls"])
+        with urllib.request.urlopen(response["urls"][0], timeout=5) as resp:
+            body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("<title>Finance Dashboard</title>", body)
+
+        # First attempt got the continuation; the retry re-anchored too.
+        self.assertTrue(llm.calls[1][-1]["content"].startswith(REMINDER_PREFIX))
+        retry_tail = llm.calls[2][-1]
+        self.assertIn('"tool": "server.serve", "args": {"action": "ensure", "artifact_id"', retry_tail["content"])
+
+        records = AgentSessionStore(self.runtime.config_dir).load(response["session_id"])
+        self.assertEqual([r.get("role") for r in records],
+                         ["user", "assistant_raw", "assistant",
+                          "assistant_raw", "assistant_raw", "assistant",
+                          "assistant_raw", "assistant"])
+
+
+class TestPostCreatePromptHygiene(unittest.TestCase):
+    """Regression (c): the post-create outgoing prompt must NOT contain the
+    raw HTML body (args redacted to args_summary + artifact_hint) while the
+    create tool_result row stays intact; full args remain in the session file
+    and in the current-turn execution path only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runtime = make_runtime(self.tmp.name)
+        self.addCleanup(self.runtime.agent_registry.stop)
+
+    def test_post_create_prompt_redacts_html_keeps_anchors(self):
+        llm = ScriptedLLM(
+            [
+                json.dumps(
+                    {
+                        "tool": "dashboard.create",
+                        "args": {"title": "Finance Month", "html": LARGE_HTML, "data_source": "app.data:finance_summary"},
+                    }
+                ),
+                serve_from_recipe_reminder,
+                lambda messages: json.dumps(
+                    {
+                        "answer": "Dashboard financeiro pronto.",
+                        "urls": [find_last_tool_result(messages, "server.serve")["url"]],
+                    }
+                ),
+            ]
+        )
+        response = run_turn(self.runtime, None, "me mostre o dashboard financeiro", llm_fn=llm)
+        self.assertEqual(llm.call_count, 3)
+
+        # The post-create outgoing prompt: no raw HTML body, markers present.
+        post_create_dump = json.dumps(llm.calls[1], ensure_ascii=False)
+        self.assertNotIn(DRIFT_HTML_SENTINEL, post_create_dump)
+        create_call_message = [m for m in llm.calls[1] if '"args_summary"' in str(m.get("content"))][0]
+        self.assertIn("tool_call:", create_call_message["content"])
+        self.assertIn("stored in the session file, not re-sent", create_call_message["content"])
+        # The create RESULT row (small) stays intact and carries the artifact id.
+        artifact_id = find_last_tool_result(llm.calls[1], "dashboard.create")["artifact_id"]
+        self.assertTrue(artifact_id)
+        # The create args never leak back into a later prompt either.
+        self.assertNotIn(DRIFT_HTML_SENTINEL, json.dumps(llm.calls[2], ensure_ascii=False))
+
+        # The continuation reminder carries the exact next-step template.
+        tail = llm.calls[1][-1]
+        self.assertTrue(tail["content"].startswith(REMINDER_PREFIX))
+        self.assertIn('{"tool": "server.serve", "args": {"action": "ensure", "artifact_id": "' + artifact_id, tail["content"])
+
+        # Full args persist in the session file (post-mortem) and in the
+        # current-turn execution path/response payload.
+        records = AgentSessionStore(self.runtime.config_dir).load(response["session_id"])
+        create_record = [r for r in records if r.get("tool") == "dashboard.create"][0]
+        self.assertIn(DRIFT_HTML_SENTINEL, create_record["args"]["html"])
+        self.assertIn(DRIFT_HTML_SENTINEL, response["turn"][0]["args"]["html"])
+
+        # End-to-end: the answer's url serves the artifact (200).
+        with urllib.request.urlopen(response["urls"][0], timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
 
 
 class TestLLMFailureGraceful(unittest.TestCase):
@@ -432,6 +641,86 @@ class TestContextWindowAndTruncation(unittest.TestCase):
         self.assertIn("tool_result:", tool_message["content"])
         self.assertIn('"dataset": "health"', tool_message["content"])
 
+    def test_raw_bookkeeping_rows_are_skipped_from_context(self):
+        records = [
+            {"role": "user", "content": "ping"},
+            {"role": "assistant_raw", "phase": "attempt", "raw_model_output": "drift prose x" * 50},
+            {"role": "assistant", "answer": "olá", "urls": []},
+        ]
+        rendered = build_context("SYS", records)
+        self.assertEqual([m["role"] for m in rendered], ["system", "user", "assistant"])
+        self.assertNotIn("drift prose", json.dumps(rendered, ensure_ascii=False))
+
+    def test_large_tool_args_redacted_small_args_verbatim(self):
+        records = [
+            {"role": "user", "content": "dashboard"},
+            {
+                "role": "assistant",
+                "tool": "dashboard.create",
+                "args": {"title": "T", "html": LARGE_HTML, "data_source": "app.data:finance_summary"},
+                "result": {"artifact_id": "ab" * 16, "path": "/artifacts/" + "ab" * 16 + ".html"},
+                "ts": "t",
+            },
+            {"role": "assistant", "tool": "app.data", "args": {"dataset": "health"}, "result": {"ok": True}, "ts": "t"},
+        ]
+        rendered = build_context("SYS", records)
+        create_message = rendered[-2]["content"]
+        self.assertNotIn("AAAA", create_message)  # marker-agnostic size guard
+        self.assertNotIn(DRIFT_HTML_SENTINEL, create_message)
+        self.assertIn('"args_summary"', create_message)
+        self.assertIn("stored in the session file, not re-sent", create_message)
+        self.assertIn('"artifact_hint": "abababab\u2026html"', create_message)
+        # The result row stays intact (small): full artifact id visible.
+        self.assertIn('"artifact_id": "' + "ab" * 16, create_message)
+        # Small args of other tools render verbatim (unchanged behavior).
+        self.assertIn('"dataset": "health"', rendered[-1]["content"])
+
+    def test_summarize_tool_args_passthrough_and_marker(self):
+        self.assertEqual(summarize_tool_args(None), "")
+        self.assertEqual(summarize_tool_args({}), "")
+        self.assertEqual(summarize_tool_args({"dataset": "health"}), "")  # nothing redacted
+        summary = json.loads(summarize_tool_args({"html": LARGE_HTML, "title": "T"}))
+        self.assertEqual(summary["title"], "T")
+        self.assertIn("stored in the session file, not re-sent", summary["html"])
+        self.assertNotIn(DRIFT_HTML_SENTINEL, summary["html"])
+
+    def test_truncate_raw_model_output_caps_8k(self):
+        huge = "D" * (RAW_MODEL_OUTPUT_MAX_BYTES + 500)
+        trimmed = truncate_raw_model_output(huge)
+        self.assertLessEqual(len(trimmed.encode("utf-8")), RAW_MODEL_OUTPUT_MAX_BYTES)
+        self.assertIn("raw model output truncated", trimmed)
+        self.assertIn("kept", trimmed)
+        # Small outputs (and non-str defensively) pass through / degrade safely.
+        self.assertEqual(truncate_raw_model_output("hi"), "hi")
+        self.assertEqual(truncate_raw_model_output(None), "")
+
+    def test_continuation_reminder_states(self):
+        success = {
+            "role": "assistant",
+            "tool": "dashboard.create",
+            "args": {"title": "T", "html": "<!DOCTYPE html><p>x</p>"},
+            "result": {"artifact_id": "cd" * 16, "path": "/x"},
+        }
+        reminder = continuation_reminder_for([{"role": "user", "content": "go"}, success])
+        self.assertIn('"tool": "server.serve", "args": {"action": "ensure", "artifact_id": "' + "cd" * 16 + '"}', reminder)
+        self.assertIn('"answer"', reminder)  # the answer shape follows the tool template
+        # Any other newest meaningful record -> None (generic paths untouched).
+        self.assertIsNone(continuation_reminder_for([]))
+        self.assertIsNone(continuation_reminder_for([{"role": "user", "content": "go"}]))
+        self.assertIsNone(continuation_reminder_for([success, {"role": "assistant", "answer": "done", "urls": []}]))
+        self.assertIsNone(
+            continuation_reminder_for(
+                [success, {"role": "assistant", "tool": "server.serve", "args": {}, "result": {"url": "u"}}]
+            )
+        )
+        self.assertIsNone(continuation_reminder_for([{**success, "error": "boom", "result": None}]))
+        # Raw bookkeeping rows never mask the underlying create step.
+        self.assertIsNotNone(
+            continuation_reminder_for(
+                [success, {"role": "assistant_raw", "phase": "attempt", "raw_model_output": "drift"}]
+            )
+        )
+
     def test_truncation_caps_at_4k_with_marker(self):
         payload = json.dumps({"items": ["x" * 100] * 100})
         trimmed = truncate_tool_result_text(payload)
@@ -509,9 +798,9 @@ class TestAgentApiEndpoints(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(detail["session_id"], session_id)
         roles = [record["role"] for record in detail["records"]]
-        self.assertEqual(roles, ["user", "assistant"])
+        self.assertEqual(roles, ["user", "assistant_raw", "assistant"])
         self.assertEqual(detail["records"][0]["content"], "Olá bot! Tudo bem?")
-        self.assertEqual(detail["records"][1]["answer"], body["answer"])
+        self.assertEqual(detail["records"][-1]["answer"], body["answer"])
 
         # Same message again within the session keeps history (2 turns).
         status, followup = self.fixture.request(

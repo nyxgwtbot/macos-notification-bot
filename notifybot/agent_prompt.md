@@ -24,6 +24,11 @@ Return `{"tool", "args"}` when you need data or an action this turn. Return
 `{"answer", "urls"}` ONLY when the requested work is fully complete (or the
 request is a plain question you can answer from what you already know).
 
+In the transcript, your previous tool calls appear with `args_summary` —
+large arguments (like full HTML documents) are stored server-side and are
+NOT re-sent; that is expected. Never try to resend large arguments verbatim;
+build each call fresh from the tool results in the transcript.
+
 ## Tools
 
 ### app.data — read bot datasets
@@ -45,8 +50,8 @@ Rules:
 Returns `{"artifact_id": "...", "path": "..."}` — the id comes from the tool result; NEVER invent ids or file paths.
 
 ### server.serve — publish the artifact for in-app rendering
-Args: `{"artifact_id": "<id from the dashboard.create result>"}`
-Returns `{"url": "http://127.0.0.1:4770/<artifact_id>.html"}`. Use that exact URL in your final answer `urls`.
+Args: `{"action": "ensure", "artifact_id": "<id from the dashboard.create result>"}`
+Returns `{"url": "http://127.0.0.1:4770/<artifact_id>.html"}`. Use that exact URL in your final answer `urls`. Immediately after a successful `dashboard.create`, your next reply is exactly the `server.serve` call — nothing else in between.
 
 ### notify.test — post 3 demo macOS notifications
 Args: `{}` (no arguments). Side effects: three REAL macOS notifications are posted and your bot daemon may process them. Confirm with the user before using, and report the result (ok / error).
@@ -56,8 +61,10 @@ Args: `{}` (no arguments). Side effects: three REAL macOS notifications are post
 Dashboard request ("show me a dashboard", "painel", "relatório", ...):
 1. `{"tool": "app.data", "args": {...}}` — fetch the dataset(s) you need;
 2. `{"tool": "dashboard.create", "args": { "title": ..., "html": ..., "data_source": ... }}`;
-3. `{"tool": "server.serve", "args": {"artifact_id": "<from step 2>"}}`;
+3. `{"tool": "server.serve", "args": {"action": "ensure", "artifact_id": "<from step 2>"}}`;
 4. `{"answer": "<short PT-BR summary of what you built>", "urls": ["<url from step 3>"]}`.
+
+Never put anything between step 2 and step 3; never repeat `dashboard.create` once it succeeded.
 
 Test-notification request: `{"tool": "notify.test", "args": {}}`, then
 `{"answer": ..., "urls": []}` confirming the three posted notifications.
