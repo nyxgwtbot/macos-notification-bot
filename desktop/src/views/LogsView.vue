@@ -93,18 +93,39 @@
           </div>
         </div>
 
+        <!-- R7: badge companion announce — the +N badge is visual-only, this
+             visually-hidden polite region extends the Dashboard announce
+             pattern (nb-sr-only) with the same clear-then-fill discipline -->
+        <p class="nb-sr-only" aria-live="polite">{{ srLogAnnouncement }}</p>
+
         <p v-if="!store.logFileExists && !store.logsError" class="nb-empty">
           <code>logs/events.jsonl</code> doesn't exist yet — run the bot (<code>python3 bot.py</code>) or
           <code>python3 bot.py --once</code> to generate the first event.
         </p>
 
-        <div ref="logScroller" class="nb-log-scroller" :data-density="density" @scroll="onScroll">
+        <!-- R7: the tail becomes a log landmark AT can enter with keyboard;
+             tabindex=0 + role=log + an explicit label (aria-live stays off
+             the scroller itself — the 2s poll cadence would spam it) -->
+        <div
+          ref="logScroller"
+          class="nb-log-scroller"
+          :data-density="density"
+          role="log"
+          aria-label="Raw log tail"
+          tabindex="0"
+          @scroll="onScroll"
+        >
+          <div class="nb-cap" aria-hidden="true">— start of loaded tail —</div>
           <div
             v-for="line in visibleLines"
             :key="line.line_no"
             class="nb-line"
             :class="{ 'nb-line-bad': line.malformed, 'nb-line-hi': line.high }"
+            :title="line.malformed ? 'Malformed JSON line' : undefined"
           >
+            <!-- R7 line-number gutter: fixed-width dim mono column; the raw
+                 content column is the hanging indent inside the same pre -->
+            <span class="nb-line-no" aria-hidden="true">{{ line.line_no }}</span>
             <button class="nb-copy" :aria-label="'Copy line ' + line.line_no" @click="copyLine(line.raw)">
               <ion-icon aria-hidden="true" :icon="copyOutline" />
             </button>
@@ -141,11 +162,16 @@ import { usePolling } from '@/composables/usePolling';
 import { copyText } from '@/utils/clipboard';
 import {
   LOGS_DENSITY_KEY,
+  LOGS_FOLLOW_KEY,
+  LOGS_KIND_FILTER_KEY,
   LOG_KIND_FILTER_OPTIONS,
   filterLogLines,
   filterLogLinesByQuery,
   logLineSegments,
+  logNewLinesAnnouncement,
   parseLogDensity,
+  parseLogFollow,
+  parseLogKindFilter,
   type LogDensity,
   type LogKindFilter
 } from '@/viewModels/logsViewModel';
@@ -153,9 +179,32 @@ import {
 const store = useBotStore();
 
 const logScroller = ref<HTMLElement | null>(null);
+/* ========================================
+   R7 PERSISTENCE — follow-tail and kind filter survive reloads via the
+   LOGS_DENSITY_KEY pattern: whitelist-VM parsers degrade tampered values to
+   defaults, and localStorage throws (privacy modes) degrade to session-only.
+   ======================================== */
+function readStoredValue(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredValue(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    /* session-only */
+  }
+}
+
 /** Follow-tail control: ON pins the scroller to the bottom; a manual scroll
- * up pauses it (chip switches to "Paused — follow?"); clicking re-enables. */
-const followOn = ref(true);
+ * up pauses it (chip switches to "Paused — follow?"); clicking re-enables.
+ * R7: the choice persists (stored 'false' restores paused). */
+const followOn = ref(parseLogFollow(readStoredValue(LOGS_FOLLOW_KEY)));
+watch(followOn, (value) => writeStoredValue(LOGS_FOLLOW_KEY, String(value)));
 const newCount = ref(0);
 /** Raw lines already accounted for while paused (line_no is window-relative
  * and shifts as the file grows, so raws are the only stable identity). */
@@ -172,7 +221,9 @@ const copiedAllText = ref<string | null>(null);
 const copiedAllTimer: { value: number | null } = { value: null };
 let copiedTimer: number | null = null;
 
-const kindFilter = ref<LogKindFilter>('all');
+/** R7: the kind filter persists; tampered/legacy values degrade to 'all'
+ * via the VM whitelist parser. */
+const kindFilter = ref<LogKindFilter>(parseLogKindFilter(readStoredValue(LOGS_KIND_FILTER_KEY)));
 
 /* ========================================
    R3: SEARCH — the input owns an instant draft; the applied query updates
@@ -199,23 +250,11 @@ function onSearchInput(event: Event): void {
    persisted under LOGS_DENSITY_KEY, tampered values degrade to comfortable.
    localStorage itself can throw in privacy modes — degrade to session-only.
    ======================================== */
-const density = ref<LogDensity>(parseLogDensity(readStoredLogDensity()));
-
-function readStoredLogDensity(): string | null {
-  try {
-    return window.localStorage.getItem(LOGS_DENSITY_KEY);
-  } catch {
-    return null;
-  }
-}
+const density = ref<LogDensity>(parseLogDensity(readStoredValue(LOGS_DENSITY_KEY)));
 
 function onDensityChange(value: LogDensity): void {
   density.value = value;
-  try {
-    window.localStorage.setItem(LOGS_DENSITY_KEY, value);
-  } catch {
-    /* session-only toggle */
-  }
+  writeStoredValue(LOGS_DENSITY_KEY, value);
 }
 
 const logTitle = computed(() =>
@@ -232,7 +271,10 @@ const visibleLines = computed(() =>
   filterLogLinesByQuery(filterLogLines(store.logLines, kindFilter.value), appliedSearch.value).map((line) => ({
     ...line,
     high: URGENCY_HIGH_RE.test(line.raw),
-    segments: logLineSegments(line.raw || ' ')
+    /* R7: the live query rides along — matched pieces wrap in nb-tok-hi
+       spans (escape-then-wrap contract unchanged: segments stay raw text
+       and Vue escapes every interpolated node before the spans wrap it) */
+    segments: logLineSegments(line.raw || ' ', appliedSearch.value)
   }))
 );
 
@@ -245,6 +287,7 @@ const lineCount = computed(
 function onKindFilterChange(kind: LogKindFilter): void {
   if (kindFilter.value === kind) return;
   kindFilter.value = kind;
+  writeStoredValue(LOGS_KIND_FILTER_KEY, kind);
   rebaseNewCount();
 }
 
@@ -325,6 +368,21 @@ function rebaseNewCount(): void {
   }
 }
 
+/** R7: the +N badge announces politely through the visually-hidden region;
+ * the Dashboard clear-then-fill discipline makes identical repeats ("1 new
+ * log line" on consecutive 2s polls) mutate the live node and re-announce. */
+const srLogAnnouncement = ref('');
+watch(newCount, async (count) => {
+  if (count <= 0) {
+    srLogAnnouncement.value = '';
+    return;
+  }
+  const text = logNewLinesAnnouncement(count);
+  srLogAnnouncement.value = '';
+  await nextTick();
+  if (newCount.value === count) srLogAnnouncement.value = text;
+});
+
 watch(
   () => store.logLines,
   () => {
@@ -378,7 +436,12 @@ onMounted(async () => {
   // first paint pins to the tail instantly (no smooth animation)
   const el = logScroller.value;
   if (el) el.scrollTop = el.scrollHeight;
-  followOn.value = true;
+  // R7: follow state persists — a restored paused session keeps the chip
+  // paused and baselines the badge against the freshly loaded tail (lines
+  // arriving after this point count; the initial load itself never does)
+  if (!followOn.value) {
+    seenRaws = new Set(store.logLines.map((line) => line.raw));
+  }
 });
 
 onUnmounted(() => {
@@ -539,6 +602,34 @@ onUnmounted(() => {
   gap: var(--nb-space-1);
 }
 
+/* R7: the scroller is a keyboard-enterable log landmark; visible focus ring
+   matches the shared input focus treatment */
+.nb-log-scroller:focus-visible {
+  border-color: var(--nb-info);
+}
+
+/* R7: micro cap line at the loaded-tail boundary (top inside the scroller) */
+.nb-cap {
+  text-align: center;
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-muted);
+}
+
+/* R7: fixed-width dim-mono line-number gutter; right-aligned to the content
+   edge, non-selectable, and vertically aligned with the first text line via
+   the same padding pattern as .nb-raw below */
+.nb-line-no {
+  flex: 0 0 auto;
+  min-width: 3.5ch;
+  text-align: right;
+  font-family: var(--nb-mono);
+  font-size: 10px;
+  line-height: 1.5;
+  padding: var(--nb-space-1) 0;
+  color: var(--nb-text-muted);
+  user-select: none;
+}
+
 /* L3: every row is [icon gutter][content column]; wrapped continuation lines
    inside .nb-raw start at the same content x — the hanging indent. */
 .nb-line {
@@ -594,6 +685,17 @@ onUnmounted(() => {
   line-height: 1.65;
   padding: 5px 6px 5px var(--nb-space-2);
 }
+/* R7: the gutter tracks the density so first text lines stay aligned */
+.nb-log-scroller[data-density='compact'] .nb-line-no {
+  font-size: 9.5px;
+  line-height: 1.35;
+  padding: 2px 0;
+}
+.nb-log-scroller[data-density='comfortable'] .nb-line-no {
+  font-size: 11px;
+  line-height: 1.65;
+  padding: 5px 0;
+}
 
 /* R3 token dimming: JSON keys muted, numeric/bool scalars teal — teal-dark
    for system light mode, teal-light on the dark scroller */
@@ -607,6 +709,13 @@ onUnmounted(() => {
   .nb-raw .nb-tok-num {
     color: var(--nb-teal-light);
   }
+}
+
+/* R7: live search-match highlight — muted info-token background on the
+   matched pieces (works in both schemes; no color flip needed) */
+.nb-raw .nb-tok-hi {
+  background: var(--nb-info-muted);
+  border-radius: 2px;
 }
 
 /* L1: the copy affordance is noise at rest — reveal on hover/keyboard focus */

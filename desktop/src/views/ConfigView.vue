@@ -4,14 +4,29 @@
       <ion-toolbar class="nb-page-header">
         <ion-title>Settings</ion-title>
         <ion-buttons slot="end">
-          <ion-button :disabled="store.configLoading || store.configSaving" aria-label="Reload settings" title="Reload settings" @click="discard">
+          <!-- R7 dirty-guard: disabled while pristine; dirty = "Discard edits?"
+               (first click arms), armed = "Confirm discard?" (second click
+               performs the discard/reload — same double-arm as the restart) -->
+          <ion-button
+            class="nb-reload-discard"
+            :class="{ 'nb-discard-armed': dirtyGuard.armed }"
+            :disabled="discardDisabled"
+            :aria-label="discardLabel"
+            :title="discardLabel"
+            @click="onDiscardClick"
+          >
             <ion-icon aria-hidden="true" :icon="refreshOutline" />
+            <span v-if="dirtyGuard.dirty" class="nb-discard-label">{{ discardLabel }}</span>
           </ion-button>
         </ion-buttons>
       </ion-toolbar>
     </ion-header>
 
     <ion-content class="nb-content">
+      <!-- R7: save/restart announces — visually-hidden polite region fed by
+           save() and the confirmed restart (exact strings in the dirty VM) -->
+      <p class="nb-sr-only" aria-live="polite">{{ srSaveAnnouncement }}</p>
+
       <ion-spinner v-if="store.configLoading && !store.config" name="crescent" class="nb-center" />
 
       <div v-if="store.configError && !store.config" class="nb-banner nb-banner-err">
@@ -123,7 +138,10 @@
               </ion-button>
             </div>
             <ion-button fill="solid" class="nb-save-btn" :class="{ 'nb-save-flash': saveFlash }" :disabled="store.configSaving" @click="save">
-              <ion-spinner v-if="store.configSaving" name="crescent" />
+              <template v-if="store.configSaving">
+                <ion-spinner name="crescent" />
+                <span class="nb-saving-label">Saving…</span>
+              </template>
               <template v-else>{{ saveFlash ? 'Saved' : 'Save' }}</template>
             </ion-button>
           </div>
@@ -177,7 +195,7 @@
                 <ion-badge color="medium">{{ entry.type }}</ion-badge>
                 <ion-toggle
                   :checked="entry.enabled"
-                  aria-label="Enable action"
+                  :aria-label="'Enable action ' + entry.id"
                   @ionChange="onActionToggle($event as CustomEvent<{ checked: boolean }>, index)"
                 />
               </div>
@@ -275,11 +293,13 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
+import { onBeforeRouteLeave } from 'vue-router';
 import {
   IonBadge,
   IonButton,
   IonButtons,
+  alertController,
   IonCard,
   IonCardContent,
   IonCardHeader,
@@ -312,6 +332,17 @@ import {
   type ConfigFieldKey
 } from '@/services/configValidation';
 import { formatIsoShort } from '@/utils/time';
+import {
+  DIRTY_GUARD_CLEAN,
+  RESTART_APPLY_ANNOUNCE,
+  SAVE_FAILED_ANNOUNCE,
+  SETTINGS_SAVED_ANNOUNCE,
+  configDraftSnapshot,
+  draftIsDirty,
+  reduceDirtyGuard,
+  type DirtyGuardEvent,
+  type DirtyGuardState
+} from '@/viewModels/configDirtyViewModel';
 import {
   buttonLabel,
   initialConnectorsState,
@@ -425,6 +456,91 @@ const loadedFields = ref<ConfigDraftFields>({
   pollInterval: ''
 });
 
+/* ========================================
+   R7 DIRTY GUARD — the canonical draft snapshot is taken at load (buildDraft)
+   and after a successful save; every edit re-serializes the draft against it.
+   The header reload button turns into the discard double-arm while dirty and
+   onBeforeRouteLeave confirms with an ion-alert. State machine: reduceDirtyGuard.
+   ======================================== */
+const dirtyGuard = ref<DirtyGuardState>({ ...DIRTY_GUARD_CLEAN });
+const DISCARD_ARM_MS = 3000;
+const draftSnapshot = ref<string | null>(null);
+
+function markDraftSnapshot(): void {
+  draftSnapshot.value = configDraftSnapshot(draft);
+}
+
+const dirtyNow = computed(() => draftIsDirty(draftSnapshot.value, draft));
+
+watch(dirtyNow, (dirty) => dispatchDirtyGuard({ type: 'dirty-change', dirty }));
+
+function dispatchDirtyGuard(event: DirtyGuardEvent): void {
+  dirtyGuard.value = reduceDirtyGuard(dirtyGuard.value, event);
+}
+
+let discardArmTimer: number | null = null;
+
+function clearDiscardArmTimer(): void {
+  if (discardArmTimer !== null) {
+    window.clearTimeout(discardArmTimer);
+    discardArmTimer = null;
+  }
+}
+
+function disarmDiscard(): void {
+  clearDiscardArmTimer();
+  dispatchDirtyGuard({ type: 'disarm' });
+}
+
+const discardDisabled = computed(
+  () => store.configLoading || store.configSaving || !dirtyGuard.value.dirty
+);
+
+const discardLabel = computed(() => {
+  if (!dirtyGuard.value.dirty) return 'Reload settings';
+  return dirtyGuard.value.armed ? 'Confirm discard?' : 'Discard edits?';
+});
+
+function onDiscardClick(): void {
+  if (discardDisabled.value) return;
+  if (dirtyGuard.value.armed) {
+    disarmDiscard();
+    discard(); // rebuilds the draft from the freshly loaded config (re-snapshots)
+    return;
+  }
+  dispatchDirtyGuard({ type: 'arm' });
+  clearDiscardArmTimer();
+  discardArmTimer = window.setTimeout(disarmDiscard, DISCARD_ARM_MS);
+}
+
+/** R7: leaving with unsaved edits confirms through an inline ion-alert. */
+onBeforeRouteLeave(async () => {
+  if (!dirtyGuard.value.dirty) return true;
+  const alert = await alertController.create({
+    header: 'Discard unsaved settings?',
+    buttons: [
+      { text: 'Cancel', role: 'cancel' },
+      { text: 'Leave', role: 'destructive' }
+    ]
+  });
+  await alert.present();
+  const { role } = await alert.onDidDismiss();
+  return role === 'destructive';
+});
+
+/* ========================================
+   R7 SAVE/RESTART ANNOUNCES — one visually-hidden polite region; the
+   clear-then-fill makes identical repeats ("Save failed." twice in a row)
+   mutate the live node and re-announce (Dashboard discipline).
+   ======================================== */
+const srSaveAnnouncement = ref('');
+
+async function announceSave(text: string): Promise<void> {
+  srSaveAnnouncement.value = '';
+  await nextTick();
+  srSaveAnnouncement.value = text;
+}
+
 const unmappedSaveDetails = computed<string[]>(() => {
   // server 400 leftovers with no field match: rendered as one muted generic
   // line (verbatim details never reach the UI — api.py phrases them PT-BR)
@@ -466,6 +582,8 @@ function onSaveRestartClick(): void {
   // completes; a failed restart keeps the affordance visible for a retry
   void store.restartDaemon().then((status) => {
     if (status === null) return;
+    // R7: the confirmed restart reaches the announce region
+    void announceSave(RESTART_APPLY_ANNOUNCE);
     restartPending.value = false;
     return store.pollDaemon();
   });
@@ -512,6 +630,8 @@ function buildDraft(config: BotConfig): void {
   rawError.value = null;
   validationErrors.value = [];
   fieldErrors.value = {};
+  // R7: a rebuilt draft IS the reference — pristine until the next edit
+  markDraftSnapshot();
 }
 
 function buildPayload(): BotConfig {
@@ -676,6 +796,10 @@ async function save(): Promise<void> {
     // success: previous inline errors are resolved — clean state
     fieldErrors.value = {};
     validationErrors.value = [];
+    // R7: the saved state becomes the new pristine reference
+    markDraftSnapshot();
+    // R7 announce
+    void announceSave(SETTINGS_SAVED_ANNOUNCE);
     // success: transient "Saved" flash (2s, label back)
     clearSaveFlashTimer();
     saveFlash.value = true;
@@ -706,6 +830,8 @@ async function save(): Promise<void> {
     // (EN text from the same table); non-field details collapse into the one
     // muted generic line (unmappedSaveDetails) — never verbatim PT-BR
     fieldErrors.value = { ...fieldErrors.value, ...splitDetailsByField(store.configSaveErrors).fieldErrors };
+    // R7 announce
+    void announceSave(SAVE_FAILED_ANNOUNCE);
   }
 }
 
@@ -719,6 +845,7 @@ onMounted(async () => {
 onUnmounted(() => {
   clearSaveFlashTimer();
   disarmRestart();
+  clearDiscardArmTimer();
 });
 </script>
 
@@ -919,5 +1046,27 @@ onUnmounted(() => {
 .nb-save-reject-note {
   margin: var(--nb-space-1) 0 0;
   font-size: var(--nb-fs-secondary);
+}
+
+/* R7: pending save label beside the spinner */
+.nb-saving-label {
+  margin-left: var(--nb-space-1);
+}
+
+/* R7 dirty-guard: the header reload button while dirty carries the discard
+   label; armed state wears the restart warn pair so "confirm" reads the same
+   affordance everywhere */
+.nb-reload-discard.nb-discard-armed {
+  --color: var(--nb-chip-warn-fg);
+  --background: transparent;
+  --border-color: var(--nb-warning);
+  --border-style: solid;
+  --border-width: 1px;
+  --border-radius: var(--nb-radius-sm);
+  --box-shadow: none;
+}
+.nb-discard-label {
+  font-size: var(--nb-fs-micro);
+  font-weight: 600;
 }
 </style>

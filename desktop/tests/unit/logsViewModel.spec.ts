@@ -8,11 +8,16 @@ import { describe, expect, test } from 'vitest';
 
 import {
   LOGS_DENSITY_KEY,
+  LOGS_FOLLOW_KEY,
+  LOGS_KIND_FILTER_KEY,
   filterLogLines,
   filterLogLinesByQuery,
   logLineKind,
   logLineSegments,
+  logNewLinesAnnouncement,
   parseLogDensity,
+  parseLogFollow,
+  parseLogKindFilter,
   LOG_KIND_FILTER_OPTIONS
 } from '../../src/viewModels/logsViewModel';
 import type { LogLineItem } from '../../src/stores/bot';
@@ -135,6 +140,100 @@ describe('logLineSegments (R3 token dimming)', () => {
 
   test('empty raw yields empty segments', () => {
     expect(logLineSegments('')).toEqual([]);
+  });
+});
+
+/* ========================================
+   R7: SEARCH-MATCH HIGHLIGHT — the live query wraps its matches in an
+   nb-tok-hi span; escape-then-wrap stays intact (segments carry raw text;
+   the rendered-DOM half lives in LogsViewRender.spec.ts).
+   ======================================== */
+describe('logLineSegments query highlighting (R7)', () => {
+  test('matched pieces carry nb-tok-hi; surrounding pieces keep their token classes', () => {
+    const segs = logLineSegments('{"event": "startup", "mode": "daemon"}', 'mode');
+    // the match lands INSIDE the key — the surrounding quote marks keep the
+    // muted key class while the matched substring re-classes to the highlight
+    expect(segs.filter((s) => s.cls === 'nb-tok-hi').map((s) => s.text)).toEqual(['mode']);
+    expect(segs.filter((s) => s.cls === 'nb-tok-key').map((s) => s.text)).toContain('"event"');
+  });
+
+  test('matches are case-insensitive and multi-occurrence', () => {
+    const segs = logLineSegments('{"telegram": false, "state": "TELEGRAM_SENT"}', 'telegram');
+    const his = segs.filter((s) => s.cls === 'nb-tok-hi');
+    expect(his.map((s) => s.text)).toEqual(['telegram', 'TELEGRAM']);
+  });
+
+  test('matches inside a string value highlight too (substring over the raw line)', () => {
+    const segs = logLineSegments('{"title": "Pagamento confirmado", "rec_id": 7}', 'confirma');
+    expect(segs.filter((s) => s.cls === 'nb-tok-hi').map((s) => s.text)).toEqual(['confirma']);
+  });
+
+  test('segments still reconstruct the raw line exactly with a query applied', () => {
+    const raw = '{"a":1,"b":true,"s":"xx bb xx"}';
+    const segs = logLineSegments(raw, 'b');
+    expect(segs.map((s) => s.text).join('')).toBe(raw);
+  });
+
+  test('a whitespace-only query passes segments through unchanged', () => {
+    const plain = logLineSegments('{"a":1}');
+    const withQuery = logLineSegments('{"a":1}', '   ');
+    expect(withQuery).toEqual(plain);
+  });
+
+  test('empty query matches the no-query result', () => {
+    expect(logLineSegments('{"a":1}', '')).toEqual(logLineSegments('{"a":1}'));
+  });
+
+  test('a <script> query match is still raw-text segments — the highlight span wraps escaped text only', () => {
+    const raw = '{"title": "<script>alert(1)</script>"}';
+    const segs = logLineSegments(raw, '"<script');
+    const his = segs.filter((s) => s.cls === 'nb-tok-hi');
+    expect(his.map((s) => s.text)).toEqual(['"<script']);
+    // reconstruction keeps every character — no reassembly into markup
+    expect(segs.map((s) => s.text).join('')).toBe(raw);
+  });
+});
+
+/* ========================================
+   R7: PERSISTENCE KEYS — follow-tail and kind filter survive reloads under
+   the LOGS_DENSITY_KEY contract: tampered stored values degrade to defaults
+   (follow ON, kind ALL).
+   ======================================== */
+describe('R7 persistence keys and parsers', () => {
+  test('keys sit in the notifybot.logs.* namespace', () => {
+    expect(LOGS_FOLLOW_KEY).toBe('notifybot.logs.follow');
+    expect(LOGS_KIND_FILTER_KEY).toBe('notifybot.logs.kindFilter');
+    expect(LOGS_DENSITY_KEY).toBe('notifybot.logs.density');
+  });
+
+  test('parseLogFollow reads stored \'false\', degrades everything else to ON', () => {
+    expect(parseLogFollow('false')).toBe(false);
+    expect(parseLogFollow('true')).toBe(true);
+    expect(parseLogFollow(null)).toBe(true);
+    expect(parseLogFollow('mega')).toBe(true);
+    expect(parseLogFollow('')).toBe(true);
+  });
+
+  test('parseLogKindFilter whitelists the chip values, degrades tampered to all', () => {
+    for (const option of LOG_KIND_FILTER_OPTIONS) {
+      expect(parseLogKindFilter(option.value)).toBe(option.value);
+    }
+    expect(parseLogKindFilter(null)).toBe('all');
+    expect(parseLogKindFilter('')).toBe('all');
+    expect(parseLogKindFilter('startup!!')).toBe('all');
+  });
+});
+
+describe('logNewLinesAnnouncement (R7 badge SR announce)', () => {
+  test('the announce strings for the +N badge', () => {
+    expect(logNewLinesAnnouncement(1)).toBe('1 new log line');
+    expect(logNewLinesAnnouncement(42)).toBe('42 new log lines');
+  });
+
+  test('zero and negative counts announce nothing', () => {
+    expect(logNewLinesAnnouncement(0)).toBe('');
+    expect(logNewLinesAnnouncement(-3)).toBe('');
+    expect(logNewLinesAnnouncement(Number.NaN)).toBe('');
   });
 });
 

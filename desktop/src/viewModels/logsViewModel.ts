@@ -3,6 +3,9 @@
  * events.jsonl tail + line payload parsing. The kind values/labels mirror
  * EVENT_KIND_OPTIONS (Status feed chips) so both screens feel like the same
  * control. Pure functions only (tests: tests/unit/logsViewModel.spec.ts).
+ *
+ * R7: search-match highlighting (nb-tok-hi segments), follow/kind-filter
+ * persistence keys + whitelist parsers, and the +N badge SR announcement.
  */
 
 import type { LogLineItem } from '@/stores/bot';
@@ -66,15 +69,43 @@ export function filterLogLinesByQuery(lines: LogLineItem[], query: string): LogL
 
 export type LogTokenClass = 'nb-tok-key' | 'nb-tok-num';
 
+/** R7: the live search-query match class slots into the same segment model —
+ * matched pieces override the token class for their span. */
+export type LogSegmentClass = LogTokenClass | 'nb-tok-hi';
+
 export interface LogLineSegment {
   text: string;
-  cls: LogTokenClass | null;
+  cls: LogSegmentClass | null;
 }
 
 const LOG_TOKEN_RE =
   /("(?:\\.|[^"\\])*")(?=\s*:)|("(?:\\.|[^"\\])*")|\b(true|false)\b|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g;
 
-export function logLineSegments(raw: string): LogLineSegment[] {
+/** R7 query-highlight splitter: one token segment becomes zero or more
+ * pieces; case-insensitive occurrences of the needle are re-classed to
+ * 'nb-tok-hi', untouched pieces keep the token's class. Segments are still
+ * RAW text — the escape-then-wrap contract (view interpolations escape every
+ * text node before spans wrap them) is untouched by the highlight pass. */
+function splitSegmentsByQuery(needle: string, text: string, cls: LogSegmentClass | null): LogLineSegment[] {
+  if (needle === '') return [{ text, cls }];
+  const lower = text.toLowerCase();
+  const needleLower = needle.toLowerCase();
+  if (needleLower === '') return [{ text, cls }];
+  const parts: LogLineSegment[] = [];
+  let from = 0;
+  for (
+    let hit = lower.indexOf(needleLower);
+    hit !== -1;
+    from = hit + needleLower.length, hit = lower.indexOf(needleLower, from)
+  ) {
+    if (hit > from) parts.push({ text: text.slice(from, hit), cls });
+    parts.push({ text: text.slice(hit, hit + needleLower.length), cls: 'nb-tok-hi' });
+  }
+  if (from < text.length) parts.push({ text: text.slice(from), cls });
+  return parts;
+}
+
+export function logLineSegments(raw: string, query = ''): LogLineSegment[] {
   const segments: LogLineSegment[] = [];
   let last = 0;
   LOG_TOKEN_RE.lastIndex = 0; // global-flag regex: reset before each pass
@@ -87,7 +118,9 @@ export function logLineSegments(raw: string): LogLineSegment[] {
     last = m.index + m[0].length;
   }
   if (last < raw.length) segments.push({ text: raw.slice(last), cls: null });
-  return segments;
+  const needle = query.trim();
+  if (needle === '') return segments;
+  return segments.flatMap((segment) => splitSegmentsByQuery(needle, segment.text, segment.cls));
 }
 
 /* ========================================
@@ -103,4 +136,34 @@ export type LogDensity = 'compact' | 'comfortable';
 /** Unknown/null stored values fall back to the comfortable default. */
 export function parseLogDensity(raw: string | null): LogDensity {
   return raw === 'compact' ? 'compact' : 'comfortable';
+}
+
+/* ========================================
+   R7 PERSISTENCE — follow-tail and kind filter survive reloads under the
+   same whitelist-parse contract as LOGS_DENSITY_KEY: tampered stored values
+   degrade to the defaults (follow ON, kind ALL). Only the parse lives here
+   so a tampered value can't inject anything.
+   ======================================== */
+
+export const LOGS_FOLLOW_KEY = 'notifybot.logs.follow';
+
+export const LOGS_KIND_FILTER_KEY = 'notifybot.logs.kindFilter';
+
+/** 'false' reads as paused; null/tampered/anything else degrades to ON. */
+export function parseLogFollow(raw: string | null): boolean {
+  return raw !== 'false';
+}
+
+/** Null/tampered stored kinds degrade to 'all' (whitelist against the chips). */
+export function parseLogKindFilter(raw: string | null): LogKindFilter {
+  const option = LOG_KIND_FILTER_OPTIONS.find((entry) => entry.value === raw);
+  return option ? option.value : 'all';
+}
+
+/** R7: the +N badge SR announcement — "N new log lines" (singular at
+ * exactly 1). Empty for zero/negative counts: the badge renders only for a
+ * positive count, and the SR region must not carry a stale or fake text. */
+export function logNewLinesAnnouncement(count: number): string {
+  if (!Number.isFinite(count) || count <= 0) return '';
+  return count === 1 ? '1 new log line' : `${count} new log lines`;
 }
