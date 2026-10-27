@@ -9,7 +9,7 @@ import ChatView from '../views/ChatView.vue';
 const routes: Array<RouteRecordRaw> = [
   {
     path: '/',
-    redirect: '/dashboard'
+    redirect: '/chat'
   },
   {
     path: '/dashboard',
