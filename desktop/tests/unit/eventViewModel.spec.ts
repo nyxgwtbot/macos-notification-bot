@@ -3,9 +3,11 @@ import { describe, expect, test } from 'vitest';
 import {
   confidenceToPct,
   eventKey,
+  eventKindIdentity,
   eventToRow,
   isErrorStatus,
   payloadPreview,
+  relativeTimeLabel,
   EVENT_KIND_OPTIONS
 } from '../../src/viewModels/eventViewModel';
 import type { BotEvent } from '../../src/types/bot';
@@ -141,6 +143,58 @@ describe('payloadPreview', () => {
     cyclic.self = cyclic;
     const preview = payloadPreview(cyclic as unknown as BotEvent);
     expect(typeof preview.text).toBe('string');
+  });
+});
+
+describe('relativeTimeLabel', () => {
+  // Fixed render clock; timestamps are built as offsets from it.
+  const NOW = Date.parse('2026-10-26T12:00:00.000Z');
+
+  test('labels seconds as now', () => {
+    expect(relativeTimeLabel(new Date(NOW).toISOString(), NOW)).toBe('now');
+    expect(relativeTimeLabel(new Date(NOW - 30_000).toISOString(), NOW)).toBe('now');
+    expect(relativeTimeLabel(new Date(NOW - 59_000).toISOString(), NOW)).toBe('now');
+  });
+
+  test('labels minutes / hours / days with the exact boundaries', () => {
+    expect(relativeTimeLabel(new Date(NOW - 60_000).toISOString(), NOW)).toBe('1 min ago');
+    expect(relativeTimeLabel(new Date(NOW - 3 * 60_000).toISOString(), NOW)).toBe('3 min ago');
+    expect(relativeTimeLabel(new Date(NOW - 59 * 60_000).toISOString(), NOW)).toBe('59 min ago');
+    expect(relativeTimeLabel(new Date(NOW - 60 * 60_000).toISOString(), NOW)).toBe('1 h ago');
+    expect(relativeTimeLabel(new Date(NOW - 3 * 60 * 60_000).toISOString(), NOW)).toBe('3 h ago');
+    expect(relativeTimeLabel(new Date(NOW - 23 * 60 * 60_000).toISOString(), NOW)).toBe('23 h ago');
+    expect(relativeTimeLabel(new Date(NOW - 24 * 60 * 60_000).toISOString(), NOW)).toBe('1 d ago');
+    expect(relativeTimeLabel(new Date(NOW - 2.5 * 24 * 60 * 60_000).toISOString(), NOW)).toBe('2 d ago');
+  });
+
+  test('future timestamps and clock skew read as now', () => {
+    expect(relativeTimeLabel(new Date(NOW + 5_000).toISOString(), NOW)).toBe('now');
+    expect(relativeTimeLabel(new Date(NOW + 10 * 60_000).toISOString(), NOW)).toBe('now');
+  });
+
+  test('empty, malformed or non-finite inputs degrade to empty string', () => {
+    expect(relativeTimeLabel('', NOW)).toBe('');
+    expect(relativeTimeLabel('not-a-date', NOW)).toBe('');
+    expect(relativeTimeLabel(new Date(NOW).toISOString(), Number.NaN)).toBe('');
+  });
+});
+
+describe('eventKindIdentity', () => {
+  test('startup rows keep the startup identity', () => {
+    const startup = eventToRow({ event: 'startup', timestamp: '2026-10-26T12:00:00Z', mode: 'daemon' });
+    expect(eventKindIdentity(startup)).toBe('startup');
+  });
+
+  test('notification rows: finance identity only when the finance layer acted', () => {
+    const plain = eventToRow(notifEvent());
+    expect(eventKindIdentity(plain)).toBe('notification');
+
+    const financeOk = eventToRow(notifEvent({ finance: { status: 'ok', method: 'regex', stored: 'inserted' } }));
+    expect(eventKindIdentity(financeOk)).toBe('finance');
+
+    // even a skipped finance pass is a finance row — the badge says so too
+    const financeSkipped = eventToRow(notifEvent({ finance: { status: 'skipped', reason: 'no_amount' } }));
+    expect(eventKindIdentity(financeSkipped)).toBe('finance');
   });
 });
 

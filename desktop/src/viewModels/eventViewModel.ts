@@ -123,6 +123,16 @@ export function eventToRow(event: BotEvent): EventRow {
   };
 }
 
+/** Visual identity kind for a feed row: the /api/events feed only knows
+ * notification|startup, but rows that went through the finance layer get
+ * their own cash-icon identity (tests: eventViewModel.spec.ts). */
+export type EventKindIdentity = 'startup' | 'notification' | 'finance';
+
+export function eventKindIdentity(row: EventRow): EventKindIdentity {
+  if (row.kind === 'startup') return 'startup';
+  return row.financeStatus !== null ? 'finance' : 'notification';
+}
+
 function buildFinanceLabel(finance: NonNullable<BotEvent['finance']>): string {
   const parts = [String(finance.status ?? '')];
   if (finance.method) parts.push(String(finance.method));
@@ -134,4 +144,21 @@ function buildFinanceLabel(finance: NonNullable<BotEvent['finance']>): string {
 /** Is this row a chip-worthy alert (telegram failed / finance error)? */
 export function isErrorStatus(status: string | null): boolean {
   return typeof status === 'string' && status.startsWith('error');
+}
+
+/** Relative age label for a feed row: 'now' / '3 min ago' / '1 h ago' /
+ * '2 d ago'. Pure in the render clock: the view-model passes `nowMs` so the
+ * 2s poll just recomputes with a fresh tick. Empty for a missing or
+ * unparseable timestamp; a future timestamp (clock skew) reads as 'now'. */
+export function relativeTimeLabel(iso: string, nowMs: number): string {
+  if (!iso || !Number.isFinite(nowMs)) return '';
+  const time = new Date(iso).getTime();
+  if (Number.isNaN(time)) return '';
+  const diffMs = nowMs - time;
+  if (diffMs < 60_000) return 'now';
+  const minutes = Math.floor(diffMs / 60_000);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  return `${Math.floor(hours / 24)} d ago`;
 }

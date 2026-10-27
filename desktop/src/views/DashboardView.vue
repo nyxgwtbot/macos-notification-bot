@@ -15,21 +15,6 @@
     </ion-header>
 
     <ion-content class="nb-content">
-      <!-- Feed kind filter chips: server-side `kind=` on /api/events, full reload per change -->
-      <div class="nb-filter-row" role="group" aria-label="Filter events by kind">
-        <button
-          v-for="option in EVENT_KIND_OPTIONS"
-          :key="option.value"
-          type="button"
-          class="nb-filter-chip"
-          :data-active="store.feedKind === option.value"
-          :aria-pressed="store.feedKind === option.value"
-          @click="onKindChange(option.value)"
-        >
-          {{ option.label }}
-        </button>
-      </div>
-
       <!-- offline banner: API down -> explicit banner + retry, never blank -->
       <div v-if="store.apiDown" class="nb-offline">
         <ion-spinner v-if="store.feedLoading" name="crescent" />
@@ -90,8 +75,8 @@
           </ion-card-header>
           <ion-card-content>
             <template v-if="store.health">
-              <div class="nb-kv"><span>Watermark (last_rec_id)</span><strong>{{ store.health.watermark.last_rec_id }}</strong></div>
-              <div class="nb-kv"><span>Last cycle (state.updated_at)</span><strong>{{ formatIsoShort(store.health.watermark.updated_at) || '—' }}</strong></div>
+              <div class="nb-kv"><span title="last_rec_id">Watermark</span><strong>{{ store.health.watermark.last_rec_id }}</strong></div>
+              <div class="nb-kv"><span title="state.updated_at">Last cycle</span><strong>{{ formatIsoShort(store.health.watermark.updated_at) || '—' }}</strong></div>
               <div class="nb-kv"><span>Ollama</span><strong>{{ store.health.ollama.url }}</strong></div>
               <div class="nb-kv"><span>Model</span><strong>{{ store.health.ollama.model }}</strong></div>
               <div class="nb-kv"><span>Log</span><strong>{{ formatBytes(store.health.log.bytes) }} · v{{ store.health.bot_version }}/api v{{ store.health.api_version }}</strong></div>
@@ -110,6 +95,23 @@
       <!-- Live feed -->
       <div class="nb-feed-header">
         <h2>Live events</h2>
+        <!-- feed kind filter chips: they filter ONLY this feed (server-side
+             `kind=` on /api/events, full reload per change), so they live on
+             the feed header row, not at the page top; shared .nb-filter-chips
+             container wraps them on narrow widths -->
+        <div class="nb-filter-chips" role="group" aria-label="Filter events by kind">
+          <button
+            v-for="option in EVENT_KIND_OPTIONS"
+            :key="option.value"
+            type="button"
+            class="nb-filter-chip"
+            :data-active="store.feedKind === option.value"
+            :aria-pressed="store.feedKind === option.value"
+            @click="onKindChange(option.value)"
+          >
+            {{ option.label }}
+          </button>
+        </div>
       </div>
 
       <ion-spinner v-if="store.feedLoading && store.events.length === 0" name="crescent" class="nb-center" />
@@ -133,8 +135,14 @@
         >
           <div class="nb-event-top">
             <ion-icon class="nb-event-chev" aria-hidden="true" :icon="chevronForwardOutline" />
-            <span class="nb-app">{{ row.app }}</span>
+            <!-- kind identity: leading tinted icon chip replaces the repeated
+                 "bot" app label (it stays as a micro caption in the expanded raw) -->
+            <span class="nb-kind" :class="'nb-kind-' + eventKindIdentity(row)" aria-hidden="true">
+              <ion-icon :icon="KIND_ICONS[eventKindIdentity(row)]" />
+            </span>
             <span class="nb-when">{{ formatIsoShort(row.timestamp) }}</span>
+            <!-- relative age recomputed on every 2s feed poll tick -->
+            <span v-if="row.relText" class="nb-when nb-when-rel">{{ row.relText }}</span>
             <span v-if="row.recId !== null" class="nb-recid">rec_id {{ row.recId }}</span>
           </div>
           <div class="nb-event-title">{{ row.kind === 'startup' ? 'startup' : row.title || '(untitled)' }}</div>
@@ -165,6 +173,9 @@
               <ion-icon aria-hidden="true" :icon="copyOutline" />
               <span v-if="copiedKey === row.key" class="nb-raw-copied">Copied</span>
             </button>
+            <!-- the per-row source label ("bot" etc.) lives only in the expanded
+                 view now, as a micro caption above the raw JSON -->
+            <span v-if="row.app && row.app !== '—'" class="nb-event-raw-source">{{ row.app }}</span>
             <pre class="nb-event-raw-text">{{ rawPreview(row).text }}</pre>
             <span v-if="rawPreview(row).truncatedChars > 0" class="nb-event-raw-note">
               … {{ rawPreview(row).truncatedChars }} chars trimmed (2 KB display cap) — copy takes the full payload
@@ -194,7 +205,7 @@ import {
   IonTitle,
   IonToolbar
 } from '@ionic/vue';
-import { chevronForwardOutline, cloudOfflineOutline, copyOutline, pulseOutline } from 'ionicons/icons';
+import { cashOutline, chevronForwardOutline, cloudOfflineOutline, copyOutline, notificationsOutline, pulseOutline, timeOutline } from 'ionicons/icons';
 
 import { useBotStore } from '@/stores/bot';
 import { usePolling } from '@/composables/usePolling';
@@ -203,7 +214,10 @@ import { formatBytes, formatIsoShort, formatUptime } from '@/utils/time';
 import { formatApiPort } from '@/viewModels/statusViewModel';
 import {
   EVENT_KIND_OPTIONS,
+  eventKindIdentity,
   payloadPreview,
+  relativeTimeLabel,
+  type EventKindIdentity,
   type EventKindValue,
   type EventRow
 } from '@/viewModels/eventViewModel';
@@ -212,7 +226,23 @@ const store = useBotStore();
 
 const daemonBridge = computed(() => typeof window !== 'undefined' && !!window.notifyAPI?.daemon);
 
-const feedRows = computed(() => [...store.events].reverse());
+/** Kind identity -> leading icon (startup: clock, notification: bell,
+ * finance: cash). The identity itself is a pure view-model helper. */
+const KIND_ICONS: Record<EventKindIdentity, string> = {
+  startup: timeOutline,
+  notification: notificationsOutline,
+  finance: cashOutline
+};
+
+/** Feed row plus the relative-age caption; recomputed against nowMs, which
+ * the 2s feed poller bumps every tick. */
+type FeedRow = EventRow & { relText: string };
+const nowMs = ref<number>(Date.now());
+const feedRows = computed<FeedRow[]>(() =>
+  [...store.events]
+    .reverse()
+    .map((row) => ({ ...row, relText: relativeTimeLabel(row.timestamp, nowMs.value) }))
+);
 
 /** Event expand state: per-row key, component-local (like the chat tool chips). */
 const expandedRows = reactive(new Set<string>());
@@ -327,7 +357,11 @@ function retryPolls() {
   void store.pollFeed();
 }
 
-const feedPoller = usePolling(() => store.pollFeed(), { intervalMs: 2000 });
+const feedPoller = usePolling(async () => {
+  await store.pollFeed();
+  // relative ages recompute on every 2s poll tick via the shared render clock
+  nowMs.value = Date.now();
+}, { intervalMs: 2000 });
 const statusPoller = usePolling(async () => {
   await Promise.all([store.loadHealth(), store.pollDaemon()]);
 }, {
@@ -351,12 +385,6 @@ onUnmounted(() => {
 /* S2: header end slot keeps the inline badge away from the window edge */
 .nb-head-end {
   padding-inline-end: var(--nb-space-4);
-}
-
-/* feed kind filter: sits directly under the page header (uses the shared
-   .nb-filter-chips / .nb-filter-chip classes from theme/nb-shared.css) */
-.nb-filter-row {
-  margin: 0 0 var(--nb-space-3);
 }
 
 .nb-cards {
@@ -415,10 +443,14 @@ onUnmounted(() => {
 .nb-kv strong {
   font-weight: 600;
 }
+/* feed header + its kind chips share ONE row; wraps under the h2 when narrow
+   (chips use the shared .nb-filter-chips container from theme/nb-shared.css) */
 .nb-feed-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
+  gap: var(--nb-space-2) var(--nb-space-3);
   margin: var(--nb-space-4) 0 var(--nb-space-2);
 }
 .nb-feed-header h2 {
@@ -465,6 +497,13 @@ onUnmounted(() => {
   padding: var(--nb-space-2) var(--nb-space-3);
   border-radius: var(--nb-radius-sm);
   background: var(--nb-bg-elevated);
+}
+/* the source label ("bot" etc.) as a micro caption, only in the expanded view */
+.nb-event-raw-source {
+  display: block;
+  margin-bottom: var(--nb-space-1);
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-muted);
 }
 .nb-event-raw-text {
   margin: 0;
@@ -518,13 +557,40 @@ onUnmounted(() => {
   font-size: var(--nb-fs-micro);
   color: var(--nb-text-secondary);
 }
-.nb-app {
-  font-weight: 600;
+/* kind identity chip: leading tinted icon circle — startup slate (neutral
+   elevated), notification teal, finance green; the shared tinted-chip DNA
+   (soft ~15% alpha background, icon at full strength) */
+.nb-kind {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--nb-radius-full);
+  background: var(--nb-bg-elevated);
+  color: var(--nb-text-secondary);
+  /* center the circle against the micro text under the row's baseline layout */
+  align-self: center;
+}
+.nb-kind ion-icon {
+  font-size: 14px;
+}
+.nb-kind-notification {
+  background: var(--nb-teal-muted);
   color: var(--nb-teal-light);
+}
+.nb-kind-finance {
+  background: var(--nb-green-muted);
+  color: var(--nb-green);
 }
 .nb-when,
 .nb-recid {
   color: var(--nb-text-secondary);
+}
+/* the relative caption reads one step quieter than the absolute stamp */
+.nb-when-rel {
+  color: var(--nb-text-muted);
 }
 .nb-event-title {
   font-size: var(--nb-fs-body);
