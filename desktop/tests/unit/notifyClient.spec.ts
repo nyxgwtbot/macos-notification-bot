@@ -172,4 +172,51 @@ describe('client payload wiring (typing smoke)', () => {
     expect(window.notifyAPI).toBeDefined();
     expect((window.notifyAPI as unknown as NotifyAPIKey).api).toBeUndefined();
   });
+
+  test('#15 getConnectors hits GET /api/connectors and parses rows', async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            connectors: {
+              reminders: { status: 'unknown', granted: false, last_probe: null, hint: 'hint' },
+              notes: { status: 'granted', granted: true, last_probe: 'ts', hint: 'connected' },
+              system: { status: 'granted', granted: true, last_probe: null, hint: 'no consent required' },
+            },
+          }),
+          { status: 200 }
+        )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await new NotifyClient().getConnectors();
+
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('http://127.0.0.1:4769/api/connectors');
+    expect(init.method).toBe('GET');
+    expect(Object.keys(result.connectors)).toEqual(['reminders', 'notes', 'system']);
+    expect(result.connectors.system.granted).toBe(true);
+    expect(result.connectors.system.hint).toBe('no consent required');
+  });
+
+  test('#16 postConnectorProbe posts {domain} and maps a 409 to ApiError', async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: "a probe for 'notes' is already running; wait for it to finish" }),
+          { status: 409 }
+        )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(new NotifyClient().postConnectorProbe('notes')).rejects.toMatchObject({
+      name: 'ApiError',
+      status: 409,
+      message: expect.stringContaining('already running'),
+    });
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('http://127.0.0.1:4769/api/connectors/probe');
+    expect(init.method).toBe('POST');
+    expect(init.body).toBe(JSON.stringify({ domain: 'notes' }));
+  });
 });

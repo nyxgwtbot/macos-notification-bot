@@ -225,6 +225,34 @@ export interface ServicesResponse {
   services: { artifacts: ServiceStatusRow };
 }
 
+/** Connector status string (notifybot/connectors.py VALID_STATUSES). */
+export type ConnectorStatus = 'granted' | 'needs_consent' | 'denied' | 'unknown' | string;
+
+/** One domain row of GET /api/connectors. */
+export interface ConnectorRow {
+  status: ConnectorStatus;
+  granted: boolean;
+  last_probe: string | null;
+  hint: string;
+}
+
+/** GET /api/connectors response (rows 15). */
+export interface ConnectorsResponse {
+  connectors: {
+    reminders: ConnectorRow;
+    notes: ConnectorRow;
+    system: ConnectorRow;
+  };
+}
+
+/** POST /api/connectors/probe response (row 16). */
+export interface ConnectorProbeResponse {
+  ok: boolean;
+  domain: string;
+  status: ConnectorStatus;
+  last_probe: string | null;
+}
+
 /** 400 {error, details:[…]} error bodies from the API. */
 export interface ApiErrorBody {
   error: string;

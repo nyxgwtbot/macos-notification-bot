@@ -32,6 +32,40 @@
         </ion-card-content>
       </ion-card>
 
+      <!-- Connectors: native-app consent + probe (agent's native.call tool) -->
+      <ion-card>
+        <ion-card-header><ion-card-title>Connectors</ion-card-title></ion-card-header>
+        <ion-card-content>
+          <p class="nb-muted">
+            Connectors let the in-app agent (Chat tab) control native macOS apps. macOS may show a
+            system consent prompt — approve it while this app is focused.
+          </p>
+          <template v-if="connectors.rows.length > 0">
+            <div v-for="row in connectors.rows" :key="row.domain" class="nb-connector-row">
+              <div class="nb-connector-head">
+                <strong>{{ row.domain }}</strong>
+                <ion-badge :color="statusChipColor(row.status)">{{ statusChipLabel(row.status) }}</ion-badge>
+                <ion-button
+                  size="small"
+                  fill="outline"
+                  :disabled="isProbingConnectors(row.domain)"
+                  :aria-label="(row.granted ? 'Re-check ' : 'Connect ') + row.domain"
+                  @click="probeConnector(row.domain)"
+                >
+                  <ion-spinner v-if="isProbingConnectors(row.domain)" name="crescent" />
+                  <template v-else>{{ buttonLabel(row) }}</template>
+                </ion-button>
+              </div>
+              <p class="nb-muted nb-connector-hint">{{ row.hint }}</p>
+            </div>
+          </template>
+          <ion-spinner v-else name="crescent" class="nb-connectors-loading" />
+          <div v-if="connectors.error" class="nb-banner nb-banner-err">
+            <span>{{ connectors.error }}</span>
+          </div>
+        </ion-card-content>
+      </ion-card>
+
       <template v-if="store.config">
         <!-- structured editors -->
         <ion-card>
@@ -211,8 +245,19 @@ import {
 import { refreshOutline } from 'ionicons/icons';
 
 import { useBotStore } from '@/stores/bot';
+import { notifyClient, errorText } from '@/services/notifyClient';
 import { validateConfigDraft, validateRuleConditionKeys } from '@/services/configValidation';
 import { formatIsoShort } from '@/utils/time';
+import {
+  buttonLabel,
+  initialConnectorsState,
+  isProbing,
+  reduceConnectors,
+  statusChipColor,
+  statusChipLabel,
+  type ConnectorsEvent,
+  type ConnectorsState,
+} from '@/viewModels/connectorsViewModel';
 import type { BotConfig, BotRule } from '@/types/bot';
 
 interface ActionDraft {
@@ -236,6 +281,47 @@ interface ConfigDraft {
 }
 
 const store = useBotStore();
+
+const connectors = ref<ConnectorsState>(initialConnectorsState());
+
+function dispatchConnectors(event: ConnectorsEvent): void {
+  connectors.value = reduceConnectors(connectors.value, event);
+}
+
+function isProbingConnectors(domain: string): boolean {
+  return isProbing(connectors.value, domain);
+}
+
+async function loadConnectors(): Promise<void> {
+  dispatchConnectors({ type: 'load-start' });
+  try {
+    const response = await notifyClient.getConnectors();
+    dispatchConnectors({ type: 'rows-loaded', response });
+  } catch (err) {
+    dispatchConnectors({ type: 'load-failed', error: errorText(err) });
+  }
+}
+
+async function probeConnector(domain: string): Promise<void> {
+  // concurrent-probe guard: the button disables, but double-check anyway
+  if (isProbing(connectors.value, domain)) return;
+  dispatchConnectors({ type: 'probe-start', domain });
+  try {
+    const probe = await notifyClient.postConnectorProbe(domain);
+    dispatchConnectors({
+      type: 'probe-succeeded',
+      domain,
+      row: {
+        status: probe.status,
+        granted: probe.status === 'granted',
+        last_probe: probe.last_probe,
+        hint: '',
+      },
+    });
+  } catch (err) {
+    dispatchConnectors({ type: 'probe-failed', domain, error: errorText(err) });
+  }
+}
 
 const draft = reactive<ConfigDraft>({
   pollInterval: '',
@@ -427,8 +513,10 @@ async function save(): Promise<void> {
 }
 
 onMounted(async () => {
+  const connectorsTask = loadConnectors(); // independent of the config draft
   await store.loadConfig();
   if (store.config) buildDraft(store.config);
+  await connectorsTask;
 });
 </script>
 
@@ -456,6 +544,28 @@ onMounted(async () => {
   margin: 6px 0 0;
   padding-left: 18px;
   font-size: 12px;
+}
+.nb-connector-row {
+  border-bottom: 1px dashed var(--nb-border-subtle, #1e2833);
+  padding: 8px 0;
+}
+.nb-connector-row:last-of-type {
+  border-bottom: none;
+}
+.nb-connector-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.nb-connector-hint {
+  margin: 2px 0 4px;
+  font-size: 12px;
+}
+.nb-connectors-loading {
+  display: block;
+  margin: 12px auto;
+  width: 24px;
+  height: 24px;
 }
 .nb-field {
   display: flex;
