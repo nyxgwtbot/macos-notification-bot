@@ -3,6 +3,14 @@
     <ion-header>
       <ion-toolbar>
         <ion-title>Status</ion-title>
+        <!-- S2: page header row carries the feed liveness badge inline (title at
+             fs-title-lg + badge on ONE row; shared pattern lands in X1) -->
+        <div slot="end" class="nb-head-end">
+          <ion-badge :color="store.feedError ? 'danger' : 'primary'">
+            <ion-icon aria-hidden="true" :icon="pulseOutline" />
+            {{ store.feedError ? 'offline' : 'every 2s' }}
+          </ion-badge>
+        </div>
       </ion-toolbar>
     </ion-header>
 
@@ -18,9 +26,12 @@
       <div class="nb-cards">
         <!-- Daemon card: process managed by Electron main (not via the API) -->
         <ion-card>
-          <ion-card-header>
+          <ion-card-header class="nb-card-head">
             <ion-card-title>Daemon</ion-card-title>
-            <ion-badge :color="daemonBadgeColor">{{ daemonBadgeText }}</ion-badge>
+            <!-- S1: compact status chip (dot + label) right-aligned, not a full-width pill -->
+            <span class="nb-status-chip" :class="'nb-status-' + daemonChipTone">
+              <i class="nb-dot" aria-hidden="true"></i>{{ daemonBadgeText }}
+            </span>
           </ion-card-header>
           <ion-card-content>
             <template v-if="store.daemon">
@@ -52,11 +63,11 @@
 
         <!-- Health card: watermark + state + ollama (from GET /api/health) -->
         <ion-card>
-          <ion-card-header>
+          <ion-card-header class="nb-card-head">
             <ion-card-title>Bot state</ion-card-title>
-            <ion-badge :color="store.healthError ? 'danger' : 'success'">
-              {{ store.healthError ? 'error' : 'ok' }}
-            </ion-badge>
+            <span class="nb-status-chip" :class="'nb-status-' + healthChipTone">
+              <i class="nb-dot" aria-hidden="true"></i>{{ store.healthError ? 'error' : 'ok' }}
+            </span>
           </ion-card-header>
           <ion-card-content>
             <template v-if="store.health">
@@ -80,10 +91,6 @@
       <!-- Live feed -->
       <div class="nb-feed-header">
         <h2>Live events</h2>
-        <ion-badge :color="store.feedError ? 'danger' : 'primary'">
-          <ion-icon aria-hidden="true" :icon="pulseOutline" />
-          {{ store.feedError ? 'offline' : 'every 2s' }}
-        </ion-badge>
       </div>
 
       <ion-spinner v-if="store.feedLoading && store.events.length === 0" name="crescent" class="nb-center" />
@@ -151,9 +158,11 @@ const daemonBridge = computed(() => typeof window !== 'undefined' && !!window.no
 
 const feedRows = computed(() => [...store.events].reverse());
 
-const daemonBadgeColor = computed(() =>
-  store.daemon?.running ? (store.daemon.adopted ? 'secondary' : 'success') : 'medium'
+/** S1: compact status chips — tone maps to quiet semantic tint classes. */
+const daemonChipTone = computed(() =>
+  store.daemon ? (store.daemon.running ? (store.daemon.adopted ? 'info' : 'ok') : 'muted') : 'muted'
 );
+const healthChipTone = computed(() => (store.healthError ? 'bad' : 'ok'));
 const daemonBadgeText = computed(() => {
   if (store.daemon) return store.daemon.running ? (store.daemon.adopted ? 'running (adopted)' : 'running') : 'stopped';
   return store.daemonError === 'bridge-ausente' ? 'bridge missing' : 'no status';
@@ -212,18 +221,80 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+/* S2: header end slot keeps the inline badge away from the window edge */
+.nb-head-end {
+  padding-inline-end: var(--nb-space-4);
+}
+
 .nb-cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
   gap: var(--nb-space-3);
   margin-bottom: 0;
 }
+/* S1: card header row — title left, status chip right */
+.nb-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--nb-space-2);
+}
+.nb-card-head ion-card-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* S1: compact status chip (icon dot + label, max-content) */
+.nb-status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nb-space-1);
+  width: max-content;
+  max-width: 100%;
+  padding: 2px var(--nb-space-2); /* 2px micro-inner exception */
+  border-radius: var(--nb-radius-sm);
+  font-size: var(--nb-fs-micro);
+  font-weight: 600;
+  line-height: 1.45;
+  white-space: nowrap;
+  background: var(--nb-bg-elevated);
+  color: var(--nb-text-secondary);
+}
+.nb-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: var(--nb-radius-full);
+  background: currentColor;
+}
+.nb-status-ok {
+  background: var(--nb-green-muted);
+  color: var(--nb-green);
+}
+.nb-status-info {
+  background: var(--nb-info-muted);
+  color: var(--nb-info);
+}
+.nb-status-bad {
+  background: var(--nb-danger-muted);
+  color: var(--nb-danger);
+}
+
 .nb-kv {
   display: flex;
   justify-content: space-between;
   gap: var(--nb-space-2);
   font-size: var(--nb-fs-secondary);
   padding: var(--nb-space-1) 0;
+}
+/* S3: last kv row inherits the card-content 12px bottom inset like the footer */
+.nb-kv:last-child {
+  padding-bottom: 0;
+}
+/* S5: normalized kv label column so PID/watermark rows align across cards */
+.nb-kv span {
+  min-width: 160px;
 }
 .nb-kv span {
   color: var(--nb-text-secondary);
@@ -281,6 +352,11 @@ onUnmounted(() => {
   color: var(--nb-text-secondary);
   font-size: var(--nb-fs-secondary);
   margin-top: var(--nb-space-1);
+}
+/* S4: chip rhythm — one step between chip rows, one micro-gap inside;
+   ion-chip's own 4px host margins are neutralized for uniform gaps */
+.nb-chips ion-chip {
+  margin: 0;
 }
 .nb-chips {
   display: flex;

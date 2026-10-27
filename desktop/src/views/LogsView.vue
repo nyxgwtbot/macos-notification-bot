@@ -28,10 +28,10 @@
 
         <div ref="logScroller" class="nb-log-scroller" @scroll="onScroll">
           <div
-            v-for="line in store.logLines"
+            v-for="line in displayLines"
             :key="line.line_no"
             class="nb-line"
-            :class="{ 'nb-line-bad': line.malformed }"
+            :class="{ 'nb-line-bad': line.malformed, 'nb-line-hi': line.high }"
           >
             <button class="nb-copy" :aria-label="'Copy line ' + line.line_no" @click="copyLine(line.raw)">
               <ion-icon aria-hidden="true" :icon="copyOutline" />
@@ -72,6 +72,16 @@ const copiedAt = ref<string | null>(null);
 
 const logTitle = computed(() => `Raw tail · ${store.logLines.length} line${store.logLines.length === 1 ? '' : 's'}`);
 const copiedAllText = ref<string | null>(null);
+
+/** L4: rows whose raw JSON carries "urgency": "high" get the warn treatment.
+ * Pure view-layer line map — the tail payload/VM contract stays untouched. */
+const URGENCY_HIGH_RE = /"urgency"\s*:\s*"high"/;
+const displayLines = computed(() =>
+  store.logLines.map((line) => ({
+    ...line,
+    high: URGENCY_HIGH_RE.test(line.raw)
+  }))
+);
 
 /** Keep auto-scroll pinned to the bottom unless the user scrolled up. */
 function onScroll(event: Event): void {
@@ -139,9 +149,6 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-/* Constant copy-gutter: 40px */
-/* --nb-log-gutter: 40px; */
-
 .nb-logs-content {
   --overflow: hidden;
   --padding-top: var(--nb-space-4);
@@ -173,13 +180,21 @@ onUnmounted(() => {
   border-radius: var(--nb-radius-md);
   background: var(--nb-bg-deep);
   padding: var(--nb-space-2) var(--nb-space-1);
+  /* L2: micro row gap between log lines */
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-space-1);
 }
 
+/* L3: every row is [icon gutter][content column]; wrapped continuation lines
+   inside .nb-raw start at the same content x — the hanging indent. */
 .nb-line {
   position: relative;
   display: flex;
   align-items: flex-start;
   gap: var(--nb-space-1);
+  /* uniform left border slot; L4 re-colors it instead of shifting layout */
+  border-left: 2px solid transparent;
 }
 
 .nb-line-bad .nb-raw {
@@ -187,24 +202,40 @@ onUnmounted(() => {
   font-style: italic;
 }
 
+/* L4: warn marker + bg tint on urgency:high rows */
+.nb-line-hi {
+  border-left-color: var(--nb-warning);
+  background: var(--nb-warning-muted);
+}
+
 .nb-raw {
+  flex: 1 1 auto;
+  min-width: 0;
   margin: 0;
-  padding: var(--nb-space-1) 40px var(--nb-space-1) var(--nb-space-2); /* 40px copy-button gutter */
+  padding: var(--nb-space-1) var(--nb-space-1) var(--nb-space-1) var(--nb-space-2);
   font-family: var(--nb-mono);
   font-size: var(--nb-fs-micro);
-  line-height: 1.45;
+  /* L2: relaxed line height (was fs 11/1.3-1.45 wall) */
+  line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-all;
   color: var(--nb-text-primary);
 }
 
+/* L1: the copy affordance is noise at rest — reveal on hover/keyboard focus */
 .nb-copy {
   background: none;
   border: none;
   color: var(--nb-text-secondary);
   cursor: pointer;
-  padding: 2px; /* 2px micro-inner exception */
+  padding: 2px var(--nb-space-1); /* 2px micro-inner exception */
   margin-top: 2px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.nb-line:hover .nb-copy,
+.nb-copy:focus-visible {
+  opacity: 1;
 }
 
 .nb-copied {
