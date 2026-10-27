@@ -1,14 +1,17 @@
 """In-app agent tools layer (`app.data`, `dashboard.create`, `server.serve`,
-`notify.test`) and the artifacts sub-service registry.
+`notify.test`, `native.call`) and the artifacts sub-service registry.
 
 This module owns:
 
 - the shared agent constants block (ports, budgets, caps) imported by
   ``notifybot.agent``;
-- the four tool implementations, backed by the EXISTING ``BotApiRuntime``
+- the four v1 tool implementations, backed by the EXISTING ``BotApiRuntime``
   handlers in ``notifybot/api.py`` (``health`` / ``events`` /
   ``finance_summary`` / ``finance_transactions`` / ``test_notify``) — zero
   duplicated query logic;
+- the fifth tool ``native.call`` (connectors): envelope validation here, all
+  execution delegated to ``notifybot.connectors.ConnectorManager`` (frozen
+  argv-bound AppleScript, per-domain consent state, PT-BR consent errors);
 - ``ArtifactServerRegistry`` — one stdlib ``ThreadingHTTPServer`` bound to
   loopback:4770 (``ARTIFACTS_PORT``; overridable via
   ``NOTIFYBOT_ARTIFACTS_PORT`` for tests, where the sandbox uses port 0) that
@@ -276,11 +279,30 @@ def _api_error_result(api_error: Any) -> dict:
 
 
 class ToolRegistry:
-    """Dispatch table over the four v1 tools. One per server process."""
+    """Dispatch table over the four v1 tools + native.call (connectors).
+    One per server process."""
 
-    def __init__(self, runtime: Any, server_registry: ArtifactServerRegistry):
+    def __init__(
+        self,
+        runtime: Any,
+        server_registry: ArtifactServerRegistry,
+        connector_manager: Optional[Any] = None,
+    ):
         self.runtime = runtime
         self.server_registry = server_registry
+        # Connectors executor (native.call). Optional third param so both
+        # existing construction sites keep compiling unchanged; when omitted
+        # it is lazily built from runtime.config_dir on the first native.call.
+        self.connector_manager = connector_manager
+
+    def _ensure_connector_manager(self) -> Any:
+        """Lazy singleton for the ConnectorManager (avoids importing/connecting
+        anything at registry construction time)."""
+        if self.connector_manager is None:
+            from notifybot.connectors import ConnectorManager  # lazy (no cycle)
+
+            self.connector_manager = ConnectorManager(self.runtime.config_dir)
+        return self.connector_manager
 
     def dispatch(self, name: str, args: Any, ctx: Optional[Dict[str, Any]] = None) -> dict:
         """Run one tool; unknown tools and failures return {"error": ...}
@@ -295,8 +317,10 @@ class ToolRegistry:
             return self._protected(self._serve, name, args)
         if name == "notify.test":
             return self._protected(self._notify_test, name, args)
+        if name == "native.call":
+            return self._protected(self._native_call, name, args)
         return {
-            "error": f"unknown tool: {name!r} (valid: app.data, dashboard.create, server.serve, notify.test)"
+            "error": f"unknown tool: {name!r} (valid: app.data, dashboard.create, server.serve, notify.test, native.call)"
         }
 
     def _protected(self, handler, tool_name: str, args: Any) -> dict:
@@ -416,6 +440,37 @@ class ToolRegistry:
         surface as the runtime's ApiError -> {"error": ...} tool result.
         """
         return self.runtime.test_notify(args if isinstance(args, dict) else None)
+
+
+    # ---- native.call (connectors) ----
+
+    def _native_call(self, args: dict) -> dict:
+        """Drive a native macOS app through the approved connectors whitelist.
+
+        Validates the envelope (domain/action strings + params dict), then
+        delegates to the ConnectorManager (whitelist -> consent gate ->
+        argv-bound osascript -> outcome classification). ConnectorError
+        messages (PT-BR consent/denial/timeout, English validation) surface
+        VERBATIM as the tool error result — the agent relays them, never
+        retries an ungranted domain.
+        """
+        domain = args.get("domain")
+        if not isinstance(domain, str) or domain.strip() == "":
+            raise ToolFailure("native.call requires a 'domain' string (reminders, notes, system)")
+        action = args.get("action")
+        if not isinstance(action, str) or action.strip() == "":
+            raise ToolFailure("native.call requires an 'action' string for the domain")
+        params = args.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            raise ToolFailure("native.call 'params' must be a JSON object")
+        from notifybot.connectors import ConnectorError  # lazy (no import cycle)
+
+        try:
+            return self._ensure_connector_manager().run_action(domain.strip(), action.strip(), params)
+        except ConnectorError as e:
+            raise ToolFailure(str(e)) from None
 
 
 def _write_atomic(path: str, content: str) -> None:

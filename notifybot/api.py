@@ -17,6 +17,8 @@ Serves the endpoint rows of the Electron desktop plan over a stdlib
 12. GET  /api/agent/sessions        -> agent chat sessions (newest first)
 13. GET  /api/agent/session/<id>    -> full agent session transcript (validated id)
 14. GET  /api/services              -> sub-service registry status (artifacts)
+15. GET  /api/connectors            -> per-domain connector status/hints
+16. POST /api/connectors/probe      -> one osascript consent probe per domain
 Plus one support endpoint for the Logs screen (raw text tail with malformed
 lines flagged, needed to render them dimmed): GET /api/logs/tail?lines=N.
 
@@ -65,6 +67,12 @@ from notifybot.agent_tools import (
     ToolRegistry,
     artifacts_dir_for,
     artifacts_port_from_env,
+)
+from notifybot.connectors import (
+    CONNECTOR_DOMAINS,
+    ConnectorError,
+    ConnectorManager,
+    ProbeBusy,
 )
 from notifybot.finance import LEDGER_SCHEMA, FinanceLedger, previous_month
 from notifybot.report import FinanceReporter, validate_month
@@ -516,6 +524,8 @@ class BotApiRuntime:
         # the API never binds ports or creates directories as a side effect.
         self.agent_registry: Optional[ArtifactServerRegistry] = None
         self.tool_registry: Optional[ToolRegistry] = None
+        # Connectors executor (rows 15-16 + native.call): lazy singleton too.
+        self.connector_manager: Optional[ConnectorManager] = None
 
     # ---- path resolution (relative paths live beside config.json) ----
 
@@ -548,6 +558,14 @@ class BotApiRuntime:
     def artifacts_dir(self) -> str:
         return artifacts_dir_for(self.config_dir)
 
+    def ensure_connector_manager(self) -> ConnectorManager:
+        """Lazy connectors executor: one per server process (state store +
+        single-flight probe locks live inside). Creates <config_dir>/data/
+        only when the first probe/action writes state."""
+        if self.connector_manager is None:
+            self.connector_manager = ConnectorManager(self.config_dir)
+        return self.connector_manager
+
     def ensure_agent_registry(self) -> ArtifactServerRegistry:
         """Lazy artifacts sub-service registry: one per server process (the
         single BotApiRuntime keeps it singleton). The registry binds nothing
@@ -557,7 +575,7 @@ class BotApiRuntime:
                 self.artifacts_dir(), port=artifacts_port_from_env()
             )
         if self.tool_registry is None:
-            self.tool_registry = ToolRegistry(self, self.agent_registry)
+            self.tool_registry = ToolRegistry(self, self.agent_registry, self.ensure_connector_manager())
         return self.agent_registry
 
     # ---- shared reads ----
@@ -877,6 +895,37 @@ class BotApiRuntime:
         registry = self.ensure_agent_registry()
         return {"services": {"artifacts": registry.list()}}
 
+    # ---------- connectors endpoint handlers (rows 15-16; all error strings NEW -> English) ----------
+
+    # #15 GET /api/connectors — registry/status snapshot (no params).
+    def connectors_list(self) -> dict:
+        return self.ensure_connector_manager().rows()
+
+    # #16 POST /api/connectors/probe — one trivial per-domain osascript call
+    # (<= 8 s) to classify consent; single-flight per domain (409 when busy).
+    def connectors_probe(self, body: Any) -> dict:
+        if not isinstance(body, dict):
+            raise ApiError(400, "body must be a JSON object with a 'domain' string")
+        domain = body.get("domain")
+        if not isinstance(domain, str) or domain.strip() == "":
+            raise ApiError(400, "'domain' must be a non-empty string")
+        domain = domain.strip()
+        if domain not in CONNECTOR_DOMAINS:
+            raise ApiError(
+                400,
+                "unknown domain: {!r} (valid: reminders, notes, system)".format(domain),
+            )
+        manager = self.ensure_connector_manager()
+        try:
+            return manager.probe(domain)
+        except ProbeBusy:
+            raise ApiError(
+                409,
+                "a probe for {!r} is already running; wait for it to finish".format(domain),
+            ) from None
+        except ConnectorError as e:
+            raise ApiError(500, str(e)) from None
+
     # ---------- param helpers ----------
 
     # GET /api/logs/tail — raw tail support endpoint for the Logs screen
@@ -930,12 +979,14 @@ ROUTES: Dict[str, Dict[str, str]] = {
         "/api/logs/tail": "logs_tail",
         "/api/agent/sessions": "agent_sessions",
         "/api/services": "services",
+        "/api/connectors": "connectors_list",
     },
     "POST": {
         "/api/config": "config_post",
         "/api/finance/report": "finance_report_build",
         "/api/test-notify": "test_notify",
         "/api/agent/turn": "agent_turn",
+        "/api/connectors/probe": "connectors_probe",
     },
 }
 QUERY_HANDLERS = frozenset({"events", "finance_summary", "finance_transactions", "finance_report_status", "logs_tail", "agent_sessions"})
