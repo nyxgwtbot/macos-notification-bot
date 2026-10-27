@@ -3,19 +3,19 @@
     <ion-tabs>
       <ion-router-outlet />
       <ion-tab-bar slot="top" class="nb-nav">
-        <ion-tab-button tab="chat" href="/chat">
+        <ion-tab-button tab="chat" href="/chat" layout="icon-start">
           <ion-icon aria-hidden="true" :icon="chatbubblesOutline" />
           <ion-label>Chat</ion-label>
         </ion-tab-button>
-        <ion-tab-button tab="dashboard" href="/dashboard">
+        <ion-tab-button tab="dashboard" href="/dashboard" layout="icon-start">
           <ion-icon aria-hidden="true" :icon="gridOutline" />
           <ion-label>Status</ion-label>
         </ion-tab-button>
-        <ion-tab-button tab="logs" href="/logs">
+        <ion-tab-button tab="logs" href="/logs" layout="icon-start">
           <ion-icon aria-hidden="true" :icon="terminalOutline" />
           <ion-label>Logs</ion-label>
         </ion-tab-button>
-        <ion-tab-button tab="config" href="/config">
+        <ion-tab-button tab="config" href="/config" layout="icon-start">
           <ion-icon aria-hidden="true" :icon="settingsOutline" />
           <ion-label>Settings</ion-label>
         </ion-tab-button>
@@ -55,5 +55,6 @@ import { chatbubblesOutline, gridOutline, settingsOutline, terminalOutline } fro
 
 .nb-nav ion-tab-button ion-icon {
   font-size: 18px;
+  margin-inline-end: var(--nb-space-2);
 }
 </style>
