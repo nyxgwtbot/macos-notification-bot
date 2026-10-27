@@ -18,18 +18,44 @@ import { registerReportIpc } from './ipc/reportIpc';
 // Graceful handling of unhandled errors.
 unhandled();
 
-// Define our menu templates (no tray for the MVP).
+// myCapacitorApp is assigned below; menu click handlers read the window lazily
+// so the template can be built before init().
+let myCapacitorApp: ElectronCapacitorApp;
+
+/** G1: menu-accelerator navigation — push the route into the renderer; the
+ * router allowlist guards the channel. Click handlers run long after init(),
+ * so the lazy window lookup is always valid by use time. */
+function navigateTo(path: string): void {
+  if (!myCapacitorApp) return;
+  const win = myCapacitorApp.getMainWindow();
+  if (win && !win.isDestroyed()) {
+    win.webContents.send('notify:navigate', path);
+  }
+}
+
+// Define our menu templates (no tray for the MVP). The Navigate submenu adds
+// ⌘1-⌘4 view shortcuts as plain items (role: none + accelerator + click);
+// existing appMenu/editMenu/viewMenu items are untouched.
 const appMenuBarMenuTemplate: (MenuItemConstructorOptions | MenuItem)[] = [
   { role: process.platform === 'darwin' ? 'appMenu' : 'fileMenu' },
   { role: 'editMenu' },
-  { role: 'viewMenu' }
+  { role: 'viewMenu' },
+  {
+    label: 'Navigate',
+    submenu: [
+      { label: 'Chat', accelerator: 'CmdOrCtrl+1', click: () => navigateTo('/chat') },
+      { label: 'Status', accelerator: 'CmdOrCtrl+2', click: () => navigateTo('/dashboard') },
+      { label: 'Logs', accelerator: 'CmdOrCtrl+3', click: () => navigateTo('/logs') },
+      { label: 'Settings', accelerator: 'CmdOrCtrl+4', click: () => navigateTo('/config') }
+    ]
+  }
 ];
 
 // Get Config options from capacitor.config
 const capacitorFileConfig: CapacitorElectronConfig = getCapacitorElectronConfig();
 
 // Initialize our app.
-const myCapacitorApp = new ElectronCapacitorApp(capacitorFileConfig, appMenuBarMenuTemplate);
+myCapacitorApp = new ElectronCapacitorApp(capacitorFileConfig, appMenuBarMenuTemplate);
 
 // The python child-process manager (API server + bot daemon).
 const manager = new PythonProcessManager();

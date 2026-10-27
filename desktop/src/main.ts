@@ -46,6 +46,14 @@ async function bootstrap() {
     .use(router);
 
   await router.isReady();
+
+  // G1: menu accelerators (⌘1-⌘4) arrive as 'notify:navigate' IPC pushes from
+  // the Electron main process; allowlist-guard so only known routes navigate.
+  const NAVIGABLE_PATHS = new Set(['/chat', '/dashboard', '/logs', '/config']);
+  window.notifyAPI?.navigate.onNavigate((path) => {
+    if (NAVIGABLE_PATHS.has(path)) void router.push(path);
+  });
+
   app.mount('#app');
 }
 

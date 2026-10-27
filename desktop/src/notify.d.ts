@@ -58,6 +58,10 @@ export interface NotifyAPI {
   app: {
     info: () => Promise<NotifyAppInfo>;
   };
+  /** G1: menu-accelerator navigation pushed from the Electron main process. */
+  navigate: {
+    onNavigate: (handler: (path: string) => void) => void;
+  };
 }
 
 declare global {
