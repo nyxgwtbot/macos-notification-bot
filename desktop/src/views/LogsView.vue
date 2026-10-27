@@ -48,15 +48,48 @@
             >
               {{ followOn ? 'Follow' : 'Paused — follow?' }}
             </button>
-            <button
-              type="button"
-              class="nb-copy-all"
-              aria-label="Copy visible tail text"
-              @click="copyAll"
-            >
-              <ion-icon aria-hidden="true" :icon="copyOutline" />
-              Copy all
-            </button>
+            <!-- R3: right-side header tools — debounced client-side search,
+                 live "n of m lines" counter, density switch chip, copy-all -->
+            <div class="nb-log-tools">
+              <input
+                class="nb-log-search"
+                type="text"
+                :value="searchDraft"
+                placeholder="Filter lines…"
+                aria-label="Filter log lines"
+                @input="onSearchInput"
+              />
+              <span class="nb-log-count" aria-live="polite">{{ lineCount }}</span>
+              <div class="nb-density" role="group" aria-label="Log line density">
+                <button
+                  type="button"
+                  class="nb-filter-chip"
+                  :data-active="density === 'compact'"
+                  :aria-pressed="density === 'compact'"
+                  @click="onDensityChange('compact')"
+                >
+                  Compact
+                </button>
+                <button
+                  type="button"
+                  class="nb-filter-chip"
+                  :data-active="density === 'comfortable'"
+                  :aria-pressed="density === 'comfortable'"
+                  @click="onDensityChange('comfortable')"
+                >
+                  Comfortable
+                </button>
+              </div>
+              <button
+                type="button"
+                class="nb-copy-all"
+                aria-label="Copy visible tail text"
+                @click="copyAll"
+              >
+                <ion-icon aria-hidden="true" :icon="copyOutline" />
+                Copy all
+              </button>
+            </div>
           </div>
         </div>
 
@@ -65,7 +98,7 @@
           <code>python3 bot.py --once</code> to generate the first event.
         </p>
 
-        <div ref="logScroller" class="nb-log-scroller" @scroll="onScroll">
+        <div ref="logScroller" class="nb-log-scroller" :data-density="density" @scroll="onScroll">
           <div
             v-for="line in visibleLines"
             :key="line.line_no"
@@ -75,7 +108,10 @@
             <button class="nb-copy" :aria-label="'Copy line ' + line.line_no" @click="copyLine(line.raw)">
               <ion-icon aria-hidden="true" :icon="copyOutline" />
             </button>
-            <pre class="nb-raw">{{ line.raw || ' ' }}</pre>
+            <!-- R3 token dimming: the raw text renders as interpolated text
+                 nodes (escaped) wrapped by classed spans — segments come from
+                 the VM single-pass tokenizer; no innerHTML path exists -->
+            <pre class="nb-raw"><template v-for="(seg, si) in line.segments" :key="si"><span v-if="seg.cls" :class="seg.cls">{{ seg.text }}</span><template v-else>{{ seg.text }}</template></template></pre>
             <span v-if="copiedAt === line.raw" class="nb-copied">Copied</span>
           </div>
           <div v-if="visibleLines.length === 0 && store.logFileExists" class="nb-empty">No matching lines.</div>
@@ -103,7 +139,16 @@ import { copyOutline, pulseOutline } from 'ionicons/icons';
 import { useBotStore } from '@/stores/bot';
 import { usePolling } from '@/composables/usePolling';
 import { copyText } from '@/utils/clipboard';
-import { filterLogLines, LOG_KIND_FILTER_OPTIONS, type LogKindFilter } from '@/viewModels/logsViewModel';
+import {
+  LOGS_DENSITY_KEY,
+  LOG_KIND_FILTER_OPTIONS,
+  filterLogLines,
+  filterLogLinesByQuery,
+  logLineSegments,
+  parseLogDensity,
+  type LogDensity,
+  type LogKindFilter
+} from '@/viewModels/logsViewModel';
 
 const store = useBotStore();
 
@@ -129,20 +174,72 @@ let copiedTimer: number | null = null;
 
 const kindFilter = ref<LogKindFilter>('all');
 
+/* ========================================
+   R3: SEARCH — the input owns an instant draft; the applied query updates
+   after a 150ms debounce so typing stays smooth over the (already loaded)
+   tail. Filter + follow are independent: querying never toggles follow.
+   ======================================== */
+const SEARCH_DEBOUNCE_MS = 150;
+const searchDraft = ref('');
+const appliedSearch = ref('');
+let searchTimer: number | null = null;
+
+function onSearchInput(event: Event): void {
+  const value = (event.target as HTMLInputElement).value;
+  searchDraft.value = value;
+  if (searchTimer !== null) window.clearTimeout(searchTimer);
+  searchTimer = window.setTimeout(() => {
+    searchTimer = null;
+    appliedSearch.value = searchDraft.value;
+  }, SEARCH_DEBOUNCE_MS);
+}
+
+/* ========================================
+   R3: DENSITY — compact (fs 11/lh 1.35) vs comfortable (fs 12/lh 1.65);
+   persisted under LOGS_DENSITY_KEY, tampered values degrade to comfortable.
+   localStorage itself can throw in privacy modes — degrade to session-only.
+   ======================================== */
+const density = ref<LogDensity>(parseLogDensity(readStoredLogDensity()));
+
+function readStoredLogDensity(): string | null {
+  try {
+    return window.localStorage.getItem(LOGS_DENSITY_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function onDensityChange(value: LogDensity): void {
+  density.value = value;
+  try {
+    window.localStorage.setItem(LOGS_DENSITY_KEY, value);
+  } catch {
+    /* session-only toggle */
+  }
+}
+
 const logTitle = computed(() =>
   `Raw tail · ${visibleLines.value.length} line${visibleLines.value.length === 1 ? '' : 's'}`
 );
 
 /** L4: rows whose raw JSON carries "urgency": "high" get the warn treatment.
  * Pure view-layer line map — the tail payload/VM contract stays untouched.
- * Kind filter (iterB) applies first, client-side, so the highlight map sees
- * the filtered lines. */
+ * Kind filter (iterB) applies first, client-side, then the R3 search
+ * substring; the map also pre-computes the token-dimming segments so the
+ * template only renders. */
 const URGENCY_HIGH_RE = /"urgency"\s*:\s*"high"/;
 const visibleLines = computed(() =>
-  filterLogLines(store.logLines, kindFilter.value).map((line) => ({
+  filterLogLinesByQuery(filterLogLines(store.logLines, kindFilter.value), appliedSearch.value).map((line) => ({
     ...line,
-    high: URGENCY_HIGH_RE.test(line.raw)
+    high: URGENCY_HIGH_RE.test(line.raw),
+    segments: logLineSegments(line.raw || ' ')
   }))
+);
+
+/** R3: "n of m lines" beside the search input — n = currently visible rows
+ * (kind + search filtered), m = loaded tail size. */
+const lineCount = computed(
+  () => `${visibleLines.value.length} of ${store.logLines.length} lines`
 );
 
 function onKindFilterChange(kind: LogKindFilter): void {
@@ -150,6 +247,10 @@ function onKindFilterChange(kind: LogKindFilter): void {
   kindFilter.value = kind;
   rebaseNewCount();
 }
+
+/* A fresh applied query mid-pause rebases the +N badge baseline (same rule
+   as the kind filter change); the follow/pause state itself never moves. */
+watch(appliedSearch, () => rebaseNewCount());
 
 /** Keep auto-scroll pinned to the bottom unless the user scrolled up; a scroll
  * up pauses follow (chip -> "Paused — follow?"), the chip click re-enables. */
@@ -285,6 +386,7 @@ onUnmounted(() => {
   if (programmaticScrollTimer !== null) window.clearTimeout(programmaticScrollTimer);
   if (copiedTimer !== null) window.clearTimeout(copiedTimer);
   if (copiedAllTimer.value !== null) window.clearTimeout(copiedAllTimer.value);
+  if (searchTimer !== null) window.clearTimeout(searchTimer);
 });
 </script>
 
@@ -380,8 +482,47 @@ onUnmounted(() => {
   flex-wrap: wrap;
 }
 
-.nb-log-controls .nb-copy-all {
+/* R3: right-side header tool group — search + live counter + density switch
+   + copy-all; wraps under the kind chips on narrow widths */
+.nb-log-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nb-space-2);
   margin-left: auto;
+  flex-wrap: wrap;
+}
+
+.nb-log-search {
+  width: 150px;
+  min-width: 110px;
+  padding: 3px var(--nb-space-2);
+  border: 1px solid var(--nb-border-default);
+  border-radius: var(--nb-radius-sm);
+  background: var(--nb-bg-deep);
+  color: var(--nb-text-primary);
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-micro);
+  line-height: 1.45;
+}
+.nb-log-search::placeholder {
+  color: var(--nb-text-muted);
+}
+.nb-log-search:focus {
+  border-color: var(--nb-info);
+}
+
+/* live "n of m lines" counter beside the search input */
+.nb-log-count {
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-muted);
+  white-space: nowrap;
+}
+
+/* density switch: same tinted-chip DNA as the shared kind chips */
+.nb-density {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nb-space-1);
 }
 
 .nb-log-scroller {
@@ -420,6 +561,12 @@ onUnmounted(() => {
   background: var(--nb-warning-muted);
 }
 
+/* R3: row hover band — the whole row tints on hover (the existing copy
+   affordance reveal below stays untouched) */
+.nb-line:hover {
+  background: var(--nb-bg-hover);
+}
+
 .nb-raw {
   flex: 1 1 auto;
   min-width: 0;
@@ -432,6 +579,34 @@ onUnmounted(() => {
   white-space: pre-wrap;
   word-break: break-all;
   color: var(--nb-text-primary);
+}
+
+/* R3 density: compact = fs 11/lh 1.35 tight rows, comfortable = fs 12/lh 1.65
+   relaxed rows; row padding shifts with the density (the base above only
+   covers an unset attribute edge case) */
+.nb-log-scroller[data-density='compact'] .nb-raw {
+  font-size: 11px;
+  line-height: 1.35;
+  padding: 2px 3px 2px var(--nb-space-2);
+}
+.nb-log-scroller[data-density='comfortable'] .nb-raw {
+  font-size: 12px;
+  line-height: 1.65;
+  padding: 5px 6px 5px var(--nb-space-2);
+}
+
+/* R3 token dimming: JSON keys muted, numeric/bool scalars teal — teal-dark
+   for system light mode, teal-light on the dark scroller */
+.nb-raw .nb-tok-key {
+  color: var(--nb-text-muted);
+}
+.nb-raw .nb-tok-num {
+  color: var(--nb-teal-dark);
+}
+@media (prefers-color-scheme: dark) {
+  .nb-raw .nb-tok-num {
+    color: var(--nb-teal-light);
+  }
 }
 
 /* L1: the copy affordance is noise at rest — reveal on hover/keyboard focus */
