@@ -48,7 +48,15 @@
               </div>
               <div class="nb-kv"><span>API port</span><strong>{{ apiPortDisplay }}</strong></div>
               <div class="nb-kv"><span>Adopted</span><strong>{{ store.daemon.adopted ? 'yes (external instance)' : 'no (managed here)' }}</strong></div>
-              <div v-if="store.daemon.lastError" class="nb-error-line">Error: {{ store.daemon.lastError }}</div>
+              <!-- R6: the shared .nb-error-line clamps to 2 lines; the full
+                   text survives as the hover/focus title -->
+              <div
+                v-if="store.daemon.lastError"
+                class="nb-error-line"
+                :title="'Error: ' + store.daemon.lastError"
+              >
+                Error: {{ store.daemon.lastError }}
+              </div>
             </template>
             <template v-else>
               <p class="nb-muted">
@@ -66,8 +74,13 @@
                 :disabled="store.daemonBusy || !daemonBridge"
                 @click="onRestartDaemon"
               >
-                <ion-spinner v-if="store.daemonBusy" name="crescent" />
-                <template v-else>{{ restartArmed ? 'Confirm restart?' : 'Restart daemon' }}</template>
+                <!-- R6: the arm flip ("Restart daemon" -> "Confirm restart?")
+                     is announced politely; the span persists so the flip is
+                     a text change on a stable live node -->
+                <span aria-live="polite">
+                  <ion-spinner v-if="store.daemonBusy" name="crescent" />
+                  <template v-else>{{ restartArmed ? 'Confirm restart?' : 'Restart daemon' }}</template>
+                </span>
               </ion-button>
             </div>
           </ion-card-content>
@@ -108,6 +121,11 @@
         </ion-card>
       </div>
 
+      <!-- R6: feed activity for AT — a visually-hidden polite region fed by
+           the events-length delta; the list itself stays non-live (an
+           aria-live list at the 2s poll cadence would spam announcements) -->
+      <p class="nb-sr-only" aria-live="polite">{{ srFeedAnnouncement }}</p>
+
       <!-- Live feed -->
       <div class="nb-feed-header">
         <h2>Live events</h2>
@@ -143,7 +161,17 @@
         No events yet — the bot hasn't recorded a notification. Ask the bot in <strong>Chat</strong>, or wait for a macOS event.
       </p>
 
-      <div v-if="store.events.length > 0" class="nb-feed">
+      <!-- R6: entrance motion (130ms fade/slide-in for newly appended rows,
+           keyed on row.key) + aria-busy while the kind-filter reload polls;
+           reduced-motion users get neither motion nor scroll anims via the
+           app-wide gate in theme/nb-shared.css -->
+      <TransitionGroup
+        v-if="store.events.length > 0"
+        tag="div"
+        name="nb-event-enter"
+        class="nb-feed"
+        :aria-busy="store.feedLoading"
+      >
         <div
           v-for="row in feedRows"
           :key="row.key"
@@ -155,6 +183,7 @@
           :aria-label="'Expand raw payload for ' + (row.app || row.kind)"
           @click="toggleExpand(row.key)"
           @keydown.enter.prevent="toggleExpand(row.key)"
+          @keydown.space.prevent="toggleExpand(row.key)"
         >
           <div class="nb-event-top">
             <ion-icon class="nb-event-chev" aria-hidden="true" :icon="chevronForwardOutline" />
@@ -212,13 +241,13 @@
             </span>
           </div>
         </div>
-      </div>
+      </TransitionGroup>
     </ion-content>
   </ion-page>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import {
   IonBadge,
   IonButton,
@@ -247,6 +276,7 @@ import {
   eventKindIdentity,
   expandedRowCaption,
   feedIsAllStartup,
+  newEventsAnnouncement,
   payloadPreview,
   relativeTimeLabel,
   type EventKindIdentity,
@@ -286,6 +316,29 @@ const daemonStartedAge = computed(() => ageLabel(store.daemon?.startedAt ?? '', 
  * non-empty and carries zero notification-kind rows (API down keeps the
  * offline banner in charge; an empty feed keeps the plain empty state). */
 const showStartupHint = computed(() => !store.apiDown && feedIsAllStartup(store.events));
+
+/** R6 finding 2: feed activity for AT — a visually-hidden polite region fed
+ * by the events-length delta ("N new events" via newEventsAnnouncement).
+ * Growth announces; a shrink (kind-filter reload) drops the stale text and
+ * lets the reload cues (center spinner + aria-busy) carry it instead. The
+ * region is cleared then filled on the next tick so identical repeats
+ * ("1 new event" on two polls) still mutate the live node, and the fill
+ * only lands if the feed didn't change again mid-tick. */
+const srFeedAnnouncement = ref('');
+watch(
+  () => store.events.length,
+  async (len, prev) => {
+    if (len === prev) return;
+    if (len > (prev ?? 0)) {
+      const text = newEventsAnnouncement(prev ?? 0, len);
+      srFeedAnnouncement.value = '';
+      await nextTick();
+      if (store.events.length === len) srFeedAnnouncement.value = text;
+    } else {
+      srFeedAnnouncement.value = '';
+    }
+  }
+);
 
 /** Event expand state: per-row key, component-local (like the chat tool chips). */
 const expandedRows = reactive(new Set<string>());
@@ -529,10 +582,22 @@ onUnmounted(() => {
 }
 .nb-event:hover {
   border-color: var(--nb-border-strong);
+  /* R6: hover parity with the Logs rows (LogsView .nb-line:hover) */
+  background: var(--nb-bg-hover);
 }
 .nb-event:focus-visible {
   outline: 2px solid var(--nb-info);
   outline-offset: 2px;
+}
+/* R6: entrance for newly appended rows — 130ms fade with a 6px drop-in
+   (rows prepend newest-first, keyed on row.key); gated app-wide by the
+   prefers-reduced-motion block in theme/nb-shared.css */
+.nb-event-enter-active {
+  transition: opacity 130ms ease, transform 130ms ease;
+}
+.nb-event-enter-from {
+  opacity: 0;
+  transform: translateY(-6px);
 }
 /* chevron in the meta gutter: rotates 90° when the row is open */
 .nb-event-chev {
@@ -648,6 +713,12 @@ onUnmounted(() => {
 .nb-when,
 .nb-recid {
   color: var(--nb-text-secondary);
+}
+/* R6: the meta cluster (stamp / rel age / rec_id) reads as one right-aligned
+   column — margin-left:auto on the FIRST meta element pushes the trio to the
+   far edge instead of raggedly following the kind chip */
+.nb-when {
+  margin-left: auto;
 }
 /* the relative caption reads one step quieter than the absolute stamp */
 .nb-when-rel {

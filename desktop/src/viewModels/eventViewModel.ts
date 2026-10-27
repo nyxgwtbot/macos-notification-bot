@@ -163,6 +163,16 @@ export function relativeTimeLabel(iso: string, nowMs: number): string {
   return `${Math.floor(hours / 24)} d ago`;
 }
 
+/** R6: the SR feed-activity announcement text for feed growth — "N new
+ * events" (singular at exactly 1). Empty for zero/negative deltas: a
+ * kind-filter reload SHRINKS the ring (reset), and that reload announces
+ * through aria-busy instead — never a fake "N new events". */
+export function newEventsAnnouncement(previousCount: number, currentCount: number): string {
+  const delta = currentCount - previousCount;
+  if (!Number.isFinite(delta) || delta <= 0) return '';
+  return delta === 1 ? '1 new event' : `${delta} new events`;
+}
+
 /** True when the filtered feed carries at least one row but ZERO
  * notification-kind rows (startup lines only) — the Status view then cues
  * the user that macOS itself hasn't produced anything yet (R2 finding 4).

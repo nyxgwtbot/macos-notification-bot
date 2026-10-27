@@ -240,7 +240,8 @@
                 :value="draft.rawRules"
                 @ionInput="onRawRulesInput($event as IonValueEvent)"
               />
-              <div v-if="rawError" class="nb-error-line">{{ rawError }}</div>
+              <!-- R6: clamped to 2 lines (shared .nb-error-line); full text in title -->
+              <div v-if="rawError" class="nb-error-line" :title="rawError">{{ rawError }}</div>
             </template>
           </ion-card-content>
         </ion-card>

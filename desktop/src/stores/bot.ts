@@ -172,12 +172,20 @@ export const useBotStore = defineStore('bot', {
     },
 
     /** Feed kind filter change: full reload (resetFeed clears the ring and the
-     * `since` cursor), then one immediate poll — the 2s poller keeps running. */
+     * `since` cursor), then one immediate poll — the 2s poller keeps running.
+     * R6: feedLoading tracks ONLY this reload (never the 2s incremental
+     * polls) — it drives the Status view's reload cues (center spinner while
+     * the ring is empty, aria-busy on the feed container when rendered). */
     async setFeedKind(kind: EventKind) {
       if (this.feedKind === kind) return;
       this.feedKind = kind;
       this.resetFeed();
-      await this.pollFeed();
+      this.feedLoading = true;
+      try {
+        await this.pollFeed();
+      } finally {
+        this.feedLoading = false;
+      }
     },
 
     /** Daemon process status via the Electron bridge (null in browser dev). */

@@ -127,7 +127,8 @@
             <div v-if="store.reportResult" class="nb-report-ok">
               <strong>Report generated:</strong> {{ store.reportResult.html_path }}
             </div>
-            <div v-if="store.reportError" class="nb-error-line">{{ store.reportError }}</div>
+            <!-- R6: clamped to 2 lines (shared .nb-error-line); full text in title -->
+            <div v-if="store.reportError" class="nb-error-line" :title="store.reportError">{{ store.reportError }}</div>
           </ion-card-content>
         </ion-card>
       </template>

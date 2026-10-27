@@ -78,12 +78,37 @@
   margin-top: var(--nb-space-1);
   font-size: var(--nb-fs-secondary);
   color: var(--ion-color-danger);
+  /* R6: error strings render unbounded (daemon lastError especially) —
+     clamp to ~2 lines; consumers keep the full text in the title attr */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
 }
 
 .nb-card-footer {
   padding-top: var(--nb-space-3);
   display: flex;
   align-items: center;
+}
+
+/* ========================================
+   SR-ONLY — visually hidden, announced only. Live regions (feed activity,
+   restart arm label, future save announcements) render through this so the
+   visible layout never shifts or shows assistive text.
+   ======================================== */
+.nb-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
 }
 
 /* ========================================
@@ -193,4 +218,22 @@
   font-weight: 600 !important;
   line-height: 1.3 !important;
   padding-inline: var(--nb-space-4) !important;
+}
+
+/* ========================================
+   REDUCED MOTION — app-wide gate (R6). Users with prefers-reduced-motion:
+   reduce get transitions/animations collapsed to imperceptible and
+   scroll-behavior degraded to auto, everywhere. Programmatic scroll call
+   sites de-grade their 'smooth' behavior through src/utils/motion.ts
+   (wired in their own missions); new motion must respect this base.
+   ======================================== */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

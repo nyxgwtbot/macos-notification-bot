@@ -8,6 +8,7 @@ import {
   expandedRowCaption,
   feedIsAllStartup,
   isErrorStatus,
+  newEventsAnnouncement,
   payloadPreview,
   relativeTimeLabel,
   EVENT_KIND_OPTIONS
@@ -272,5 +273,27 @@ describe('expandedRowCaption', () => {
     expect(expandedRowCaption(eventToRow(notifEvent({ title: null as never })))).toBe('com.apple.mail');
     // nothing meaningful at all -> the caption slot is skipped by the caller
     expect(expandedRowCaption(eventToRow(notifEvent({ app: null as never, title: null as never })))).toBe('');
+  });
+});
+
+describe('newEventsAnnouncement (R6 SR feed-activity delta)', () => {
+  test('growth announces "N new events" (singular at exactly 1)', () => {
+    expect(newEventsAnnouncement(0, 1)).toBe('1 new event');
+    expect(newEventsAnnouncement(0, 5)).toBe('5 new events');
+    expect(newEventsAnnouncement(10, 11)).toBe('1 new event');
+    expect(newEventsAnnouncement(500, 503)).toBe('3 new events');
+  });
+
+  test('zero/negative deltas announce nothing (kind reload shrinks, aria-busy covers it)', () => {
+    expect(newEventsAnnouncement(4, 4)).toBe('');
+    expect(newEventsAnnouncement(4, 0)).toBe('');
+    expect(newEventsAnnouncement(4, 1)).toBe('');
+    expect(newEventsAnnouncement(4, 3)).toBe('');
+  });
+
+  test('non-finite deltas degrade to silence, never "NaN new events"', () => {
+    expect(newEventsAnnouncement(Number.NaN, 5)).toBe('');
+    expect(newEventsAnnouncement(0, Number.NaN)).toBe('');
+    expect(newEventsAnnouncement(Number.POSITIVE_INFINITY, 0)).toBe('');
   });
 });

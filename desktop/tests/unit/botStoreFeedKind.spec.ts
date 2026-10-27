@@ -81,4 +81,31 @@ describe('feed kind filter (stores/bot)', () => {
     await store.setFeedKind('all');
     expect(getEvents).toHaveBeenLastCalledWith({ limit: 100, since: undefined });
   });
+
+  test('R6: feedLoading tracks only the kind-switch reload, not the 2s polls', async () => {
+    const store = useBotStore();
+    await store.pollFeed();
+    expect(store.feedLoading).toBe(false); // incremental poll never flips it
+
+    // hold the reload poll open and observe aria-busy's source flag
+    let resolveReload!: (value: { events: BotEvent[]; latest_rec_id: number; count: number }) => void;
+    getEvents.mockImplementation(
+      () => new Promise((resolve) => { resolveReload = resolve; })
+    );
+    const reload = store.setFeedKind('notification');
+    expect(store.feedLoading).toBe(true);
+
+    resolveReload({ events: [notifEvent(2)], latest_rec_id: 2, count: 1 });
+    await reload;
+    expect(store.feedLoading).toBe(false);
+    expect(store.sinceCursor).toBe(2);
+  });
+
+  test('R6: a failing reload still clears feedLoading (finally, no stuck aria-busy)', async () => {
+    const store = useBotStore();
+    getEvents.mockRejectedValue(new Error('down'));
+    await store.setFeedKind('notification');
+    expect(store.feedLoading).toBe(false);
+    expect(store.feedError).toBeTruthy();
+  });
 });
