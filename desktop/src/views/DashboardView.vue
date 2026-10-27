@@ -2,14 +2,15 @@
   <ion-page>
     <ion-header>
       <ion-toolbar class="nb-page-header">
-        <ion-title>Status</ion-title>
+        <!-- R8: the page title is a real heading (level 1) — the shared
+             .nb-page-header pattern's a11y contract, kept in every view -->
+        <ion-title role="heading" aria-level="1">Status</ion-title>
         <!-- S2: page header row carries the feed liveness badge inline (title at
-             fs-title-lg + badge on ONE row; shared pattern lands in X1) -->
+             fs-title-lg + badge on ONE row; shared pattern lands in X1).
+             R8: one shared badge wording app-wide — "Live" + a tooltip that
+             reads the real cadence from this poller's config (FEED_POLL_MS). -->
         <div slot="end" class="nb-head-end">
-          <ion-badge :color="store.feedError ? 'danger' : 'primary'">
-            <ion-icon aria-hidden="true" :icon="pulseOutline" />
-            {{ store.feedError ? 'offline' : 'every 2s' }}
-          </ion-badge>
+          <LiveBadge :interval-ms="FEED_POLL_MS" :error="store.feedError" />
         </div>
       </ion-toolbar>
     </ion-header>
@@ -264,10 +265,11 @@ import {
   IonTitle,
   IonToolbar
 } from '@ionic/vue';
-import { cashOutline, chevronForwardOutline, cloudOfflineOutline, copyOutline, notificationsOutline, pulseOutline, timeOutline } from 'ionicons/icons';
+import { cashOutline, chevronForwardOutline, cloudOfflineOutline, copyOutline, notificationsOutline, timeOutline } from 'ionicons/icons';
 
 import { useBotStore } from '@/stores/bot';
 import { usePolling } from '@/composables/usePolling';
+import LiveBadge from '@/components/LiveBadge.vue';
 import { copyText } from '@/utils/clipboard';
 import { formatBytes, formatIsoShort, formatUptime } from '@/utils/time';
 import { ageLabel, formatApiPort } from '@/viewModels/statusViewModel';
@@ -453,11 +455,15 @@ function retryPolls() {
   void store.pollFeed();
 }
 
+/** R8: the feed cadence as ONE const — the poller config and the "Live"
+ * badge tooltip both read it, so the badge can't drift from the real tick. */
+const FEED_POLL_MS = 2000;
+
 const feedPoller = usePolling(async () => {
   await store.pollFeed();
   // relative ages recompute on every 2s poll tick via the shared render clock
   nowMs.value = Date.now();
-}, { intervalMs: 2000 });
+}, { intervalMs: FEED_POLL_MS });
 const statusPoller = usePolling(async () => {
   await Promise.all([store.loadHealth(), store.pollDaemon()]);
 }, {

@@ -6,6 +6,10 @@
  * - the feed container exposes aria-busy while feedLoading, and the designed
  *   center-spinner reload cue fires during the kind-switch reload
  * - the restart arm flip lives on a stable polite span ("Confirm restart?")
+ * R8:
+ * - the header badge is the shared "Live" badge (cadence in the tooltip)
+ * - polling sleeps while hidden; resume fires the catch-up tick that
+ *   recomputes the age labels (timestamps stay honest post-resume)
  */
 
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
@@ -145,5 +149,92 @@ describe('DashboardView SR semantics + motion base (R6)', () => {
     await wrapper.find('.nb-restart-btn').trigger('click');
     await wrapper.vm.$nextTick();
     expect(wrapper.find('.nb-card-footer span[aria-live="polite"]').text()).toBe('Confirm restart?');
+  });
+});
+
+/* ========================================
+   R8 shell semantics: the shared Live badge wording + the polling visibility
+   pause, proven at the DOM level.
+   ======================================== */
+describe('DashboardView R8 — Live badge + visibility pause', () => {
+  function setHidden(hidden: boolean): void {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
+  }
+  function fireVisibilityChange(): void {
+    document.dispatchEvent(new Event('visibilitychange'));
+  }
+
+  afterEach(() => {
+    setHidden(false); // restore the jsdom default
+    vi.useRealTimers();
+  });
+
+  test('the header badge reads "Live" with the poll cadence in its tooltip; errors flip the tint', async () => {
+    const wrapper = await mountStatus([notifEvent(1)]);
+    const badge = wrapper.find('.nb-head-end .nb-live-badge');
+    expect(badge.exists()).toBe(true);
+    expect(badge.text()).toBe('Live');
+    expect(badge.attributes('title')).toBe('Refreshes every 2 s');
+    expect(badge.attributes('data-state')).toBe('live');
+
+    const store = useBotStore();
+    store.feedError = 'offline boom';
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('.nb-head-end .nb-live-badge').attributes('data-state')).toBe('error');
+  });
+
+  test('polling sleeps while hidden; the resume catch-up tick recomputes the age labels', async () => {
+    // fake timers freeze BOTH the cadence and Date.now (setSystemTime)
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-27T12:01:59Z'));
+
+    const settle = async (wrapper: VueWrapper<any>): Promise<void> => {
+      await vi.advanceTimersByTimeAsync(0);
+      await wrapper.vm.$nextTick();
+      await vi.advanceTimersByTimeAsync(0);
+      await wrapper.vm.$nextTick();
+    };
+
+    pinia = createPinia();
+    setActivePinia(pinia);
+    const store = useBotStore();
+    const event = { ...notifEvent(1), timestamp: '2026-10-27T12:00:00.000Z' };
+    store.appendToFeed(event);
+    vi.spyOn(store, 'pollFeed').mockResolvedValue(undefined);
+    vi.spyOn(store, 'loadHealth').mockResolvedValue(undefined);
+    vi.spyOn(store, 'pollDaemon').mockResolvedValue(undefined);
+    const wrapper = mount(DashboardView, { global: { plugins: [pinia] } });
+    await settle(wrapper);
+    mounted = wrapper;
+
+    const feedCalls = () => vi.mocked(store.pollFeed).mock.calls.length;
+    const ageText = () => wrapper.find('.nb-when-rel').text();
+    // fresh mount: the immediate first run stamped the age against the frozen clock
+    expect(feedCalls()).toBe(1);
+    expect(ageText()).toBe('1 min ago');
+
+    // hidden: the cadence sleeps — the clock advances but nothing recomputes
+    setHidden(true);
+    fireVisibilityChange();
+    await vi.advanceTimersByTimeAsync(5000);
+    await wrapper.vm.$nextTick();
+    expect(feedCalls()).toBe(1); // no ticking in the background
+    expect(ageText()).toBe('1 min ago'); // display honestly frozen
+
+    // visible: ONE catch-up refresh RIGHT AWAY — the age recomputes from the
+    // nowMs bump inside the poll task (timestamps honest again)
+    setHidden(false);
+    fireVisibilityChange();
+    await settle(wrapper);
+    expect(feedCalls()).toBe(2);
+    expect(ageText()).toBe('2 min ago');
+
+    // ...and the interval resumed behind the catch-up run
+    await vi.advanceTimersByTimeAsync(2000);
+    await wrapper.vm.$nextTick();
+    expect(feedCalls()).toBe(3);
+    expect(ageText()).toBe('2 min ago'); // 127s -> floor = 2 min
+    wrapper.unmount();
+    mounted = null;
   });
 });

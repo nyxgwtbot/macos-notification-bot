@@ -236,4 +236,22 @@ describe('LogsView R7 semantics, persistence, highlight', () => {
 
     wrapper.unmount();
   });
+
+  /* R8: one shared live-badge wording app-wide — "Live" + the cadence in the
+     tooltip (read from the poll config), error state flips the tint. */
+  test('the header badge reads "Live" with the poll cadence tooltip; a fetch error flips the tint', async () => {
+    const wrapper = await mountLogs([STARTUP_LINE]);
+    const badge = wrapper.find('.nb-log-header-end .nb-live-badge');
+    expect(badge.exists()).toBe(true);
+    expect(badge.text()).toBe('Live');
+    expect(badge.attributes('title')).toBe('Refreshes every 2 s');
+    expect(badge.attributes('data-state')).toBe('live');
+
+    const store = useBotStore();
+    store.logsError = 'tail read failed';
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('.nb-log-header-end .nb-live-badge').attributes('data-state')).toBe('error');
+
+    wrapper.unmount();
+  });
 });

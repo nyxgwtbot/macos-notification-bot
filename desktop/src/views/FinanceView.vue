@@ -2,7 +2,9 @@
   <ion-page>
     <ion-header>
       <ion-toolbar class="nb-page-header">
-        <ion-title>Finance (legacy)</ion-title>
+        <!-- R8: the page title is a real heading (level 1) — the shared
+             .nb-page-header pattern's a11y contract, kept in every view -->
+        <ion-title role="heading" aria-level="1">Finance (legacy)</ion-title>
         <ion-buttons slot="end">
           <ion-note class="nb-legacy-note">
             Pre-agent example — the agent builds finance dashboards in Chat.

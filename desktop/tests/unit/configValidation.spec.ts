@@ -1,11 +1,13 @@
 import { describe, expect, test } from 'vitest';
 
 import {
+  ACTION_COMMAND_REQUIRED_TEXT,
   KNOWN_RULE_FIELDS,
   operationallyRelevantChange,
   splitDetailsByField,
   validateActionEntries,
   validateConfigDraft,
+  validateDraftActionCommands,
   validateDraftFields,
   validateRuleConditionKeys
 } from '../../src/services/configValidation';
@@ -137,6 +139,46 @@ describe('action registry checks', () => {
       { id: 'example_command', match_hint: 'cmd', type: 'command', enabled: false, config: { command: '/x' } }
     ]);
     expect(details).toEqual([]);
+  });
+});
+
+/* ========================================
+   R8 action rows: an empty command on a type:'command' action is the
+   per-row field error for the Settings Actions editor (index-keyed map, so
+   ConfigView binds .nb-input-bad + the inline message straight from it) and
+   blocks the save. Pure unit proof here; the rendered wiring is covered by
+   configViewRender.spec.ts.
+   ======================================== */
+describe('validateDraftActionCommands (R8 action rows parity)', () => {
+  test('an empty command on a command action is flagged on the right index', () => {
+    const errors = validateDraftActionCommands([
+      { type: 'builtin', command: '' },
+      { type: 'command', command: '' }
+    ]);
+    expect(errors).toEqual({ 1: ACTION_COMMAND_REQUIRED_TEXT });
+  });
+
+  test('a whitespace-only command counts as empty', () => {
+    const errors = validateDraftActionCommands([{ type: 'command', command: '   \t' }]);
+    expect(errors).toEqual({ 0: ACTION_COMMAND_REQUIRED_TEXT });
+  });
+
+  test('a filled command passes and builtin rows never carry the rule', () => {
+    const errors = validateDraftActionCommands([
+      { type: 'command', command: 'open {path}' },
+      { type: 'builtin', command: '' }
+    ]);
+    expect(errors).toEqual({});
+  });
+
+  test('multiple offending rows report one index each; an empty list is valid', () => {
+    const errors = validateDraftActionCommands([
+      { type: 'command', command: '' },
+      { type: 'builtin', command: '' },
+      { type: 'command', command: ' ' }
+    ]);
+    expect(Object.keys(errors)).toEqual(['0', '2']);
+    expect(validateDraftActionCommands([])).toEqual({});
   });
 });
 

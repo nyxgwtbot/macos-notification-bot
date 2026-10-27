@@ -2,7 +2,9 @@
   <ion-page>
     <ion-header>
       <ion-toolbar class="nb-page-header">
-        <ion-title class="nb-chat-title">
+        <!-- R8: the page title is a real heading (level 1) — the shared
+             .nb-page-header pattern's a11y contract, kept in every view -->
+        <ion-title class="nb-chat-title" role="heading" aria-level="1">
           <span class="nb-title-row">
             <!-- F5: daemon live dot — green running / red stopped / gray unknown,
                  light 5s health poll, click jumps to the Status tab -->

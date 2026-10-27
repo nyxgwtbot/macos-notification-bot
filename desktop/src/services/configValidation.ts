@@ -174,6 +174,32 @@ export function validateRuleConditionKeys(rules: BotRule[] | null | undefined, i
   return details;
 }
 
+/* ========================================
+   R8 ACTION ROWS — the Settings Actions editor parity: an empty command on a
+   type:'command' action is a per-row field error (index-keyed so the view can
+   bind the standard .nb-input-bad box + inline message straight from the map)
+   that joins the draft validation and blocks the save. Builtin entries carry
+   no command and always pass.
+   ======================================== */
+
+/** Canonical English message for the empty-command field error. */
+export const ACTION_COMMAND_REQUIRED_TEXT = 'command is required for command actions';
+
+/** The one draft-shaped field rule for the Actions rows (empty command when
+ * type is 'command'). Mirrors the shape of validateDraftFields: a map of
+ * index -> message, empty when every row is valid. */
+export function validateDraftActionCommands(
+  actions: ReadonlyArray<{ type: 'builtin' | 'command'; command: string }>
+): Record<number, string> {
+  const errors: Record<number, string> = {};
+  actions.forEach((action, index) => {
+    if (action.type === 'command' && action.command.trim() === '') {
+      errors[index] = ACTION_COMMAND_REQUIRED_TEXT;
+    }
+  });
+  return errors;
+}
+
 export function validateActionEntries(actions: ActionEntry[] | null | undefined): string[] {
   const details: string[] = [];
   if (!Array.isArray(actions)) {

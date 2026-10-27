@@ -212,7 +212,10 @@
 }
 
 /* Outer !important beats the md :host title declarations (20px/500,
-   padding-inline 20px) — the H1-26px-era header ends for good. */
+   padding-inline 20px) — the H1-26px-era header ends for good.
+   R8: every <ion-title> under this shared pattern carries
+   role="heading" aria-level="1" (the title IS the page's real H1); the five
+   view templates set the attributes — keep any new view consistent. */
 .nb-page-header ion-title {
   font-size: var(--nb-fs-title-lg) !important;
   font-weight: 600 !important;

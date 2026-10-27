@@ -2,7 +2,9 @@
   <ion-page>
     <ion-header>
       <ion-toolbar class="nb-page-header">
-        <ion-title>Logs</ion-title>
+        <!-- R8: the page title is a real heading (level 1) — the shared
+             .nb-page-header pattern's a11y contract, kept in every view -->
+        <ion-title role="heading" aria-level="1">Logs</ion-title>
       </ion-toolbar>
     </ion-header>
 
@@ -17,11 +19,11 @@
           <div class="nb-log-header-row">
             <span class="nb-muted">{{ logTitle }}</span>
             <div class="nb-log-header-end">
-              <ion-badge v-if="!followOn && newCount > 0" color="secondary">+{{ newCount }} new</ion-badge>
-              <ion-badge :color="store.feedError ? 'danger' : 'primary'">
-                <ion-icon aria-hidden="true" :icon="pulseOutline" />
-                auto-reload 2s
-              </ion-badge>
+            <ion-badge v-if="!followOn && newCount > 0" color="secondary">+{{ newCount }} new</ion-badge>
+            <!-- R8: one shared live-badge wording app-wide — "Live" + the
+                 real cadence in the tooltip, read from this poller's config
+                 (LOG_POLL_MS); the tail-fetch error state flips the tint -->
+            <LiveBadge :interval-ms="LOG_POLL_MS" :error="store.logsError" />
             </div>
           </div>
           <div class="nb-log-controls">
@@ -155,11 +157,13 @@ import {
   IonTitle,
   IonToolbar
 } from '@ionic/vue';
-import { copyOutline, pulseOutline } from 'ionicons/icons';
+import { copyOutline } from 'ionicons/icons';
 
 import { useBotStore } from '@/stores/bot';
 import { usePolling } from '@/composables/usePolling';
+import LiveBadge from '@/components/LiveBadge.vue';
 import { copyText } from '@/utils/clipboard';
+import { scrollBehavior } from '@/utils/motion';
 import {
   LOGS_DENSITY_KEY,
   LOGS_FOLLOW_KEY,
@@ -335,7 +339,8 @@ function enableFollow(): void {
   followOn.value = true;
   seenRaws = null;
   newCount.value = 0;
-  void scrollToBottom('smooth');
+  // R8: the scroll behavior degrades through the shared reduced-motion helper
+  void scrollToBottom(scrollBehavior());
 }
 
 function onFollowChipClick(): void {
@@ -387,7 +392,8 @@ watch(
   () => store.logLines,
   () => {
     if (followOn.value) {
-      void scrollToBottom('smooth');
+      // R8: behavior routed through the shared reduced-motion helper
+      void scrollToBottom(scrollBehavior());
     } else {
       newCount.value = countUnseen();
     }
@@ -427,7 +433,10 @@ function refreshOnce(): void {
   void store.pollLogs();
 }
 
-const logPoller = usePolling(() => store.pollLogs(), { intervalMs: 2000 });
+/** R8: the tail cadence as ONE const — the poller config and the "Live"
+ * badge tooltip both read it (single source, badge can't drift). */
+const LOG_POLL_MS = 2000;
+const logPoller = usePolling(() => store.pollLogs(), { intervalMs: LOG_POLL_MS });
 
 onMounted(async () => {
   await store.pollLogs();

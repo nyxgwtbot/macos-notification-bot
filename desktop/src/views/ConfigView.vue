@@ -1,8 +1,13 @@
 <template>
-  <ion-page>
+  <!-- R8: the page root carries a template ref — a failed save whose only
+       violations mapped to inline fields (no banner) scrolls the first
+       errored input anywhere on the page into view instead -->
+  <ion-page ref="pageRoot">
     <ion-header>
       <ion-toolbar class="nb-page-header">
-        <ion-title>Settings</ion-title>
+        <!-- R8: the page title is a real heading (level 1) — the shared
+             .nb-page-header pattern's a11y contract, kept in every view -->
+        <ion-title role="heading" aria-level="1">Settings</ion-title>
         <ion-buttons slot="end">
           <!-- R7 dirty-guard: disabled while pristine; dirty = "Discard edits?"
                (first click arms), armed = "Confirm discard?" (second click
@@ -118,6 +123,18 @@
                success = transient "Saved" flash (2s, label back) — validation is inline per field.
                iterC restart-to-apply: tinted banner next to SAVE, only when an ollama/router/poll
                value changed vs the last-loaded config. -->
+          <!-- R8: the save-blocking banner renders NEXT TO the row that saves
+               (the old page-bottom placement could sit a full scroll away from
+               SAVE); a failed save scrolls it into view — reduced-motion aware
+               via the shared scrollBehavior() helper (ref: validationBanner) -->
+          <div v-if="validationBannerErrors.length > 0" ref="validationBanner" class="nb-banner nb-banner-err nb-save-validation-banner">
+            <div>
+              <strong>Fix before saving:</strong>
+              <ul class="nb-details">
+                <li v-for="detail in validationBannerErrors" :key="detail">{{ detail }}</li>
+              </ul>
+            </div>
+          </div>
           <div class="nb-card-footer nb-save-row">
             <span v-if="store.lastSavedAt" class="nb-saved-at">saved at {{ formatIsoShort(store.lastSavedAt) }}</span>
             <div v-if="showRestartRow" class="nb-restart-apply">
@@ -178,8 +195,11 @@
             </div>
           </template>
           <ion-spinner v-else name="crescent" class="nb-connectors-loading" />
+          <!-- R8: the error banner carries a Retry (same affordance as the
+               config-load banner above) re-raising loadConnectors -->
           <div v-if="connectors.error" class="nb-banner nb-banner-err">
             <span>{{ connectors.error }}</span>
+            <ion-button size="small" fill="outline" @click="loadConnectors">Retry</ion-button>
           </div>
         </ion-card-content>
       </ion-card>
@@ -199,20 +219,30 @@
                   @ionChange="onActionToggle($event as CustomEvent<{ checked: boolean }>, index)"
                 />
               </div>
+              <!-- R8: the action rows join the boxed input treatment of the
+                   config fields (elevated box + focus ring); the empty-command
+                   field error wears the standard pair (.nb-input-bad +
+                   aria-invalid + inline message) and blocks the save -->
               <ion-textarea
+                class="nb-action-box"
                 label="match_hint"
                 label-placement="stacked"
                 auto-grow
                 :value="entry.match_hint"
                 @ionInput="onActionHintInput($event as IonValueEvent, index)"
               />
-              <ion-input
-                v-if="entry.type === 'command'"
-                label="command"
-                label-placement="stacked"
-                :value="entry.command"
-                @ionInput="onActionCommandInput($event as IonValueEvent, index)"
-              />
+              <template v-if="entry.type === 'command'">
+                <ion-input
+                  class="nb-action-box nb-action-command"
+                  label="command"
+                  label-placement="stacked"
+                  :class="{ 'nb-input-bad': actionErrors[index] !== undefined }"
+                  :aria-invalid="actionErrors[index] !== undefined ? true : undefined"
+                  :value="entry.command"
+                  @ionInput="onActionCommandInput($event as IonValueEvent, index)"
+                />
+                <p v-if="actionErrors[index] !== undefined" class="nb-field-error">{{ actionErrors[index] }}</p>
+              </template>
             </div>
           </ion-card-content>
         </ion-card>
@@ -264,15 +294,9 @@
           </ion-card-content>
         </ion-card>
 
-        <!-- validation + server errors -->
-        <div v-if="validationBannerErrors.length > 0" class="nb-banner nb-banner-err">
-          <div>
-            <strong>Fix before saving:</strong>
-            <ul class="nb-details">
-              <li v-for="detail in validationBannerErrors" :key="detail">{{ detail }}</li>
-            </ul>
-          </div>
-        </div>
+        <!-- R8: the save-blocking validation banner moved into the Bot &
+             Ollama card, right above the save row; only the restart notice
+             stays at the page bottom -->
         <div v-if="restartNote" class="nb-banner nb-banner-warn">{{ restartNote }}</div>
       </template>
 
@@ -293,7 +317,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch, type ComponentPublicInstance } from 'vue';
 import { onBeforeRouteLeave } from 'vue-router';
 import {
   IonBadge,
@@ -326,12 +350,14 @@ import {
   operationallyRelevantChange,
   splitDetailsByField,
   validateConfigDraft,
+  validateDraftActionCommands,
   validateRuleConditionKeys,
   validateDraftFields,
   type ConfigDraftFields,
   type ConfigFieldKey
 } from '@/services/configValidation';
 import { formatIsoShort } from '@/utils/time';
+import { scrollBehavior } from '@/utils/motion';
 import {
   DIRTY_GUARD_CLEAN,
   RESTART_APPLY_ANNOUNCE,
@@ -436,6 +462,13 @@ const restartNote = ref<string | null>(null);
 /** Inline field errors (red border + message under the input): merged from
  * the client pre-check and the server 400 details[]. */
 const fieldErrors = ref<Partial<Record<ConfigFieldKey, string>>>({});
+/** R8: per-index inline errors for the Actions rows (empty command on a
+ * type:'command' action) — index-keyed against draft.actions. */
+const actionErrors = ref<Record<number, string>>({});
+/** R8: the save-blocking banner (inside the Bot & Ollama card) + the page
+ * root (scroll fallback when every violation mapped to an inline field). */
+const validationBanner = ref<HTMLElement | null>(null);
+const pageRoot = ref<ComponentPublicInstance | null>(null);
 /** Success flash: "Saved" tint on the button for 2s, then label back. */
 const saveFlash = ref(false);
 let saveFlashTimer: number | null = null;
@@ -630,6 +663,7 @@ function buildDraft(config: BotConfig): void {
   rawError.value = null;
   validationErrors.value = [];
   fieldErrors.value = {};
+  actionErrors.value = {};
   // R7: a rebuilt draft IS the reference — pristine until the next edit
   markDraftSnapshot();
 }
@@ -698,7 +732,15 @@ function onActionHintInput(event: IonValueEvent, index: number): void {
 }
 
 function onActionCommandInput(event: IonValueEvent, index: number): void {
-  if (draft.actions[index]) draft.actions[index].command = textOf(event);
+  if (!draft.actions[index]) return;
+  draft.actions[index].command = textOf(event);
+  // R8: typing clears this row's inline command error (same live rule as the
+  // five config fields)
+  if (actionErrors.value[index] !== undefined) {
+    const next = { ...actionErrors.value };
+    delete next[index];
+    actionErrors.value = next;
+  }
 }
 
 function showRawRules(): void {
@@ -752,12 +794,33 @@ function condValueText(value: string | string[]): string {
 function discard(): void {
   validationErrors.value = [];
   fieldErrors.value = {};
+  actionErrors.value = {};
   disarmRestart();
   restartPending.value = false;
   if (store.config) {
     void store.loadConfig().then(() => {
       if (store.config) buildDraft(store.config);
     });
+  }
+}
+
+/** R8: a failed save brings the blocking errors into view — the banner next
+ * to the save row first; when every violation mapped to an inline field (no
+ * banner), the first errored input. 'nearest' avoids any page jump, and the
+ * behavior degrades to 'auto' under prefers-reduced-motion (utils/motion). */
+async function scrollToSaveFailure(): Promise<void> {
+  await nextTick();
+  const banner = validationBanner.value;
+  const fallback =
+    pageRoot.value !== null
+      ? ((pageRoot.value as { $el?: Element }).$el?.querySelector('.nb-input-bad') ?? null)
+      : null;
+  const target: Element | null = banner ?? fallback;
+  if (!target) return;
+  try {
+    target.scrollIntoView({ block: 'nearest', behavior: scrollBehavior() });
+  } catch {
+    // pre-options engines (jsdom, old webviews): skip the scroll, keep the save
   }
 }
 
@@ -768,11 +831,13 @@ async function save(): Promise<void> {
     showStructuredRules();
     if (rawError.value) {
       validationErrors.value = [`JSON rules: ${rawError.value}`];
+      void scrollToSaveFailure();
       return;
     }
     payload = buildPayload();
   } catch (err) {
     validationErrors.value = [err instanceof Error ? err.message : String(err)];
+    void scrollToSaveFailure();
     return;
   }
   // Inline-only validation (no browser alert): client rules first, then the
@@ -787,14 +852,27 @@ async function save(): Promise<void> {
     pollInterval: draft.pollInterval
   });
   fieldErrors.value = { ...mappedClient, ...fieldChecks };
+  // R8: the Actions rows join the draft validation — an empty command on a
+  // command action is a per-row field error (inline box + message) and blocks
+  // the round-trip exactly like the five config fields
+  actionErrors.value = validateDraftActionCommands(draft.actions);
   validationErrors.value = clientErrors;
   // pre-existing blocking rule stays: any client-mirror violation (fields,
   // actions, rules…) blocks the round-trip; non-field leftovers hit the banner
-  if (clientErrors.length > 0 || Object.keys(fieldChecks).length > 0) return;
+  // (R8: rendered next to the save row), actions/field errors go inline
+  if (
+    clientErrors.length > 0 ||
+    Object.keys(fieldChecks).length > 0 ||
+    Object.keys(actionErrors.value).length > 0
+  ) {
+    void scrollToSaveFailure();
+    return;
+  }
   const ok = await store.saveConfig(payload);
   if (ok) {
     // success: previous inline errors are resolved — clean state
     fieldErrors.value = {};
+    actionErrors.value = {};
     validationErrors.value = [];
     // R7: the saved state becomes the new pristine reference
     markDraftSnapshot();
@@ -830,6 +908,10 @@ async function save(): Promise<void> {
     // (EN text from the same table); non-field details collapse into the one
     // muted generic line (unmappedSaveDetails) — never verbatim PT-BR
     fieldErrors.value = { ...fieldErrors.value, ...splitDetailsByField(store.configSaveErrors).fieldErrors };
+    // R8: the failed round-trip scrolls the blocking errors into view (the
+    // unmapped leftovers may open the banner; mapped ones clear it and the
+    // fallback scrolls the first errored input)
+    void scrollToSaveFailure();
     // R7 announce
     void announceSave(SAVE_FAILED_ANNOUNCE);
   }
@@ -919,6 +1001,44 @@ onUnmounted(() => {
   border-bottom: 1px solid var(--nb-border-default);
   padding-bottom: var(--nb-space-2);
   margin-bottom: var(--nb-space-3);
+}
+/* R8: action rows join the boxed input treatment of the config fields —
+   elevated surface, hairline, radius, focus ring (same pair as
+   .nb-field ion-input) — and the invalid state wears the same danger pair */
+.nb-action-row .nb-action-box {
+  background: var(--nb-bg-elevated);
+  border: 1px solid var(--nb-border-strong);
+  border-radius: var(--nb-radius-md);
+  padding: var(--nb-space-2) var(--nb-space-3);
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+.nb-action-row .nb-action-box:focus-within {
+  border-color: var(--nb-info);
+  box-shadow: 0 0 0 2px var(--nb-info-muted);
+}
+.nb-action-row .nb-action-box.nb-input-bad {
+  border-color: var(--nb-danger);
+  background-color: var(--nb-danger-muted);
+}
+.nb-action-row .nb-action-box.nb-input-bad:focus-within {
+  border-color: var(--nb-danger);
+  box-shadow: 0 0 0 2px var(--nb-danger-muted);
+}
+/* command reads as shell text: same mono as the raw JSON editor */
+.nb-action-row .nb-action-command {
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-secondary);
+}
+/* labels above the values (ion-input internals are light-DOM-scoped) */
+.nb-action-row :deep(.label-text-wrapper) {
+  font-size: var(--nb-fs-secondary);
+  color: var(--nb-text-secondary);
+  margin-bottom: var(--nb-space-1);
+}
+/* inline message under the errored action input (shared .nb-field-error DNA) */
+.nb-action-row .nb-field-error {
+  margin: var(--nb-space-1) 0 0;
+  padding-left: var(--nb-space-1);
 }
 .nb-action-head {
   display: flex;
