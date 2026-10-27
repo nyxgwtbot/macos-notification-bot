@@ -38,7 +38,7 @@
               <div class="nb-kv"><span>PID</span><strong>{{ store.daemon.pid ?? '—' }}</strong></div>
               <div class="nb-kv"><span>Uptime</span><strong>{{ formatUptime(store.daemon.uptimeSec) || '—' }}</strong></div>
               <div class="nb-kv"><span>Started</span><strong>{{ formatIsoShort(store.daemon.startedAt) || '—' }}</strong></div>
-              <div class="nb-kv"><span>API port</span><strong>{{ store.daemon.port ?? '—' }}</strong></div>
+              <div class="nb-kv"><span>API port</span><strong>{{ apiPortDisplay }}</strong></div>
               <div class="nb-kv"><span>Adopted</span><strong>{{ store.daemon.adopted ? 'yes (external instance)' : 'no (managed here)' }}</strong></div>
               <div v-if="store.daemon.lastError" class="nb-error-line">Error: {{ store.daemon.lastError }}</div>
             </template>
@@ -151,12 +151,22 @@ import { cloudOfflineOutline, pulseOutline } from 'ionicons/icons';
 import { useBotStore } from '@/stores/bot';
 import { usePolling } from '@/composables/usePolling';
 import { formatBytes, formatIsoShort, formatUptime } from '@/utils/time';
+import { formatApiPort } from '@/viewModels/statusViewModel';
 
 const store = useBotStore();
 
 const daemonBridge = computed(() => typeof window !== 'undefined' && !!window.notifyAPI?.daemon);
 
 const feedRows = computed(() => [...store.events].reverse());
+
+const apiPortDisplay = computed(() =>
+  formatApiPort({
+    daemonPort: store.daemon?.port,
+    adopted: store.daemon?.adopted,
+    hasHealth: !!store.health,
+    apiStarted: store.apiStarted,
+  })
+);
 
 /** S1: compact status chips — tone maps to quiet semantic tint classes. */
 const daemonChipTone = computed(() =>
