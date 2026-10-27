@@ -171,7 +171,7 @@ _TRUNCATION_RESERVE_BYTES = 160
 _FALLBACK_SYSTEM_PROMPT = (
     "You are the NotifyDesk in-app agent. Reply with EXACTLY ONE JSON object per turn: "
     '{"tool": "<name>", "args": {...}} or {"answer": "<pt-br text>", "urls": [...]}. '
-    "Valid tools: app.data, dashboard.create, server.serve, notify.test. "
+    "Valid tools: app.data, dashboard.create, server.serve, notify.test, native.call. "
     "The final 'answer' text is always in Brazilian Portuguese."
 )
 
@@ -642,6 +642,8 @@ def _ollama_chat(runtime: Any, messages: List[dict]) -> str:
 
 MOCK_DASHBOARD_TITLE = "Agent Health Overview"
 MOCK_DASHBOARD_DATA_SOURCE = "app.data:health"
+MOCK_REMINDER_LIST = "Leituras"
+MOCK_REMINDER_TITLE = "Ler o relatório do projeto X"
 
 
 def _mock_dashboard_html() -> str:
@@ -674,6 +676,7 @@ def _mock_llm(messages: List[dict]) -> str:
 
     tool_calls = 0
     last_call_name: Optional[str] = None
+    last_call_args: Dict[str, Any] = {}
     last_result: dict = {}
     for message in messages:
         if message.get("role") != "assistant":
@@ -685,6 +688,8 @@ def _mock_llm(messages: List[dict]) -> str:
                 call = json.loads(content.splitlines()[0][len("tool_call:") :])
                 if isinstance(call, dict):
                     last_call_name = call.get("tool")
+                    args_value = call.get("args")
+                    last_call_args = args_value if isinstance(args_value, dict) else {}
             except (ValueError, IndexError):
                 pass
         for line in content.splitlines():
@@ -704,6 +709,35 @@ def _mock_llm(messages: List[dict]) -> str:
 
     notification_words = ("test notif", "notificação de teste", "teste de notificação", "testar notific")
     dashboard_words = ("dashboard", "painel", "relatório", "relatorio")
+    reminder_words = ("lembrete", "reminder", "nota", "note")
+
+    if any(word in text for word in reminder_words):
+        if last_call_name != "native.call":
+            return tool(
+                "native.call",
+                {
+                    "domain": "reminders",
+                    "action": "add",
+                    "params": {"list": MOCK_REMINDER_LIST, "title": MOCK_REMINDER_TITLE},
+                },
+            )
+        last_action = str((last_call_args or {}).get("action", ""))
+        if last_action == "add":
+            return tool(
+                "native.call",
+                {
+                    "domain": "reminders",
+                    "action": "list_reminders",
+                    "params": {"list": MOCK_REMINDER_LIST},
+                },
+            )
+        items = last_result.get("reminders")
+        count = len(items) if isinstance(items, list) else 0
+        return answer(
+            f"Criei o lembrete {MOCK_REMINDER_TITLE!r} na lista {MOCK_REMINDER_LIST!r} — "
+            f"agora há {count} lembrete(s) pendente(s) nela.",
+            [],
+        )
 
     if any(word in text for word in notification_words):
         if last_call_name != "notify.test":

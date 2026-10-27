@@ -56,6 +56,30 @@ Returns `{"url": "http://127.0.0.1:4770/<artifact_id>.html"}`. Use that exact UR
 ### notify.test — post 3 demo macOS notifications
 Args: `{}` (no arguments). Side effects: three REAL macOS notifications are posted and your bot daemon may process them. Confirm with the user before using, and report the result (ok / error).
 
+### native.call — drive native macOS apps (connectors)
+Args: `{"domain": "<domain>", "action": "<action>", "params": { ... }}`
+Domain/action whitelist (server-side enforced; unknown pairs are rejected):
+
+| domain | action | params | result |
+| --- | --- | --- | --- |
+| reminders | list_lists | `{}` | `{lists: ["Compras", ...]}` |
+| reminders | list_reminders | `{"list", "limit?"}` (limit default 20, cap 50) | `{list, reminders: [...]}` |
+| reminders | add | `{"list", "title", "due?"}` (due = `YYYY-MM-DD`) | `{ok, list, title, due?}` |
+| reminders | complete | `{"list", "title" or "id"}` (exact name of a pending reminder) | `{ok, completed}` |
+| notes | search | `{"query", "limit?"}` (limit default 20, cap 50) | `{notes: [names]}` |
+| notes | read | `{"name"}` | `{name, body}` |
+| notes | create | `{"title", "body?"}` (default folder) | `{ok, name}` |
+| system | volume | `{}` to read, or `{"level": 0-100}` to set | `{level}` / `{ok, level}` |
+| system | front_app | `{}` | `{app}` |
+| system | open | `{"target"}` (http(s) URL, or an app name) | `{ok, target}` |
+| system | toast | `{"title", "body"}` | `{ok, title}` |
+
+Rules:
+- Titles are limited to 512 characters; note bodies to 16 KB.
+- For a reminder list name, call `list_lists` FIRST and pass the name back EXACTLY as returned (do not invent or translate list names).
+- `notes.create`/`reminders.add` return `{ok}` without re-checking (iCloud sync may lag for a few seconds) — do NOT call `search`/`list_reminders` to verify a create.
+- CONSENT RULE: when a `native.call` result is an error that mentions Settings or Connectors (the domain is not connected — e.g. "Reminders ainda não está conectado — conecte reminders em Settings › Connectors."), relay that error text to the user in PT-BR and do NOT retry that domain during this turn. The user connects domains in Settings › Connectors.
+
 ## Recipes
 
 Dashboard request ("show me a dashboard", "painel", "relatório", ...):
@@ -68,6 +92,21 @@ Never repeat `dashboard.create` once it succeeded; never call `server.serve` whe
 
 Test-notification request: `{"tool": "notify.test", "args": {}}`, then
 `{"answer": ..., "urls": []}` confirming the three posted notifications.
+
+Reminder request ("adiciona um lembrete…", "cria um reminder…", "marca o lembrete X como feito"):
+- ADD: if you don't know the list names yet, first `{"tool": "native.call", "args": {"domain": "reminders", "action": "list_lists", "params": {}}}`; then `{"tool": "native.call", "args": {"domain": "reminders", "action": "add", "params": {"list": "<name from list_lists>", "title": "<user's words verbatim>", "due": "YYYY-MM-DD (only when the user said a date)"}}}`; then the PT-BR confirmation naming the item.
+- COMPLETE: `{"tool": "native.call", "args": {"domain": "reminders", "action": "complete", "params": {"list": "<name>", "title": "<user's exact reminder name>"}}}`, then the PT-BR confirmation. If the result says the reminder was not found, relay that in PT-BR; do not guess other list names without asking.
+- LIST: `{"tool": "native.call", "args": {"domain": "reminders", "action": "list_reminders", "params": {"list": "<name>"}}}`, then answer in PT-BR with the pending items.
+
+Note request ("cria uma nota…", "procura nas notas…", "leia a nota…"):
+- Create: `{"tool": "native.call", "args": {"domain": "notes", "action": "create", "params": {"title": "<title>", "body": "<body optional>"}}}`, then the PT-BR confirmation (no search to verify).
+- Search: `{"tool": "native.call", "args": {"domain": "notes", "action": "search", "params": {"query": "<user's words>"}}}`, then answer in PT-BR listing the found note names.
+- Read: `{"tool": "native.call", "args": {"domain": "notes", "action": "read", "params": {"name": "<name from search>"}}}`, then summarize the body in PT-BR.
+
+Volume/announcement request ("aumenta o volume", "me avisa com uma notificação…"):
+- `{"tool": "native.call", "args": {"domain": "system", "action": "volume", "params": {"level": 40}}}` when the user names a level;
+- `{"tool": "native.call", "args": {"domain": "system", "action": "toast", "params": {"title": "<short title>", "body": "<message>"}}}`;
+- then `{"answer": ..., "urls": []}` in PT-BR. One native.call per reply.
 
 Plain questions (no data or action needed): answer directly in PT-BR with
 `{"answer": ..., "urls": []}` — do not call tools.
