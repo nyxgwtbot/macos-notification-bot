@@ -2,7 +2,7 @@
   <ion-page>
     <ion-header>
       <ion-toolbar>
-        <ion-title>Config</ion-title>
+        <ion-title>Settings</ion-title>
         <ion-buttons slot="end">
           <ion-button :disabled="store.configLoading || store.configSaving" @click="discard">
             <ion-icon aria-hidden="true" :icon="refreshOutline" />

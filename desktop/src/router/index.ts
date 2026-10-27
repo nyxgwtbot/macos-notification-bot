@@ -4,6 +4,7 @@ import DashboardView from '../views/DashboardView.vue';
 import FinanceView from '../views/FinanceView.vue';
 import ConfigView from '../views/ConfigView.vue';
 import LogsView from '../views/LogsView.vue';
+import ChatView from '../views/ChatView.vue';
 
 const routes: Array<RouteRecordRaw> = [
   {
@@ -14,6 +15,11 @@ const routes: Array<RouteRecordRaw> = [
     path: '/dashboard',
     name: 'Dashboard',
     component: DashboardView
+  },
+  {
+    path: '/chat',
+    name: 'Chat',
+    component: ChatView
   },
   {
     path: '/finance',
