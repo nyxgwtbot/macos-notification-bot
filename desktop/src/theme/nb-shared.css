@@ -1,0 +1,87 @@
+/*
+ * Notification Bot Desktop — shared utility classes.
+ * Consolidated from per-view scoped blocks and tokenized per the redesign spec.
+ */
+
+.nb-content {
+  --padding-top: var(--nb-space-4);
+  --padding-start: var(--nb-space-4);
+  --padding-end: var(--nb-space-4);
+  --padding-bottom: var(--nb-space-6);
+}
+
+.nb-muted {
+  color: var(--nb-text-secondary);
+  font-size: var(--nb-fs-secondary);
+}
+
+.nb-center {
+  display: block;
+  margin: var(--nb-space-8) auto;
+  width: var(--nb-space-8);
+  height: var(--nb-space-8);
+}
+
+.nb-empty {
+  text-align: center;
+  color: var(--nb-text-secondary);
+  padding: var(--nb-space-6) 0;
+  font-size: var(--nb-fs-secondary);
+}
+
+.nb-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--nb-space-2);
+  margin: 0 0 var(--nb-space-4);
+  padding: var(--nb-space-2) var(--nb-space-3);
+  border-radius: var(--nb-radius-md);
+  font-size: var(--nb-fs-secondary);
+}
+
+.nb-banner-warn {
+  background: var(--nb-warning-muted);
+  color: var(--ion-color-warning);
+}
+
+.nb-banner-err {
+  background: var(--nb-danger-muted);
+  color: var(--ion-color-danger);
+}
+
+.nb-offline {
+  display: flex;
+  align-items: center;
+  gap: var(--nb-space-2);
+  margin: 0 0 var(--nb-space-4);
+  padding: var(--nb-space-2) var(--nb-space-3);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-danger-muted);
+  color: var(--ion-color-danger);
+  font-size: var(--nb-fs-secondary);
+}
+
+.nb-error-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--nb-space-2);
+  margin: 0 0 var(--nb-space-3);
+  padding: var(--nb-space-2) var(--nb-space-3);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-danger-muted);
+  color: var(--ion-color-danger);
+  font-size: var(--nb-fs-secondary);
+}
+
+.nb-error-line {
+  margin-top: var(--nb-space-1);
+  font-size: var(--nb-fs-secondary);
+  color: var(--ion-color-danger);
+}
+
+.nb-card-footer {
+  padding-top: var(--nb-space-3);
+  display: flex;
+  align-items: center;
+}
