@@ -369,6 +369,14 @@ def _truncate_bytes(text: str, cap: int) -> str:
     return encoded[:cap].decode("utf-8", errors="ignore")
 
 
+def _as_runner_text(value: Any) -> str:
+    """Normalize a runner's stdout/stderr (CompletedProcess exposes str under
+    text=True; defensive str() keeps custom seams honest)."""
+    if isinstance(value, str):
+        return value
+    return "" if value is None else str(value)
+
+
 def _parse_level_stdout(stdout: str) -> int:
     try:
         return int((stdout or "").strip())
@@ -469,6 +477,7 @@ def _as_string(value: Any, field: str, field_max: Optional[int] = None) -> str:
 
 
 def _as_limit(value: Any) -> int:
+    """limit: default 20, cap 50 (values above the cap clamp down), 1..50."""
     if value is None:
         return LIST_LIMIT_DEFAULT
     if isinstance(value, bool):
@@ -483,9 +492,9 @@ def _as_limit(value: Any) -> int:
         limit = int(value.strip())
     else:
         raise ConnectorError(f"'limit' must be an integer between 1 and {LIST_LIMIT_MAX}")
-    if not (1 <= limit <= LIST_LIMIT_MAX):
+    if limit < 1:
         raise ConnectorError(f"'limit' must be an integer between 1 and {LIST_LIMIT_MAX}")
-    return limit
+    return min(limit, LIST_LIMIT_MAX)
 
 
 def _parse_due(value: Any) -> Optional[Tuple[int, int, int]]:
@@ -682,8 +691,8 @@ class ConnectorManager:
             raise _ScriptFailure("timeout", 0, "") from exc
         except OSError as exc:
             raise ConnectorError(f"osascript execution failed: {exc}") from exc
-        stdout = outcome.stdout if isinstance(outcome.stdout, str) else ("" if outcome.stdout is None else str(outcome.stdout))
-        stderr = outcome.stderr if isinstance(outcome.stderr, str) else ("" if outcome.stderr is None else str(outcome.stderr))
+        stdout = _as_runner_text(outcome.stdout)
+        stderr = _as_runner_text(outcome.stderr)
         returncode = int(outcome.returncode)
         if returncode == 0:
             return _Outcome(returncode=0, stdout=stdout, stderr=stderr)
@@ -793,7 +802,8 @@ class ConnectorManager:
                 argv = [list_name, title, str(year), f"{month:02d}", f"{day:02d}"]
                 due_out = f"{year:04d}-{month:02d}-{day:02d}"
 
-            def post(raw: dict, _list_name: str = list_name, _title: str = title, _due: Optional[str] = due_out) -> dict:
+            def post(raw: dict, _list_name: str = list_name,
+                     _title: str = title, _due: Optional[str] = due_out) -> dict:
                 del raw
                 result = {"ok": True, "list": _list_name, "title": _title}
                 if _due is not None:
