@@ -7,13 +7,13 @@
           <ion-icon aria-hidden="true" :icon="gridOutline" />
           <ion-label>Dashboard</ion-label>
         </ion-tab-button>
-        <ion-tab-button tab="chat" href="/chat">
-          <ion-icon aria-hidden="true" :icon="chatbubblesOutline" />
-          <ion-label>Chat</ion-label>
-        </ion-tab-button>
         <ion-tab-button tab="finance" href="/finance">
           <ion-icon aria-hidden="true" :icon="cashOutline" />
           <ion-label>Finance</ion-label>
+        </ion-tab-button>
+        <ion-tab-button tab="chat" href="/chat">
+          <ion-icon aria-hidden="true" :icon="chatbubblesOutline" />
+          <ion-label>Chat</ion-label>
         </ion-tab-button>
         <ion-tab-button tab="config" href="/config">
           <ion-icon aria-hidden="true" :icon="settingsOutline" />

@@ -1,4 +1,5 @@
 # Reflections Index
 
+- [agent-loop-v1-learnings.md](agent-loop-v1-learnings.md) — agent loop v1: lazy ApiError import breaks the api↔agent_tools cycle; NOTIFYBOT_ARTIFACTS_PORT=0 sandboxing carries the bound port back in `url`; 1 record = 1 context message transcript lines (`tool_call:`/`tool_result:`); session ts stamped inside append; alphabetical unittest method order vs shared fixtures; `sandbox=""` for vue iframes.
 - [llm-budget-smoke-idempotency.md](llm-budget-smoke-idempotency.md) — one live LLM classification per session; smoke script's per-marker reuse is load-bearing; unit suite must stay fully mocked; db2/osascript write lag ~2-6 s; event-log stage evidence lives inside `notification` events.
 - [phase2-finance-smoke-learnings.md](phase2-finance-smoke-learnings.md) — finance smoke: marker bodies must be unambiguously bank-flavored (person-like text gets classified `message` and rules-first legitimately skips finance); evidence readers unwrap JSONL record→event; reusable HTML reports require finance.db older than the report (mtime); `bot.py report` always spends one insights call.
