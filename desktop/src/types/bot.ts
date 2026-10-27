@@ -154,6 +154,77 @@ export interface TestNotifyResponse {
   posted: number;
 }
 
+/** One in-loop tool step of POST /api/agent/turn ("assistant" rows that
+ * touched a tool; the python loop omits the failing key on each outcome). */
+export interface AgentTurnStep {
+  role: 'assistant' | string;
+  tool: string;
+  args?: Record<string, unknown>;
+  /** Tool payload on success (arbitrary dataset/artifact JSON). */
+  result?: unknown;
+  /** Error text on tool failure (key omitted when the tool succeeded). */
+  error?: string;
+  ts: string;
+}
+
+/** POST /api/agent/turn response (synchronous turn). */
+export interface AgentTurnResponse {
+  session_id: string;
+  turn: AgentTurnStep[];
+  answer: string;
+  urls: string[];
+}
+
+/** GET /api/agent/sessions row (newest-first list). */
+export interface AgentSessionSummary {
+  session_id: string;
+  updated_at: string;
+  /** Number of user messages in the session. */
+  turns: number;
+  /** First user message, truncated by the server. */
+  preview: string;
+}
+
+export interface AgentSessionsResponse {
+  sessions: AgentSessionSummary[];
+}
+
+/** One persisted JSONL record of GET /api/agent/session/<id>: a user message,
+ * an assistant tool step (tool/args/result|error), or an assistant answer
+ * (answer/urls). */
+export interface AgentRecord {
+  role: 'user' | 'assistant' | string;
+  content?: string;
+  tool?: string;
+  args?: Record<string, unknown>;
+  result?: unknown;
+  error?: string;
+  answer?: string;
+  urls?: string[];
+  ts: string;
+}
+
+/** GET /api/agent/session/<id> response. */
+export interface AgentSessionDetail {
+  session_id: string;
+  records: AgentRecord[];
+}
+
+/** Row of GET /api/services -> services.artifacts (always present). */
+export interface ServiceStatusRow {
+  running: boolean;
+  host: string;
+  /** Bound port while running; the configured port otherwise. */
+  port: number;
+  root: string;
+  since: string | null;
+}
+
+/** GET /api/services response. */
+export interface ServicesResponse {
+  services: { artifacts: ServiceStatusRow };
+}
+
 /** 400 {error, details:[…]} error bodies from the API. */
 export interface ApiErrorBody {
   error: string;
