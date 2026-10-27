@@ -83,6 +83,18 @@
   --nb-purple: #a371d9;
   --nb-purple-muted: rgba(163, 113, 217, 0.15);
 
+  /* ========================================
+     SOFT STATUS CHIPS — tinted chip pairs: background at ~14-16% alpha of
+     the semantic color, text at full strength, dot solid. ok (green),
+     danger (red), warn (amber, pending/consent states).
+     ======================================== */
+  --nb-chip-ok-bg: rgba(63, 185, 80, 0.14);
+  --nb-chip-ok-fg: var(--nb-green);
+  --nb-chip-danger-bg: rgba(248, 81, 73, 0.16);
+  --nb-chip-danger-fg: var(--nb-danger);
+  --nb-chip-warn-bg: rgba(210, 153, 34, 0.14);
+  --nb-chip-warn-fg: var(--nb-warning);
+
   --nb-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
   /* ========================================

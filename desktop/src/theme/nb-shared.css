@@ -87,6 +87,53 @@
 }
 
 /* ========================================
+   SOFT STATUS CHIPS — the shared tinted status pill: background is a
+   ~14-16% tint of the semantic color (never a solid fill), text + dot at
+   full strength, radius-sm. The base class is the neutral state; tone
+   classes select the semantic pair. Consumers: Status card headers
+   (Daemon / Bot state) and the Settings connector rows.
+   ======================================== */
+.nb-status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nb-space-1);
+  width: max-content;
+  max-width: 100%;
+  padding: 2px var(--nb-space-2); /* 2px micro-inner exception */
+  border-radius: var(--nb-radius-sm);
+  font-size: var(--nb-fs-micro);
+  font-weight: 600;
+  line-height: 1.45;
+  white-space: nowrap;
+  background: var(--nb-bg-elevated);
+  color: var(--nb-text-secondary);
+}
+/* Solid-state dot; tone classes below set the full-strength color. */
+.nb-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: var(--nb-radius-full);
+  background: currentColor;
+}
+.nb-status-ok {
+  background: var(--nb-chip-ok-bg);
+  color: var(--nb-chip-ok-fg);
+}
+.nb-status-info {
+  background: var(--nb-info-muted);
+  color: var(--nb-info);
+}
+.nb-status-warn {
+  background: var(--nb-chip-warn-bg);
+  color: var(--nb-chip-warn-fg);
+}
+.nb-status-bad {
+  background: var(--nb-chip-danger-bg);
+  color: var(--nb-chip-danger-fg);
+}
+
+/* ========================================
    PAGE HEADER PATTERN (X1) — one shared structure: single-row title at
    --nb-fs-title-lg (18px/600) with inline actions, --nb-space-3 vertical
    padding, hairline bottom border. Views opt in via .nb-page-header on

@@ -44,7 +44,9 @@
             <div v-for="row in connectors.rows" :key="row.domain" class="nb-connector-row">
               <div class="nb-connector-head">
                 <strong>{{ row.domain }}</strong>
-                <ion-badge :color="statusChipColor(row.status)">{{ statusChipLabel(row.status) }}</ion-badge>
+                <span class="nb-status-chip" :class="'nb-status-' + statusChipTone(row.status)">
+                  <i class="nb-dot" aria-hidden="true"></i>{{ statusChipLabel(row.status) }}
+                </span>
                 <ion-button
                   size="small"
                   fill="outline"
@@ -256,7 +258,7 @@ import {
   initialConnectorsState,
   isProbing,
   reduceConnectors,
-  statusChipColor,
+  statusChipTone,
   statusChipLabel,
   type ConnectorsEvent,
   type ConnectorsState,

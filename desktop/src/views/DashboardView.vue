@@ -242,54 +242,26 @@ onUnmounted(() => {
   gap: var(--nb-space-3);
   margin-bottom: 0;
 }
-/* S1: card header row — title left, status chip right */
+/* S1 (iter3): ONE left-aligned header row — flex-direction: row beats
+   Ionic's :host column (which centered the title horizontally and dropped
+   the chip below it); title at fs-title 16px/600, chip adjacent with a
+   --nb-space-2 gap */
 .nb-card-head {
   display: flex;
+  flex-direction: row;
   align-items: center;
-  justify-content: space-between;
   gap: var(--nb-space-2);
 }
 .nb-card-head ion-card-title {
+  font-size: var(--nb-fs-title);
+  font-weight: 600;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-/* S1: compact status chip (icon dot + label, max-content) */
-.nb-status-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--nb-space-1);
-  width: max-content;
-  max-width: 100%;
-  padding: 2px var(--nb-space-2); /* 2px micro-inner exception */
-  border-radius: var(--nb-radius-sm);
-  font-size: var(--nb-fs-micro);
-  font-weight: 600;
-  line-height: 1.45;
-  white-space: nowrap;
-  background: var(--nb-bg-elevated);
-  color: var(--nb-text-secondary);
-}
-.nb-dot {
-  width: 6px;
-  height: 6px;
-  flex: none;
-  border-radius: var(--nb-radius-full);
-  background: currentColor;
-}
-.nb-status-ok {
-  background: var(--nb-green-muted);
-  color: var(--nb-green);
-}
-.nb-status-info {
-  background: var(--nb-info-muted);
-  color: var(--nb-info);
-}
-.nb-status-bad {
-  background: var(--nb-danger-muted);
-  color: var(--nb-danger);
-}
+/* Soft status chip + dot + tone classes live in theme/nb-shared.css so the
+   Settings connector rows share the same tinted chip system */
 
 .nb-kv {
   display: flex;

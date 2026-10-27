@@ -52,12 +52,15 @@ export function rowsFromResponse(response: ConnectorsResponse | null | undefined
   });
 }
 
-/** Ionic chip color per connector status (success/warning/danger/medium). */
-export function statusChipColor(status: string): string {
-  if (status === 'granted') return 'success';
-  if (status === 'needs_consent') return 'warning';
-  if (status === 'denied') return 'danger';
-  return 'medium';
+/**
+ * Chip tone class per connector status — the soft tinted chips in
+ * theme/nb-shared.css (ok/warn/bad tone pairs; neutral base otherwise).
+ */
+export function statusChipTone(status: string): string {
+  if (status === 'granted') return 'ok';
+  if (status === 'needs_consent') return 'warn';
+  if (status === 'denied') return 'bad';
+  return 'muted';
 }
 
 /** Short English chip label per connector status. */

@@ -7,7 +7,7 @@ import {
   isProbing,
   reduceConnectors,
   rowsFromResponse,
-  statusChipColor,
+  statusChipTone,
   statusChipLabel,
   type ConnectorsState,
 } from '../../src/viewModels/connectorsViewModel';
@@ -118,12 +118,12 @@ describe('connectors view-model — probes', () => {
 });
 
 describe('connectors view-model — chip mapping', () => {
-  test('statusChipColor maps the four statuses to Ionic colors', () => {
-    expect(statusChipColor('granted')).toBe('success');
-    expect(statusChipColor('needs_consent')).toBe('warning');
-    expect(statusChipColor('denied')).toBe('danger');
-    expect(statusChipColor('unknown')).toBe('medium');
-    expect(statusChipColor('anything-else')).toBe('medium');
+  test('statusChipTone maps the four statuses to soft-chip tone classes', () => {
+    expect(statusChipTone('granted')).toBe('ok');
+    expect(statusChipTone('needs_consent')).toBe('warn');
+    expect(statusChipTone('denied')).toBe('bad');
+    expect(statusChipTone('unknown')).toBe('muted');
+    expect(statusChipTone('anything-else')).toBe('muted');
   });
 
   test('statusChipLabel maps the four statuses to English labels', () => {
