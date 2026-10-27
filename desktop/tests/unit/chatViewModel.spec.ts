@@ -160,6 +160,18 @@ describe('send → succeed flow', () => {
     state = reduceChat(state, { type: 'error-cleared' });
     expect(state.error).toBeNull();
   });
+
+  test('error-cleared reduces error to null even if previously in an error state', () => {
+    const state0 = withState({
+      error: 'Previous failure message',
+      pending: false,
+      messages: [{ id: 'm1', role: 'user', text: 'hello' }]
+    });
+    const state1 = reduceChat(state0, { type: 'error-cleared' });
+    expect(state1.error).toBeNull();
+    expect(state1.messages).toEqual(state0.messages);
+    expect(state1.pending).toBe(false);
+  });
 });
 
 // ---- sessions -------------------------------------------------------------

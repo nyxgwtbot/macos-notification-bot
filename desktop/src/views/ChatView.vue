@@ -39,7 +39,7 @@
               <ion-icon aria-hidden="true" :icon="cloudOfflineOutline" />
               <span>API offline: {{ loadError }}</span>
             </div>
-            <ion-button size="small" fill="outline" @click="loadSessions">Retry</ion-button>
+            <ion-button size="small" fill="outline" @click="loadSessions()">Retry</ion-button>
           </div>
 
           <!-- Transcript bubbles with internal scroll and accessible log role -->
@@ -271,13 +271,28 @@ watch(
   }
 );
 
-async function loadSessions(): Promise<void> {
-  loadError.value = null;
-  try {
-    const { sessions } = await notifyClient.getAgentSessions();
-    dispatch({ type: 'sessions-loaded', sessions });
-  } catch (err) {
-    loadError.value = errorText(err);
+async function loadSessions(quietAutoRetry = false): Promise<void> {
+  const isQuiet = quietAutoRetry === true;
+  const delays = isQuiet ? [1500, 3000, 6000] : [];
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    loadError.value = null;
+    dispatch({ type: 'error-cleared' });
+    try {
+      const { sessions } = await notifyClient.getAgentSessions();
+      dispatch({ type: 'sessions-loaded', sessions });
+      return;
+    } catch (err) {
+      if (attempt < delays.length) {
+        const delayMs = delays[attempt];
+        console.info(`[ChatView] Session load attempt ${attempt + 1} failed (${errorText(err)}). Retrying in ${delayMs}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      } else {
+        if (isQuiet) {
+          console.warn(`[ChatView] Session load auto-retry exhausted (${errorText(err)}). Surfacing error.`);
+        }
+        loadError.value = errorText(err);
+      }
+    }
   }
 }
 
@@ -369,11 +384,12 @@ async function send(): Promise<void> {
 
 function retryLast(): void {
   if (lastMessage.value === null) return;
-  draft.value = lastMessage.value;
+  loadError.value = null;
   dispatch({ type: 'error-cleared' });
+  draft.value = lastMessage.value;
 }
 
-onMounted(loadSessions);
+onMounted(() => void loadSessions(true));
 </script>
 
 <style scoped>
@@ -409,6 +425,12 @@ onMounted(loadSessions);
   --color-activated: var(--nb-text-primary) !important;
   --color-focused: var(--nb-text-primary) !important;
   --border-radius: var(--nb-radius-full) !important;
+  --padding-start: var(--nb-space-3) !important;
+  --padding-end: var(--nb-space-3) !important;
+  font-size: var(--nb-fs-secondary) !important;
+  white-space: nowrap !important;
+  flex-shrink: 0;
+  margin: 0;
 }
 
 /* C4: one shared control height for the header end-slot (select + buttons
@@ -417,6 +439,15 @@ onMounted(loadSessions);
 .nb-header-sessions .nb-session-select {
   min-height: 28px !important;
   height: 28px !important;
+  margin: 0;
+}
+
+.nb-header-sessions ion-button {
+  flex-shrink: 0;
+  white-space: nowrap !important;
+  font-size: var(--nb-fs-secondary) !important;
+  --padding-start: var(--nb-space-3) !important;
+  --padding-end: var(--nb-space-3) !important;
 }
 
 .nb-session-select {
