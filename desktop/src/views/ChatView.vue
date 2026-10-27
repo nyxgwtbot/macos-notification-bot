@@ -2,7 +2,21 @@
   <ion-page>
     <ion-header>
       <ion-toolbar class="nb-page-header">
-        <ion-title>Chat</ion-title>
+        <ion-title class="nb-chat-title">
+          <span class="nb-title-row">
+            <!-- F5: daemon live dot — green running / red stopped / gray unknown,
+                 light 5s health poll, click jumps to the Status tab -->
+            <button
+              type="button"
+              class="nb-daemon-dot"
+              :class="`nb-dot-${daemonTone}`"
+              :title="daemonDotTitle"
+              :aria-label="daemonDotTitle"
+              @click="goStatus"
+            ></button>
+            <span>Chat</span>
+          </span>
+        </ion-title>
         <ion-buttons slot="end" class="nb-header-sessions">
           <ion-button
             v-if="state.artifactUrl && !railOpen"
@@ -31,7 +45,7 @@
 
     <ion-content class="nb-content nb-chat-content">
       <div class="nb-chat-layout" :class="{ 'has-artifact': state.artifactUrl && railOpen }">
-        <!-- Main Column: Transcript + Tools + Error + Composer -->
+        <!-- Main Column: Transcript + Error + Composer -->
         <div class="nb-chat-main">
           <!-- Offline banner: sessions endpoint unreachable -> error strip + retry, never blank -->
           <div v-if="loadError" class="nb-error-strip">
@@ -42,72 +56,95 @@
             <ion-button size="small" fill="outline" @click="loadSessions()">Retry</ion-button>
           </div>
 
-          <!-- Transcript bubbles with internal scroll and accessible log role -->
+          <!-- Transcript bubbles with internal scroll and accessible log role.
+               F1: one ordered item list — bubbles interleaved with per-turn
+               tool-activity groups (under the turn's user bubble, before its
+               reply). -->
           <div ref="transcriptEl" class="nb-transcript" role="log" aria-live="polite">
-            <div
-              v-for="bubble in state.messages"
-              :key="bubble.id"
-              class="nb-bubble"
-              :class="bubble.role === 'user' ? 'nb-bubble-user' : 'nb-bubble-assistant'"
-            >
-              <span v-if="bubble.role === 'user'" class="nb-bubble-plain">{{ bubble.text }}</span>
-              <!-- C6: assistant replies render through mdLite (escape-first; uniform
-                   .nb-md rhythm). User replies stay verbatim pre-wrap. -->
-              <div v-else class="nb-md" v-html="mdLite(bubble.text)"></div>
-            </div>
+            <template v-for="item in state.items" :key="item.id">
+              <div
+                v-if="item.kind === 'bubble'"
+                class="nb-bubble"
+                :class="item.role === 'user' ? 'nb-bubble-user' : 'nb-bubble-assistant'"
+                tabindex="0"
+              >
+                <span v-if="item.role === 'user'" class="nb-bubble-plain">{{ item.text }}</span>
+                <!-- C6: assistant replies render through mdLite (escape-first; uniform
+                     .nb-md rhythm). User replies stay verbatim pre-wrap. -->
+                <div v-else class="nb-md" v-html="mdLite(item.text)"></div>
+                <!-- F2: right-aligned micro timestamp + hover copy affordance
+                     (copy the plain bubble TEXT, not the markdown markup) -->
+                <div class="nb-bubble-meta">
+                  <time class="nb-bubble-time" :datetime="item.ts ?? undefined">{{ formatBubbleTime(item.ts) }}</time>
+                  <button
+                    type="button"
+                    class="nb-bubble-copy"
+                    aria-label="Copy message"
+                    @click="copyBubble(item)"
+                  >
+                    <ion-icon aria-hidden="true" :icon="copiedBubbles.has(item.id) ? checkmarkOutline : copyOutline" />
+                  </button>
+                </div>
+              </div>
+
+              <!-- F1: collapsible per-turn tool-activity group (collapsed by
+                   default, count label as the toggle) -->
+              <div v-else class="nb-turn-tools">
+                <button
+                  type="button"
+                  class="nb-turn-tools-head"
+                  :aria-expanded="expandedGroups.has(item.id)"
+                  :aria-controls="`nb-tools-${item.id}`"
+                  @click="toggleGroup(item.id)"
+                >
+                  <span class="nb-turn-tools-label">Tool activity · {{ item.chips.length }}</span>
+                  <ion-icon aria-hidden="true" :icon="expandedGroups.has(item.id) ? chevronUpOutline : chevronDownOutline" />
+                </button>
+                <div v-show="expandedGroups.has(item.id)" :id="`nb-tools-${item.id}`" class="nb-tool-activity">
+                  <div v-for="chip in item.chips" :key="chip.id" class="nb-tool-chip" :class="{ 'nb-tool-chip-error': !chip.ok }">
+                    <button
+                      type="button"
+                      class="nb-tool-chip-head"
+                      :aria-expanded="expandedChips.has(chip.id)"
+                      @click="toggleChip(chip.id)"
+                    >
+                      <span class="nb-tool-tool">{{ chip.tool }}</span>
+                      <ion-badge :color="chip.ok ? 'success' : 'danger'">{{ chip.ok ? 'ok' : 'error' }}</ion-badge>
+                    </button>
+                    <pre v-if="expandedChips.has(chip.id)" class="nb-tool-preview">{{ chip.preview }}</pre>
+                  </div>
+                </div>
+              </div>
+            </template>
 
             <!-- Onboarding empty state when no conversation is active -->
-            <div v-if="state.messages.length === 0 && !state.pending" class="nb-onboarding">
+            <div v-if="state.items.length === 0 && !state.pending" class="nb-onboarding">
               <h2 class="nb-onboarding-title">What should I build?</h2>
               <p class="nb-onboarding-desc">
                 Ask a question and the agent runs local tools, may request macOS consent for native actions, and renders dashboards right next to this conversation.
               </p>
               <div class="nb-onboarding-suggestions">
-                <ion-chip :outline="true" class="nb-suggestion-chip" @click="suggest('Draft a spending dashboard for this month')">
-                  Draft a spending dashboard for this month
-                </ion-chip>
-                <ion-chip :outline="true" class="nb-suggestion-chip" @click="suggest('Send a test notification')">
-                  Send a test notification
-                </ion-chip>
-                <ion-chip :outline="true" class="nb-suggestion-chip" @click="suggest('Summarize this week\'s event log')">
-                  Summarize this week's event log
-                </ion-chip>
-              </div>
-            </div>
-
-            <!-- Pending bubble: assistant thinking indicator with spinner -->
-            <div v-if="state.pending" class="nb-bubble nb-bubble-assistant nb-pending-bubble">
-              <ion-spinner name="crescent" />
-              <span>Working…</span>
-            </div>
-          </div>
-
-          <!-- Tool activity: collapsible section above the composer (C7) with
-               compact inline chips (C2), count label and per-session open state -->
-          <div v-if="state.chips.length > 0" class="nb-tool-section">
-            <button
-              type="button"
-              class="nb-tool-section-head"
-              :aria-expanded="toolsOpen"
-              aria-controls="nb-tool-chips"
-              @click="toggleTools"
-            >
-              <span class="nb-tool-section-label">Tool activity · {{ state.chips.length }}</span>
-              <ion-icon aria-hidden="true" :icon="toolsOpen ? chevronUpOutline : chevronDownOutline" />
-            </button>
-            <div v-show="toolsOpen" id="nb-tool-chips" class="nb-tool-activity">
-              <div v-for="chip in state.chips" :key="chip.id" class="nb-tool-chip" :class="{ 'nb-tool-chip-error': !chip.ok }">
                 <button
+                  v-for="suggestion in SUGGESTIONS"
+                  :key="suggestion.text"
                   type="button"
-                  class="nb-tool-chip-head"
-                  :aria-expanded="expandedChips.has(chip.id)"
-                  @click="toggleChip(chip.id)"
+                  class="nb-suggestion-card"
+                  @click="prefill(suggestion.text)"
                 >
-                  <span class="nb-tool-tool">{{ chip.tool }}</span>
-                  <ion-badge :color="chip.ok ? 'success' : 'danger'">{{ chip.ok ? 'ok' : 'error' }}</ion-badge>
+                  <ion-icon aria-hidden="true" :icon="suggestion.icon" />
+                  <span class="nb-suggestion-copy">
+                    <span class="nb-suggestion-title">{{ suggestion.title }}</span>
+                    <span class="nb-suggestion-hint">{{ suggestion.hint }}</span>
+                  </span>
                 </button>
-                <pre v-if="expandedChips.has(chip.id)" class="nb-tool-preview">{{ chip.preview }}</pre>
               </div>
+              <p class="nb-onboarding-tags">Dashboards · Test notifications · Event summaries · Reminders · Notes · System controls</p>
+            </div>
+
+            <!-- F6: pending bubble with a CSS-only animated dot pattern -->
+            <div v-if="state.pending" class="nb-bubble nb-bubble-assistant nb-pending-bubble">
+              <span class="nb-typing" aria-hidden="true"><i></i><i></i><i></i></span>
+              <span>Working…</span>
             </div>
           </div>
 
@@ -120,19 +157,22 @@
             <ion-button size="small" fill="outline" @click="retryLast">Retry</ion-button>
           </div>
 
-          <!-- Composer: bordered group (C3) — textarea + Send bottom-right inside one surface -->
+          <!-- Composer: bordered group (C3) — textarea + hint/send foot inside one surface -->
           <div class="nb-composer">
             <div class="nb-composer-surface">
               <ion-textarea
-                v-model="draft"
+                ref="composerEl"
                 class="nb-composer-input"
                 placeholder="Message the bot…"
+                :value="state.draft"
                 :auto-grow="true"
                 :rows="1"
+                @ionInput="onDraftInput($event as IonValueEvent)"
                 @keydown="onComposerKeydown($event)"
               />
-              <div class="nb-composer-send">
-                <ion-button :disabled="!canSend" fill="solid" @click="send">
+              <div class="nb-composer-foot">
+                <span class="nb-composer-hint">⏎ Send · ⇧⏎ Newline</span>
+                <ion-button class="nb-send-btn" :disabled="!canSend" fill="solid" @click="send">
                   <ion-spinner v-if="state.pending" name="crescent" />
                   <template v-else>Send</template>
                 </ion-button>
@@ -176,7 +216,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
+import { useRouter } from 'vue-router';
 import {
   IonBadge,
   IonButton,
@@ -185,7 +226,6 @@ import {
   IonCardContent,
   IonCardHeader,
   IonCardTitle,
-  IonChip,
   IonContent,
   IonHeader,
   IonIcon,
@@ -199,52 +239,72 @@ import {
 } from '@ionic/vue';
 import {
   alertCircleOutline,
+  barChartOutline,
+  beakerOutline,
   checkmarkOutline,
   chevronDownOutline,
   chevronUpOutline,
   closeOutline,
   cloudOfflineOutline,
   copyOutline,
+  listOutline,
   refreshOutline
 } from 'ionicons/icons';
 
 import { notifyClient, errorText } from '@/services/notifyClient';
+import { usePolling } from '@/composables/usePolling';
 import {
+  formatBubbleTime,
   initialChatState,
   isIpcTimeout,
   reduceChat,
+  type ChatBubble,
   type ChatEvent,
   type ChatState
 } from '@/viewModels/chatViewModel';
 import { mdLite } from '@/utils/mdLite';
 
+/** F3: card-like onboarding suggestions — click prefills the composer draft
+ * (no auto-send); text is the prompt the agent performs best. */
+const SUGGESTIONS = [
+  {
+    icon: barChartOutline,
+    text: 'Draft a spending dashboard for this month',
+    title: 'Draft a spending dashboard',
+    hint: 'Turns this month’s finance ledger into a live dashboard card.'
+  },
+  {
+    icon: beakerOutline,
+    text: 'Send a test notification',
+    title: 'Send a test notification',
+    hint: 'Fire sample macOS notifications to verify the flow end to end.'
+  },
+  {
+    icon: listOutline,
+    text: 'Summarize this week\'s event log',
+    title: 'Summarize this week\'s event log',
+    hint: 'A plain-language digest of the last 7 days of events.'
+  }
+] as const;
+
 const state = ref<ChatState>(initialChatState());
-const draft = ref('');
 const loadError = ref<string | null>(null);
 const lastMessage = ref<string | null>(null);
 const expandedChips = reactive(new Set<string>());
-/** C7: tool-activity panel open state per session (component-only memory). */
-const toolsOpenBySession = reactive(new Map<string | null, boolean>());
-/** Default: visible inline while the list is small, collapsed past this size. */
-const TOOL_PANEL_INLINE_MAX = 6;
+/** F1: per-turn tool-activity groups — collapsed by default; the turn's
+ * count label toggles it. Expanded state is component-only memory. */
+const expandedGroups = reactive(new Set<string>());
+/** F2: transient per-bubble "copied" state (icon swaps to a checkmark). */
+const copiedBubbles = reactive(new Set<string>());
 const railOpen = ref(true);
 const reloadKey = ref(0);
 const copiedRecently = ref(false);
 const transcriptEl = ref<HTMLElement | null>(null);
+const composerEl = ref<{ $el?: HTMLElement } | null>(null);
 
-const canSend = computed(() => !state.value.pending && draft.value.trim() !== '');
+const router = useRouter();
 
-/** C7: open state for the current session — manual toggle wins, otherwise
- * "closed by default only past the inline cap". */
-const toolsOpen = computed(() => {
-  const manual = toolsOpenBySession.get(state.value.sessionId);
-  if (manual !== undefined) return manual;
-  return state.value.chips.length <= TOOL_PANEL_INLINE_MAX;
-});
-
-function toggleTools(): void {
-  toolsOpenBySession.set(state.value.sessionId, !toolsOpen.value);
-}
+const canSend = computed(() => !state.value.pending && state.value.draft.trim() !== '');
 
 function dispatch(event: ChatEvent): void {
   state.value = reduceChat(state.value, event);
@@ -260,9 +320,9 @@ watch(
   }
 );
 
-// Auto-scroll transcript internally when new messages arrive or pending state toggles
+// Auto-scroll transcript internally when new items arrive or pending state toggles
 watch(
-  [() => state.value.messages.length, () => state.value.pending, () => state.value.sessionId],
+  [() => state.value.items.length, () => state.value.pending, () => state.value.sessionId],
   async () => {
     await nextTick();
     if (transcriptEl.value) {
@@ -328,9 +388,33 @@ function toggleChip(chipId: string): void {
   }
 }
 
-function suggest(text: string): void {
-  draft.value = text;
-  void send();
+function toggleGroup(groupId: string): void {
+  if (expandedGroups.has(groupId)) {
+    expandedGroups.delete(groupId);
+  } else {
+    expandedGroups.add(groupId);
+  }
+}
+
+/** F3: prefill (not send) the composer draft from a suggestion and focus it. */
+function prefill(text: string): void {
+  dispatch({ type: 'prefill', text });
+  void focusComposer();
+}
+
+async function focusComposer(): Promise<void> {
+  await nextTick();
+  const host = composerEl.value?.$el as (HTMLElement & { setFocus?: (opts?: { focusDelay?: number }) => void }) | undefined;
+  if (host && typeof host.setFocus === 'function') {
+    host.setFocus();
+  }
+}
+
+/** Composer keystrokes keep the VM draft in sync (send-on-enter stays view-side). */
+type IonValueEvent = CustomEvent<{ value?: string | null }>;
+
+function onDraftInput(event: IonValueEvent): void {
+  dispatch({ type: 'draft-changed', text: String(event.detail?.value ?? '') });
 }
 
 function onComposerKeydown(event: KeyboardEvent): void {
@@ -357,10 +441,22 @@ async function copyArtifactLink(): Promise<void> {
   }
 }
 
+/** F2: copy the bubble's plain text (not the rendered markdown markup). */
+async function copyBubble(bubble: ChatBubble): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(bubble.text);
+    copiedBubbles.add(bubble.id);
+    setTimeout(() => {
+      copiedBubbles.delete(bubble.id);
+    }, 2000);
+  } catch {
+    // clipboard write failure swallowed
+  }
+}
+
 async function send(): Promise<void> {
-  const message = draft.value.trim();
+  const message = state.value.draft.trim();
   if (!message || state.value.pending) return;
-  draft.value = '';
   lastMessage.value = message;
   dispatch({ type: 'send', message });
   try {
@@ -386,10 +482,45 @@ function retryLast(): void {
   if (lastMessage.value === null) return;
   loadError.value = null;
   dispatch({ type: 'error-cleared' });
-  draft.value = lastMessage.value;
+  prefill(lastMessage.value);
 }
 
-onMounted(() => void loadSessions(true));
+/** F5: light 5s health poll — the chat flow itself polls turns only, so a
+ * tiny local poll (usePolling) feeds the header dot without coupling to the
+ * Status view's pollers. */
+async function pollHealthTick(): Promise<void> {
+  try {
+    const health = await notifyClient.getHealth();
+    daemonTone.value = health && health.ok ? 'running' : 'stopped';
+  } catch {
+    daemonTone.value = 'stopped';
+  }
+}
+
+const daemonPoller = usePolling(pollHealthTick, { intervalMs: 5000 });
+
+const daemonTone = ref<'running' | 'stopped' | 'unknown'>('unknown');
+
+const daemonDotTitle = computed(() =>
+  daemonTone.value === 'running'
+    ? 'Notification daemon running'
+    : daemonTone.value === 'stopped'
+      ? 'Notification daemon stopped'
+      : 'Notification daemon status unknown'
+);
+
+function goStatus(): void {
+  void router.push('/dashboard');
+}
+
+onMounted(() => {
+  void loadSessions(true);
+  daemonPoller.start();
+});
+
+onUnmounted(() => {
+  daemonPoller.stop();
+});
 </script>
 
 <style scoped>
@@ -406,6 +537,37 @@ onMounted(() => void loadSessions(true));
   align-items: center;
   gap: var(--nb-space-2);
   margin-inline-end: var(--nb-space-2);
+}
+
+/* F5: title row — live daemon dot sits before the "Chat" label, dot tone
+   classes color the state (green/red/gray) */
+.nb-chat-title .nb-title-row {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nb-space-2);
+}
+
+.nb-daemon-dot {
+  width: 9px;
+  height: 9px;
+  flex: none;
+  padding: 0;
+  border: none;
+  border-radius: var(--nb-radius-full);
+  cursor: pointer;
+  background: var(--nb-text-muted);
+}
+
+.nb-dot-running {
+  background: var(--nb-green);
+}
+
+.nb-dot-stopped {
+  background: var(--nb-danger);
+}
+
+.nb-dot-unknown {
+  background: var(--nb-text-muted);
 }
 
 /* C1: quiet secondary header button — must not out-shout the primary flow.
@@ -562,12 +724,122 @@ onMounted(() => void loadSessions(true));
   border-radius: var(--nb-radius-sm);
 }
 
+/* F2: bubble meta row — right-aligned micro timestamp + hover copy icon
+   (opacity 0→1 on hover and on keyboard focus-within) */
+.nb-bubble-meta {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: var(--nb-space-1);
+  margin-top: 2px; /* 2px micro-inner exception (chip padding precedent) */
+}
+
+.nb-bubble-time {
+  font-size: var(--nb-fs-micro);
+  line-height: 1.45;
+  color: var(--nb-text-muted);
+}
+
+.nb-bubble-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--nb-radius-sm);
+  color: var(--nb-text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.nb-bubble:hover .nb-bubble-copy,
+.nb-bubble:focus-within .nb-bubble-copy,
+.nb-bubble-copy:focus-visible {
+  opacity: 1;
+}
+
+.nb-bubble-copy:hover {
+  color: var(--nb-text-primary);
+}
+
+/* F1: per-turn tool-activity group (assistant-side region) */
+.nb-turn-tools {
+  align-self: flex-start;
+  max-width: 82%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-space-1);
+}
+
+.nb-turn-tools-head {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nb-space-1);
+  width: max-content;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--nb-text-muted);
+}
+
+.nb-turn-tools-label {
+  font-size: var(--nb-fs-micro);
+}
+
+.nb-turn-tools-head ion-icon {
+  font-size: 12px;
+  color: var(--nb-text-muted);
+}
+
+/* F6: CSS-only typing dots for the pending bubble */
 .nb-pending-bubble {
   display: flex;
   align-items: center;
   gap: var(--nb-space-2);
   font-size: var(--nb-fs-secondary);
   color: var(--nb-text-secondary);
+}
+
+.nb-typing {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.nb-typing i {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--nb-radius-full);
+  background: var(--nb-text-secondary);
+  animation: nb-typing-pulse 1.2s ease-in-out infinite;
+}
+
+.nb-typing i:nth-child(2) {
+  animation-delay: 150ms;
+}
+
+.nb-typing i:nth-child(3) {
+  animation-delay: 300ms;
+}
+
+@keyframes nb-typing-pulse {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.35;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
 }
 
 .nb-onboarding {
@@ -604,56 +876,65 @@ onMounted(() => void loadSessions(true));
   width: 100%;
 }
 
-.nb-suggestion-chip {
-  justify-content: center;
-  cursor: pointer;
-  border-color: var(--nb-border-default);
-  font-size: var(--nb-fs-secondary);
-  color: var(--nb-text-primary);
-  margin: 0;
-  padding: var(--nb-space-2) var(--nb-space-3);
-  border-radius: var(--nb-radius-md);
-}
-
-.nb-suggestion-chip:hover {
-  background: var(--nb-bg-hover);
-  border-color: var(--nb-teal);
-}
-
-/* C7: collapsible tool-activity section — hairline divider above the composer */
-.nb-tool-section {
-  border-top: 1px solid var(--nb-border-default);
-  margin-top: var(--nb-space-2);
-  padding: var(--nb-space-2) 0;
-  flex-shrink: 0;
-}
-
-.nb-tool-section-head {
+/* F3: card-like suggestions — icon left, title + one-line hint right */
+.nb-suggestion-card {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  align-items: flex-start;
+  gap: var(--nb-space-3);
   width: 100%;
-  margin: 0;
-  padding: var(--nb-space-1) var(--nb-space-1) var(--nb-space-2);
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  color: var(--nb-text-secondary);
+  text-align: left;
+  background: var(--ion-card-background);
+  border: 1px solid var(--nb-border-default);
+  border-radius: var(--nb-radius-md);
+  padding: var(--nb-space-3);
+  color: var(--nb-text-primary);
   font: inherit;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
 }
 
-.nb-tool-section-label {
+.nb-suggestion-card:hover {
+  background: var(--nb-bg-hover);
+  border-color: var(--nb-border-strong);
+}
+
+.nb-suggestion-card:focus-visible {
+  outline: 2px solid var(--nb-teal);
+  outline-offset: 2px;
+}
+
+.nb-suggestion-card ion-icon {
+  flex: none;
+  font-size: 20px;
+  margin-top: 1px;
+  color: var(--nb-teal-light);
+}
+
+.nb-suggestion-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px; /* title/hint micro-gap */
+  min-width: 0;
+}
+
+.nb-suggestion-title {
   font-size: var(--nb-fs-secondary);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  font-weight: 600;
 }
 
-.nb-tool-section-head ion-icon {
-  font-size: 14px;
+.nb-suggestion-hint {
+  font-size: var(--nb-fs-micro);
   color: var(--nb-text-secondary);
+  line-height: 1.45;
 }
 
-/* C2: compact inline chips — one wrapping flex row, tight gap */
+.nb-onboarding-tags {
+  margin: var(--nb-space-3) 0 0;
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-muted);
+}
+
+/* compact inline chips (C2) — one wrapping flex row, tight gap */
 .nb-tool-activity {
   display: flex;
   flex-direction: row;
@@ -712,7 +993,7 @@ onMounted(() => void loadSessions(true));
   color: var(--nb-text-secondary);
 }
 
-/* C3: one bordered composer group — textarea + Send bottom-right inside it */
+/* C3: one bordered composer group — textarea + hint/send foot inside it */
 .nb-composer {
   flex-shrink: 0;
   margin-top: var(--nb-space-2);
@@ -725,11 +1006,13 @@ onMounted(() => void loadSessions(true));
   border-radius: var(--nb-radius-md);
   background: var(--nb-bg-elevated);
   padding: var(--nb-space-2) var(--nb-space-2) var(--nb-space-1);
-  transition: border-color 120ms ease;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 
+/* F4b: focus-visible ring on the container — border-strong + subtle outer glow */
 .nb-composer-surface:focus-within {
-  border-color: var(--nb-teal);
+  border-color: var(--nb-border-strong);
+  box-shadow: 0 0 0 3px var(--nb-teal-muted);
 }
 
 .nb-composer-input {
@@ -741,10 +1024,23 @@ onMounted(() => void loadSessions(true));
   font-size: var(--nb-fs-body);
 }
 
-.nb-composer-send {
+/* F4a: keyboard hint bottom-left + Send bottom-right inside one foot row */
+.nb-composer-foot {
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
   align-items: center;
+  gap: var(--nb-space-2);
+}
+
+.nb-composer-hint {
+  padding-inline-start: var(--nb-space-2);
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-muted);
+}
+
+/* F4c: Send brightness — 40% until the draft is non-empty */
+.nb-composer-foot ion-button[disabled] {
+  opacity: 0.4;
 }
 
 .nb-chat-rail {

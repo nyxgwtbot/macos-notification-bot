@@ -18,6 +18,9 @@ export interface ChatBubble {
   id: string;
   role: 'user' | 'assistant';
   text: string;
+  /** ISO timestamp of the message (server ts on transcript reload, arrival
+   * time for live turns); null when unknowable. Rendered HH:MM. */
+  ts: string | null;
 }
 
 export interface ChatToolChip {
@@ -28,9 +31,18 @@ export interface ChatToolChip {
   preview: string;
 }
 
+/** One transcript entry in display order. A turn's tool steps are interleaved
+ * as a single collapsible group directly under that turn's user bubble and
+ * before its assistant reply (kind: 'tools'). */
+export type ChatTranscriptItem =
+  | ({ kind: 'bubble' } & ChatBubble)
+  | ({ kind: 'tools'; id: string; chips: ChatToolChip[] });
+
 export interface ChatState {
-  messages: ChatBubble[];
-  chips: ChatToolChip[];
+  /** Interleaved transcript: bubbles + per-turn tool groups in display order. */
+  items: ChatTranscriptItem[];
+  /** Composer draft owned by the VM so prefill/send/locked states are pure. */
+  draft: string;
   artifactUrl: string | null;
   pending: boolean;
   error: string | null;
@@ -40,6 +52,10 @@ export interface ChatState {
 
 export type ChatEvent =
   | { type: 'send'; message: string }
+  /** Suggestion click / retry: fill the draft, focus is a view concern. */
+  | { type: 'prefill'; text: string }
+  /** Composer keystrokes (keeps send-on-enter semantics view-side). */
+  | { type: 'draft-changed'; text: string }
   | { type: 'turn-succeeded'; response: AgentTurnResponse }
   | { type: 'turn-failed'; error: string }
   | { type: 'error-cleared' }
@@ -52,8 +68,8 @@ export type ChatEvent =
 
 export function initialChatState(): ChatState {
   return {
-    messages: [],
-    chips: [],
+    items: [],
+    draft: '',
     artifactUrl: null,
     pending: false,
     error: null,
@@ -87,8 +103,22 @@ function nextId(prefix: string): string {
   return `${prefix}-seq-${seqCounter}`;
 }
 
-export function toBubble(role: 'user' | 'assistant', text: string): ChatBubble {
-  return { id: nextId('bubble'), role, text };
+/** Arrival-time ISO timestamp for bubbles created from live events. */
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+export function toBubble(role: 'user' | 'assistant', text: string, ts: string | null = null): ChatBubble {
+  return { id: nextId('bubble'), role, text, ts };
+}
+
+/** ISO timestamp -> local wall clock 'HH:MM' (empty when unparsable). */
+export function formatBubbleTime(ts: string | null | undefined): string {
+  if (!ts) return '';
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return '';
+  const two = (n: number) => String(n).padStart(2, '0');
+  return `${two(date.getHours())}:${two(date.getMinutes())}`;
 }
 
 /** Pretty-printed preview of one tool step: result JSON on success, error
@@ -113,27 +143,60 @@ export function toToolChip(step: AgentTurnStep, index: number): ChatToolChip {
   return { id: `chip-${step.ts}-${index}`, tool: step.tool, ok, preview };
 }
 
-/** Rebuild bubbles/chips/artifact from a persisted session transcript. */
-export function chipsFromRecords(records: AgentRecord[]): ChatToolChip[] {
-  const chips: ChatToolChip[] = [];
+/** One collapsible tool-activity group for a turn's steps, ids scoped to the
+ * group so they stay unique across turns. */
+function toolsItemFromSteps(steps: AgentTurnStep[]): ChatTranscriptItem {
+  const id = nextId('tools');
+  return {
+    kind: 'tools',
+    id,
+    chips: steps.map((step, index) => ({ ...toToolChip(step, index), id: `${id}-${index}` })),
+  };
+}
+
+/** Rebuild the interleaved transcript (bubbles + per-turn tool groups) and
+ * artifact URL from a persisted session transcript. Consecutive tool rows
+ * form the group of the turn whose user message precedes them; any answer /
+ * content row closes the group. */
+export function transcriptFromRecords(records: AgentRecord[]): { items: ChatTranscriptItem[]; artifactUrl: string | null } {
+  const items: ChatTranscriptItem[] = [];
+  let artifactUrl: string | null = null;
+  let toolRun: AgentTurnStep[] | null = null;
+
+  const flushTools = (): void => {
+    if (toolRun === null) return;
+    if (toolRun.length > 0) items.push(toolsItemFromSteps(toolRun));
+    toolRun = null;
+  };
+
   records.forEach((record) => {
-    if (record.role === 'assistant' && typeof record.tool === 'string') {
-      chips.push(
-        toToolChip(
-          {
-            role: 'assistant',
-            tool: record.tool,
-            args: record.args,
-            result: record.result,
-            error: record.error,
-            ts: record.ts,
-          },
-          chips.length
-        )
-      );
+    if (record.role === 'user') {
+      flushTools();
+      items.push({ kind: 'bubble', ...toBubble('user', String(record.content ?? ''), record.ts) });
+    } else if (record.role === 'assistant' && typeof record.tool === 'string') {
+      (toolRun ??= []).push({
+        role: 'assistant',
+        tool: record.tool,
+        args: record.args,
+        result: record.result,
+        error: record.error,
+        ts: record.ts,
+      });
+    } else if (record.role === 'assistant' && typeof record.answer === 'string') {
+      flushTools();
+      items.push({ kind: 'bubble', ...toBubble('assistant', record.answer, record.ts) });
+      const url = iframeUrlFrom(record.urls ?? []);
+      if (url) artifactUrl = url;
+    } else if (record.role === 'assistant' && typeof record.content === 'string') {
+      // legacy/loop-internal records without a tool or answer payload
+      flushTools();
+      items.push({ kind: 'bubble', ...toBubble('assistant', record.content, record.ts) });
+    } else {
+      flushTools();
     }
   });
-  return chips;
+  flushTools();
+  return { items, artifactUrl };
 }
 
 export function reduceChat(state: ChatState, event: ChatEvent): ChatState {
@@ -141,18 +204,29 @@ export function reduceChat(state: ChatState, event: ChatEvent): ChatState {
     case 'send':
       return {
         ...state,
-        messages: [...state.messages, toBubble('user', event.message)],
+        items: [...state.items, { kind: 'bubble', ...toBubble('user', event.message, nowIso()) }],
+        draft: '',
         pending: true,
         error: null,
       };
+    case 'prefill':
+      return { ...state, draft: event.text };
+    case 'draft-changed':
+      return { ...state, draft: event.text };
     case 'turn-succeeded': {
       const response = event.response;
       const newUrl = iframeUrlFrom(response?.urls);
+      const items: ChatTranscriptItem[] = [...state.items];
+      // F1: the turn's tool steps land as one group under this turn's user
+      // bubble, before its assistant reply (both are appended in order).
+      if (response.turn && response.turn.length > 0) {
+        items.push(toolsItemFromSteps(response.turn));
+      }
+      items.push({ kind: 'bubble', ...toBubble('assistant', response.answer, nowIso()) });
       return {
         ...state,
         sessionId: response.session_id,
-        messages: [...state.messages, toBubble('assistant', response.answer)],
-        chips: [...state.chips, ...response.turn.map((step, index) => toToolChip(step, index))],
+        items,
         artifactUrl: newUrl ?? state.artifactUrl,
         pending: false,
         error: null,
@@ -174,24 +248,10 @@ export function reduceChat(state: ChatState, event: ChatEvent): ChatState {
     case 'session-loaded': {
       // Guard against a stale transcript arriving after the user switched.
       if (state.sessionId !== event.sessionId) return state;
-      const messages: ChatBubble[] = [];
-      let artifactUrl = state.artifactUrl;
-      event.records.forEach((record) => {
-        if (record.role === 'user') {
-          messages.push(toBubble('user', String(record.content ?? '')));
-        } else if (record.role === 'assistant' && typeof record.answer === 'string') {
-          messages.push(toBubble('assistant', record.answer));
-          const url = iframeUrlFrom(record.urls ?? []);
-          if (url) artifactUrl = url;
-        } else if (record.role === 'assistant' && typeof record.content === 'string') {
-          // legacy/loop-internal records without a tool or answer payload
-          messages.push(toBubble('assistant', record.content));
-        }
-      });
+      const { items, artifactUrl } = transcriptFromRecords(event.records);
       return {
         ...state,
-        messages,
-        chips: chipsFromRecords(event.records),
+        items,
         artifactUrl,
         pending: false,
         error: null,
