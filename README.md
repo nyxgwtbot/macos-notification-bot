@@ -713,6 +713,13 @@ The loop auto-serves after `dashboard.create` (it executes `server.serve` itself
 synthesizes the PT-BR answer when the model drifts), date-grounds the prompt header
 with a build-time `Current local date:` line, and retries transient Ollama transport
 errors (2 extra attempts, 2 s linear backoff).
+Session-context hardening: prior assistant answers longer than ~240 chars are
+truncated in the outgoing model context only (first ~200 chars plus
+`…[answer truncated N chars in context]`; the full answer stays in the session file
+and the UI), and any turn on a session with prior history carries one standing
+system line — `Reminder: respond with exactly ONE JSON object …` — from the first
+model call onward; known limitation: with the current small model, occasional
+free-form drift still lands on the clean PT-BR guard answer (the accepted UX for v1).
 Sessions persist append-only under `<config_dir>/data/agent_sessions/<id>.jsonl`;
 ids match `^[A-Za-z0-9-]{1,64}$`.
 
@@ -746,7 +753,10 @@ inject their own `llm_fn` transcripts instead (`tests/test_agent.py`);
 
 > If something else owns port 4770 when `server.serve` runs, the tool fails with a
 > clear error ("artifacts port 4770 busy — close the other process"); there is no
-> auto-increment by design.
+> auto-increment by design. The API smoke sandbox resolves its own artifacts port
+> (4770 when free, else the documented test-only `NOTIFYBOT_ARTIFACTS_PORT`
+> override picks a free 4771–4780), so it stays runnable next to a live bot;
+> production itself never moves off 4770.
 
 ## Project layout
 

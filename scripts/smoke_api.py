@@ -34,9 +34,13 @@ if REPO_ROOT not in sys.path:
 
 from notifybot.finance import FinanceLedger
 from notifybot.report import validate_month  # noqa: F401  (contract reference)
+from notifybot.agent_tools import ARTIFACTS_PORT, artifacts_port_from_env
 
-# 4770 reserved for the artifacts sub-service (server.serve) — the API smoke
-# must never occupy the port it is about to exercise.
+# The API port must stay OUTSIDE the artifacts range: the artifacts
+# sub-service binds 4770 in production (fixed constant, no auto-increment by
+# design), so the API smoke prefers 4789. When the artifacts port itself is
+# owned (e.g. a live bot), the sandbox falls back to the documented TEST-ONLY
+# NOTIFYBOT_ARTIFACTS_PORT override (see pick_artifacts_port below).
 PREFERRED_PORT = 4789
 HEALTH_TIMEOUT_S = 20.0
 
@@ -45,6 +49,32 @@ def print_check(name: str, passed: bool, evidence: str) -> bool:
     """Emit ``[PASSED/FAILED] <name> — <evidence>`` (smoke_e2e style)."""
     print("[%s] %s \u2014 %s" % ("PASSED" if passed else "FAILED", name, evidence))
     return passed
+
+
+def can_bind(port: int) -> bool:
+    """True when nothing owns 127.0.0.1:<port> right now."""
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def pick_artifacts_port() -> int:
+    """Artifacts port for the smoke sandbox: the production default 4770 when
+    bindable (or an explicit env override), else the first free 4771..4780 via
+    the documented test-only NOTIFYBOT_ARTIFACTS_PORT override. Production
+    itself never moves off 4770."""
+    preferred = artifacts_port_from_env()
+    if preferred != ARTIFACTS_PORT or can_bind(preferred):
+        return preferred
+    for candidate in range(ARTIFACTS_PORT + 1, ARTIFACTS_PORT + 11):
+        if can_bind(candidate):
+            return candidate
+    raise RuntimeError(
+        f"nenhuma porta livre para artifacts entre {ARTIFACTS_PORT + 1} e {ARTIFACTS_PORT + 10}"
+    )
 
 
 def free_port(preferred: int = PREFERRED_PORT) -> int:
@@ -162,6 +192,10 @@ def main() -> int:
         agent_mock = os.environ.get("NOTIFYBOT_SMOKE_AGENT_MOCK", "") == "1"
         if agent_mock:
             env["NOTIFYBOT_SMOKE_AGENT_MOCK"] = "1"
+        # Artifacts port resolution for the sandbox (default 4770 when free;
+        # documented test-only override otherwise). Production keeps 4770.
+        artifacts_port = pick_artifacts_port()
+        env["NOTIFYBOT_ARTIFACTS_PORT"] = str(artifacts_port)
         proc = subprocess.Popen(
             [sys.executable, "bot.py", "api", "--config", config_path, "--port", str(port)],
             cwd=REPO_ROOT,
@@ -287,14 +321,23 @@ def main() -> int:
             # forwards to the server subprocess; never talks to a live Ollama).
             if agent_mock:
                 status, body = api_request(base, "POST", "/api/agent/turn", {"message": "dashboard, por favor"})
-                url = (body or {}).get("urls", [None])[0] if status == 200 and body else None
+                urls = (body or {}).get("urls") or []
+                url = urls[0] if (status == 200 and body and urls) else None
                 turn_ok = (
                     status == 200 and bool(body) and bool(body.get("answer"))
                     and url is not None
-                    and re.match(r"^http://127\.0\.0\.1:4770/[0-9a-f]{32}\.html$", url) is not None
+                    and re.match(
+                        "^http://127\\.0\\.0\\.1:" + str(artifacts_port) + "/[0-9a-f]{32}\\.html$",
+                        url,
+                    )
+                    is not None
                 )
-                all_ok &= print_check("agent turn pipeline", turn_ok,
-                                      f"status={status} answer={(body or {}).get('answer', '')[:60]!r} urls={url}")
+                all_ok &= print_check(
+                    "agent turn pipeline",
+                    turn_ok,
+                    f"artifacts_port={artifacts_port} status={status} "
+                    f"answer={(body or {}).get('answer', '')[:60]!r} urls={urls}",
+                )
 
                 if turn_ok:
                     session_id = body["session_id"]
@@ -308,7 +351,7 @@ def main() -> int:
                     artifacts_row = (services or {}).get("services", {}).get("artifacts", {})
                     all_ok &= print_check("agent services row", status == 200
                                           and artifacts_row.get("running") is True
-                                          and artifacts_row.get("port") == 4770
+                                          and artifacts_row.get("port") == artifacts_port
                                           and bool(artifacts_row.get("root")) and bool(artifacts_row.get("since")),
                                           str(artifacts_row))
 

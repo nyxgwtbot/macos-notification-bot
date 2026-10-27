@@ -26,8 +26,11 @@ from notifybot.agent import (
     AUTO_COMPLETE_PHASE,
     AUTO_SERVE_PHASE,
     AgentSessionStore,
+    PRIOR_ANSWER_INLINE_MAX_CHARS,
+    PRIOR_ANSWER_KEPT_CHARS,
     RAW_MODEL_OUTPUT_MAX_BYTES,
     REMINDER_PREFIX,
+    STANDING_PROTOCOL_REMINDER,
     build_context,
     continuation_reminder_for,
     current_date_ground,
@@ -37,6 +40,7 @@ from notifybot.agent import (
     run_turn,
     summarize_tool_args,
     synthesize_dashboard_answer,
+    truncate_prior_answer_text,
     truncate_raw_model_output,
     truncate_tool_result_text,
 )
@@ -1013,6 +1017,228 @@ class TestContextWindowAndTruncation(unittest.TestCase):
         self.assertIn("persisted in the session file", trimmed)
         # untouched when small
         self.assertEqual(truncate_tool_result_text('{"ok": true}'), '{"ok": true}')
+
+
+# ---- round 3: session-context hardening ------------------------------------------
+
+
+class TestSessionContextHardening(unittest.TestCase):
+    """Round 3 hardening (session f1b57e96 evidence: the prior turn's long
+    assistant answer echoed into the context made the NEXT fresh ask drift out
+    of protocol on its first model turn).
+
+    (a) prior answers longer than ~240 chars truncate in the model CONTEXT
+        only (first ~200 chars + ``…[answer truncated N chars in context]``) —
+        the full text stays in the session jsonl on disk and the UI;
+    (b) turns on a session with prior history carry ONE standing protocol
+        reminder line in the system prompt (every prompt of the turn);
+    (c) the happy path (full dashboard turn + a second simple turn on the
+        same session) still completes normally;
+    (d) the double-drift guard is unchanged on continuing sessions.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runtime = make_runtime(self.tmp.name)
+        self.addCleanup(self.runtime.agent_registry.stop)
+
+    # -- (a) prior-answer truncation ------------------------------------------------
+
+    def test_truncate_prior_answer_text_constants_boundary_and_marker(self):
+        short = "Dashboard pronto: http://127.0.0.1:4770/x.html."
+        self.assertEqual(truncate_prior_answer_text(short), short)
+        boundary = "b" * PRIOR_ANSWER_INLINE_MAX_CHARS  # exactly ~240: untouched
+        self.assertEqual(truncate_prior_answer_text(boundary), boundary)
+        over = "x" * (PRIOR_ANSWER_INLINE_MAX_CHARS + 1)  # 241: truncated
+        trimmed = truncate_prior_answer_text(over)
+        self.assertEqual(trimmed[:PRIOR_ANSWER_KEPT_CHARS], "x" * PRIOR_ANSWER_KEPT_CHARS)
+        self.assertIn("…[answer truncated 41 chars in context]", trimmed)
+        # Defensive non-str degradation (the loop only ever writes str answers).
+        self.assertEqual(truncate_prior_answer_text(None), "")
+        self.assertEqual(truncate_prior_answer_text(42), "42")
+
+    def test_build_context_truncates_long_answers_short_verbatim(self):
+        short_answer = "Resposta curta e ok."
+        long_answer = "HEAD-PROSE " + "q" * PRIOR_ANSWER_KEPT_CHARS + " TAIL-" + DRIFT_HTML_SENTINEL * 2
+        omitted = len(long_answer) - PRIOR_ANSWER_KEPT_CHARS
+        records = [
+            {"role": "user", "content": "um"},
+            {"role": "assistant", "answer": short_answer, "urls": []},
+            {"role": "user", "content": "dois"},
+            {"role": "assistant", "answer": long_answer, "urls": []},
+            {"role": "user", "content": "três"},
+        ]
+        dump = json.dumps(build_context("SYS", records), ensure_ascii=False)
+        self.assertIn(short_answer, dump)  # short answers stay verbatim
+        self.assertNotIn(long_answer, dump)  # the long full text is NOT re-sent
+        self.assertNotIn(DRIFT_HTML_SENTINEL, dump)  # no tail fragment either
+        self.assertLessEqual(len(long_answer[:PRIOR_ANSWER_KEPT_CHARS]), 200)
+        self.assertIn(long_answer[:PRIOR_ANSWER_KEPT_CHARS], dump)  # head survives
+        self.assertIn(f"…[answer truncated {omitted} chars in context]", dump)
+
+    def test_end_to_end_long_prior_answers_truncated_full_on_disk(self):
+        """(a) end-to-end: BOTH guard-style and successful long prior answers
+        render truncated in the very next outgoing prompt; the session jsonl
+        keeps every full answer."""
+        store = AgentSessionStore(self.runtime.config_dir)
+        session_id = store.new_session_id()
+        success_long = "S" * 260  # previous turn's successful answer
+        guard_long = "G" * 280  # a long guard-error-style answer
+        store.append(session_id, {"role": "user", "content": "primeiro pedido"})
+        store.append(session_id, {"role": "assistant", "answer": success_long, "urls": []})
+        store.append(session_id, {"role": "user", "content": "segundo pedido"})
+        store.append(session_id, {"role": "assistant", "answer": guard_long, "urls": []})
+
+        llm = ScriptedLLM([json.dumps({"answer": "terceira resposta", "urls": []})])
+        response = run_turn(self.runtime, session_id, "terceira pergunta", llm_fn=llm)
+        self.assertEqual(llm.call_count, 1)
+        self.assertEqual(response["answer"], "terceira resposta")
+
+        outgoing = json.dumps([m["content"] for m in llm.calls[0]], ensure_ascii=False)
+        self.assertIn("…[answer truncated 60 chars in context]", outgoing)
+        self.assertIn("…[answer truncated 80 chars in context]", outgoing)
+        self.assertIn("S" * PRIOR_ANSWER_KEPT_CHARS, outgoing)  # heads ARE re-sent
+        self.assertIn("G" * PRIOR_ANSWER_KEPT_CHARS, outgoing)
+        self.assertNotIn(success_long, outgoing)  # full texts never re-sent
+        self.assertNotIn(guard_long, outgoing)
+
+        # Disk keeps the FULL answers (context-only truncation; the UI reads
+        # the same records verbatim).
+        records = store.load(session_id)
+        self.assertEqual(records[1]["answer"], success_long)
+        self.assertEqual(records[3]["answer"], guard_long)
+
+    # -- (b) standing protocol reminder ---------------------------------------------
+
+    def test_standing_reminder_constant_exact_english(self):
+        self.assertEqual(
+            STANDING_PROTOCOL_REMINDER,
+            "Reminder: respond with exactly ONE JSON object \u2014 "
+            '{"tool": "\u2026", "args": {...}} or {"answer": "\u2026", "urls": [...]} \u2014 '
+            "nothing else.",
+        )
+
+    def test_standing_reminder_on_nonempty_session_only_and_once(self):
+        # Fresh session: NO standing reminder anywhere in the outgoing prompt.
+        fresh = ScriptedLLM([json.dumps({"answer": "olá, nova conversa", "urls": []})])
+        fresh_response = run_turn(self.runtime, None, "primeiro contato", llm_fn=fresh)
+        fresh_contents = [str(m.get("content", "")) for m in fresh.calls[0]]
+        self.assertEqual(sum(c.count(STANDING_PROTOCOL_REMINDER) for c in fresh_contents), 0)
+
+        # Continuing the fresh session: reminder present EXACTLY ONCE, as the
+        # last line of the system message (grounded header + template + line).
+        llm = ScriptedLLM([json.dumps({"answer": "de novo, em protocolo", "urls": []})])
+        response = run_turn(self.runtime, fresh_response["session_id"], "segunda msg", llm_fn=llm)
+        self.assertEqual(llm.call_count, 1)
+        self.assertEqual(response["answer"], "de novo, em protocolo")
+        contents = [str(m.get("content", "")) for m in llm.calls[0]]
+        self.assertEqual(sum(c.count(STANDING_PROTOCOL_REMINDER) for c in contents), 1)
+        system_message = llm.calls[0][0]
+        self.assertEqual(system_message["role"], "system")
+        self.assertTrue(system_message["content"].endswith(STANDING_PROTOCOL_REMINDER))
+        # The grounded date header and template stay intact above the line.
+        self.assertIn("Current local date: ", system_message["content"])
+        prompt_without_reminder = system_message["content"][: -len(STANDING_PROTOCOL_REMINDER)]
+        self.assertIn(load_system_prompt(), prompt_without_reminder)
+
+    def test_standing_reminder_carried_on_protocol_retry_prompt(self):
+        store = AgentSessionStore(self.runtime.config_dir)
+        session_id = store.new_session_id()
+        store.append(session_id, {"role": "user", "content": "primeiro pedido"})
+        store.append(session_id, {"role": "assistant", "answer": "curta anterior", "urls": []})
+
+        llm = ScriptedLLM(
+            ["prosa livre sem JSON", json.dumps({"answer": "agora em protocolo", "urls": []})]
+        )
+        response = run_turn(self.runtime, session_id, "tenta de novo", llm_fn=llm)
+        self.assertEqual(llm.call_count, 2)
+        self.assertEqual(response["answer"], "agora em protocolo")
+        # EVERY prompt of the turn (initial + protocol retry) carries exactly
+        # one standing reminder; the user-role retry tail stays untouched.
+        for messages in llm.calls:
+            contents = [str(m.get("content", "")) for m in messages]
+            self.assertEqual(sum(c.count(STANDING_PROTOCOL_REMINDER) for c in contents), 1)
+            self.assertEqual(contents[-1].count(STANDING_PROTOCOL_REMINDER), 0)
+
+    # -- (c) happy-path regression ---------------------------------------------------
+
+    def test_full_dashboard_turn_then_simple_turn_regression(self):
+        """(c) session-2-style conversation with the scripted LLM: the full
+        dashboard pipeline completes, and the NEXT fresh ask on the same
+        session completes in protocol too."""
+        llm = ScriptedLLM(
+            [
+                json.dumps({"tool": "app.data", "args": {"dataset": "health"}}),
+                json.dumps(
+                    {
+                        "tool": "dashboard.create",
+                        "args": {"title": "Health Dashboard", "html": DASHBOARD_HTML, "data_source": "app.data:health"},
+                    }
+                ),
+                lambda messages: json.dumps(
+                    {
+                        "answer": "Aqui está o dashboard do bot, pronto na aba Chat.",
+                        "urls": [find_last_tool_result(messages, "server.serve")["url"]],
+                    }
+                ),
+            ]
+        )
+        response = run_turn(self.runtime, None, "me mostre um dashboard, por favor", llm_fn=llm)
+        self.assertEqual(llm.call_count, 3)
+        self.assertEqual([step["tool"] for step in response["turn"]],
+                         ["app.data", "dashboard.create", "server.serve"])
+        self.assertEqual(response["turn"][2].get("phase"), AUTO_SERVE_PHASE)
+        self.assertEqual(len(response["urls"]), 1)
+        with urllib.request.urlopen(response["urls"][0], timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
+
+        # Second SIMPLE turn on the same session (the session-2 "fresh ask").
+        llm2 = ScriptedLLM([json.dumps({"answer": "Enviei as notificações de teste.", "urls": []})])
+        second = run_turn(self.runtime, response["session_id"], "envie notificações de teste", llm_fn=llm2)
+        self.assertEqual(llm2.call_count, 1)
+        self.assertEqual(second["answer"], "Enviei as notificações de teste.")
+        self.assertEqual(second["turn"], [])
+        self.assertEqual(second["session_id"], response["session_id"])
+        system_content = llm2.calls[0][0]["content"]
+        self.assertEqual(system_content.count(STANDING_PROTOCOL_REMINDER), 1)
+        self.assertTrue(system_content.endswith(STANDING_PROTOCOL_REMINDER))
+        # The prior dashboard answer is short: verbatim in context, and NO
+        # truncation marker pollution on the happy path.
+        outgoing = json.dumps([m["content"] for m in llm2.calls[0]], ensure_ascii=False)
+        self.assertNotIn("answer truncated", outgoing)
+        self.assertIn("Aqui está o dashboard do bot", outgoing)
+        # Both turns persisted in the SAME session jsonl.
+        records = AgentSessionStore(self.runtime.config_dir).load(second["session_id"])
+        self.assertEqual(records[0]["content"], "me mostre um dashboard, por favor")
+        self.assertEqual(records[-1]["answer"], second["answer"])
+
+    # -- (d) guard behavior unchanged --------------------------------------------------
+
+    def test_double_drift_guard_unchanged_on_continuing_session(self):
+        store = AgentSessionStore(self.runtime.config_dir)
+        session_id = store.new_session_id()
+        store.append(session_id, {"role": "user", "content": "primeiro pedido"})
+        store.append(session_id, {"role": "assistant", "answer": "resposta anterior", "urls": []})
+
+        llm = ScriptedLLM(["prosa numero um", "prosa numero dois"])
+        response = run_turn(self.runtime, session_id, "tenta mais uma vez", llm_fn=llm)
+        self.assertEqual(llm.call_count, 2)
+        self.assertIn("formato JSON", response["answer"])
+        self.assertIn("duas vezes", response["answer"])
+        self.assertIn("tente reformular o pedido", response["answer"])
+        self.assertEqual(response["urls"], [])
+        self.assertNotIn("phase", response)
+        # Session preserved with post-mortem raw rows; the retry prompt kept
+        # the standing reminder (non-empty history) without masking the guard.
+        records = store.load(session_id)
+        self.assertEqual([r.get("role") for r in records],
+                         ["user", "assistant", "user", "assistant_raw", "assistant_raw", "assistant"])
+        self.assertEqual([r["phase"] for r in records if r.get("role") == "assistant_raw"],
+                         ["attempt", "protocol_retry"])
+        self.assertEqual(records[-1]["answer"], response["answer"])
+        retry_contents = [str(m.get("content", "")) for m in llm.calls[1]]
+        self.assertEqual(sum(c.count(STANDING_PROTOCOL_REMINDER) for c in retry_contents), 1)
 
 
 # ---- auto serve + deterministic completion ----------------------------------------

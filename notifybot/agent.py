@@ -13,7 +13,13 @@ Context hygiene + drift guards (post-8f0ae727 fix):
   carries a targeted continuation recipe (the exact ``server.serve`` template
   with the real artifact id) instead of only the generic protocol reminder;
 - every raw model output is persisted BEFORE parsing as an ``assistant_raw``
-  row (``raw_model_output`` capped at ~8 KB) for drift post-mortems.
+  row (``raw_model_output`` capped at ~8 KB) for drift post-mortems;
+- prior assistant ANSWERS longer than ~240 chars are truncated in the model
+  CONTEXT only (first ~200 chars + ``…[answer truncated N chars in context]``);
+  the full answer stays in the session jsonl on disk and in the UI (round 3);
+- when the request continues a session that already has prior turns, EVERY
+  outgoing prompt of the turn re-states the one-JSON protocol in one standing
+  system line (``STANDING_PROTOCOL_REMINDER``) before the model's first call.
 
 Deterministic pipeline completion (post-2: the "drifted after create" class
 of failure cannot lose the delivered dashboard anymore):
@@ -79,6 +85,15 @@ RAW_MODEL_OUTPUT_MAX_BYTES = 8192
 # Tool args larger than this are REDACTED in the model context (a size marker
 # replaces the value); the full args live only in the session jsonl.
 TOOL_ARG_INLINE_MAX_CHARS = 160
+# Prior assistant ANSWERS longer than this are truncated in the model context
+# (first PRIOR_ANSWER_KEPT_CHARS kept + explicit marker); the FULL text stays
+# in the session jsonl on disk and in the UI — only the model's context
+# shrinks. Evidence (session f1b57e96, round 3): the long assistant answer of
+# the previous turn (~450+ chars of full dashboard prose echoed back) made the
+# NEXT fresh ask drift out of protocol on its very first model turn. Applies
+# to guard-error and successful answers alike.
+PRIOR_ANSWER_INLINE_MAX_CHARS = 240
+PRIOR_ANSWER_KEPT_CHARS = 200
 
 # Deterministic completion phases (additive session-record fields):
 # - ``auto_serve`` marks the loop-executed server.serve step (no model call,
@@ -133,6 +148,17 @@ FINALIZE_CONTINUATION_TEMPLATE = (
     "any tool again. Reply NOW with EXACTLY ONE JSON object \u2014 no prose, no markdown "
     "fences \u2014 in the final answer shape:\n"
     '{"answer": "<short pt-br text saying the dashboard is ready>", "urls": ["{serve_url}"]}'
+)
+
+# Standing protocol reminder (session-2 drift fix, round 3): when the request
+# continues a session that already has prior turns, every outgoing prompt of
+# the turn carries this ONE extra system line — heavy prior history (tool rows
+# + a long answer) makes the small model drift back into free-form prose, so
+# the contract is re-stated before each model call of the turn.
+STANDING_PROTOCOL_REMINDER = (
+    "Reminder: respond with exactly ONE JSON object \u2014 "
+    '{"tool": "\u2026", "args": {...}} or {"answer": "\u2026", "urls": [...]} \u2014 '
+    "nothing else."
 )
 
 _TRUNCATED_MARKER = (
@@ -350,6 +376,23 @@ def truncate_raw_model_output(text: str, budget: int = RAW_MODEL_OUTPUT_MAX_BYTE
     return piece + marker
 
 
+_ANSWER_TRUNCATED_MARKER = "…[answer truncated {omitted} chars in context]"
+
+
+def truncate_prior_answer_text(text: Any) -> str:
+    """Context-only truncation of a PRIOR assistant answer (round 3): answers
+    longer than ~240 chars are reduced to their first ~200 chars plus an
+    explicit marker; the FULL answer remains in the session jsonl on disk and
+    in the UI. Short answers pass through verbatim; non-str values degrade to
+    ""/str defensively (the loop itself only ever writes str answers)."""
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    if len(text) <= PRIOR_ANSWER_INLINE_MAX_CHARS:
+        return text
+    omitted = len(text) - PRIOR_ANSWER_KEPT_CHARS
+    return text[:PRIOR_ANSWER_KEPT_CHARS] + _ANSWER_TRUNCATED_MARKER.format(omitted=omitted)
+
+
 def _stored_arg_marker(key: str, size: int) -> str:
     return f"<{key}: {size} bytes stored in the session file, not re-sent>"
 
@@ -474,11 +517,17 @@ def build_context(
         if role == "user":
             rendered.append({"role": "user", "content": str(record.get("content", ""))})
         elif role == "assistant" and "answer" in record:
+            # Context hygiene (round 3): PRIOR answers (guard errors and
+            # successes alike) render with the answer text truncated when
+            # long — the full text lives only in the session jsonl/UI.
             rendered.append(
                 {
                     "role": "assistant",
                     "content": json.dumps(
-                        {"answer": record.get("answer", ""), "urls": record.get("urls", [])},
+                        {
+                            "answer": truncate_prior_answer_text(record.get("answer", "")),
+                            "urls": record.get("urls", []),
+                        },
                         ensure_ascii=False,
                     ),
                 }
@@ -810,12 +859,20 @@ def run_turn(
         session_id = store.new_session_id()
         records = []
 
+    # Standing reminder decision point (round 3): "non-empty history" means
+    # this request CONTINUES a session with prior turns — records exist
+    # BEFORE this turn's user message is appended below. Fresh sessions keep
+    # the plain grounded prompt.
+    had_prior_history = len(records) > 0
+
     user_record = {"role": "user", "content": message}
     store.append(session_id, user_record)
     records.append(user_record)
 
     resolve_llm = llm_fn if llm_fn is not None else default_llm_fn(runtime)
     system_prompt = grounded_system_prompt()
+    if had_prior_history:
+        system_prompt = system_prompt + "\n" + STANDING_PROTOCOL_REMINDER
     registry = _tool_registry_for(runtime)
 
     started = time.monotonic()
