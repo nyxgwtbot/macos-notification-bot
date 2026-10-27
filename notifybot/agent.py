@@ -15,26 +15,45 @@ Context hygiene + drift guards (post-8f0ae727 fix):
 - every raw model output is persisted BEFORE parsing as an ``assistant_raw``
   row (``raw_model_output`` capped at ~8 KB) for drift post-mortems.
 
+Deterministic pipeline completion (post-2: the "drifted after create" class
+of failure cannot lose the delivered dashboard anymore):
+
+- the system prompt is date-grounded (``Current local date:`` line computed
+  at build time) so "este mês" style requests stop hitting wrong months;
+- when a model-driven ``dashboard.create`` succeeds, the LOOP itself
+  deterministically executes ``server.serve {action: ensure}`` (appended as a
+  ``auto_serve`` step WITHOUT a model call and WITHOUT consuming a
+  MAX_TOOL_TURNS slot) and re-prompts the model for ONLY the final answer;
+- when a completed create+serve pair exists and the model then drifts/fails
+  to produce the answer (guard paths), the loop synthesizes the final PT-BR
+  answer from the tool results (``synthesize_dashboard_answer``) and marks
+  the answer record ``auto_complete`` — the user-facing pipeline completes.
+
 LLM injection: ``run_turn(runtime, session_id, message, llm_fn=None)``.
 ``llm_fn(messages) -> str`` — an exception raised by ``llm_fn`` is converted
 into a graceful PT-BR error answer (the caller keeps HTTP 200; the loop
-itself never turns an LLM failure into a 500).
+itself never turns an LLM failure into a 500). The production Ollama path
+(``_ollama_chat``) retries TRANSIENT transport failures (URLError, 5xx
+HTTPError, socket/TimeoutError) 2 extra attempts with 2 s linear backoff
+before giving up; per-attempt timeout stays ``config.ollama.timeout``.
 
 Mock hook: when the env var ``NOTIFYBOT_SMOKE_AGENT_MOCK=1`` is set,
 ``default_llm_fn`` selects a deterministic scripted mock LLM that walks the
-full dashboard pipeline (app.data -> dashboard.create -> server.serve ->
-answer with urls) for any "dashboard" request and uses ``notify.test`` for
-"test notification" requests. This is a TEST/SMOKE-ONLY hook: unit tests
-inject their own ``llm_fn`` transcript stubs; the API smoke
-(``scripts/smoke_api.py``) uses the env hook to exercise the server-side
-pipeline without a live Ollama model.
+full dashboard pipeline (app.data -> dashboard.create -> the loop's
+auto-executed server.serve -> answer with urls) for any "dashboard" request
+and uses ``notify.test`` for "test notification" requests. This is a
+TEST/SMOKE-ONLY hook: unit tests inject their own ``llm_fn`` transcript
+stubs; the API smoke (``scripts/smoke_api.py``) uses the env hook to
+exercise the server-side pipeline without a live Ollama model.
 """
 
 import json
 import logging
 import os
 import re
+import socket
 import time
+import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
@@ -61,6 +80,22 @@ RAW_MODEL_OUTPUT_MAX_BYTES = 8192
 # replaces the value); the full args live only in the session jsonl.
 TOOL_ARG_INLINE_MAX_CHARS = 160
 
+# Deterministic completion phases (additive session-record fields):
+# - ``auto_serve`` marks the loop-executed server.serve step (no model call,
+#   no MAX_TOOL_TURNS slot) right after a model-driven dashboard.create ok;
+# - ``auto_complete`` marks a turn whose final answer was SYNTHESIZED by the
+#   loop (model drifted/failed while create+serve had already succeeded).
+AUTO_SERVE_PHASE = "auto_serve"
+AUTO_COMPLETE_PHASE = "auto_complete"
+
+# Ollama transport resilience: per agent LLM call, transient transport
+# failures (URLError / HTTPError 5xx / socket.timeout / TimeoutError) get 2
+# EXTRA attempts with a 2 s linear backoff; the per-attempt timeout stays
+# config.ollama.timeout. Non-transport failures (e.g. HTTPError 4xx) and
+# non-transport exceptions surface immediately (hard-failure guard path).
+OLLAMA_TRANSPORT_RETRIES = 2
+OLLAMA_RETRY_BACKOFF_S = 2.0
+
 PROMPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_prompt.md")
 
 REMINDER_PREFIX = "[protocol reminder] "
@@ -84,6 +119,20 @@ SERVE_CONTINUATION_TEMPLATE = (
     "After the server.serve result arrives, reply with the final answer shape:\n"
     '{"answer": "<short pt-br text>", "urls": ["<the url from the server.serve result>"]}. '
     "Never repeat dashboard.create and never call other tools before server.serve."
+)
+
+# Finalize recipe (recipe completion, post-2): after the LOOP has executed the
+# server.serve step automatically, this template (with the served URL
+# substituted) re-anchors the model for ONLY the final answer+urls — it is
+# the last model task of the turn and must not include any more tool calls.
+FINALIZE_CONTINUATION_TEMPLATE = (
+    REMINDER_PREFIX
+    + "The pipeline is ALREADY COMPLETE: dashboard.create succeeded and the "
+    "application loop has just executed the server.serve ensure step for you "
+    "(see the last tool_result above; its result carries the final URL). Do NOT call "
+    "any tool again. Reply NOW with EXACTLY ONE JSON object \u2014 no prose, no markdown "
+    "fences \u2014 in the final answer shape:\n"
+    '{"answer": "<short pt-br text saying the dashboard is ready>", "urls": ["{serve_url}"]}'
 )
 
 _TRUNCATED_MARKER = (
@@ -244,6 +293,31 @@ def load_system_prompt() -> str:
     return _PROMPT_CACHE
 
 
+_WEEKDAYS_EN = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+
+def current_date_ground(now: Optional[datetime] = None) -> str:
+    """English date-grounding line computed at prompt-build time from the
+    LOCAL clock: ``Current local date: 2026-10-27 Tuesday (2026-10).``
+
+    The template is formatted with a fixed English weekday table so the line
+    stays English regardless of the system locale. The model has no other
+    knowledge of "now" — this anchors relative-date tool args ("deste mês").
+    """
+    stamp = now if now is not None else datetime.now()
+    weekday = _WEEKDAYS_EN[stamp.weekday()]
+    return (
+        f"Current local date: {stamp.strftime('%Y-%m-%d')} {weekday} "
+        f"({stamp.strftime('%Y-%m')})."
+    )
+
+
+def grounded_system_prompt() -> str:
+    """``load_system_prompt()`` with the current date line injected in the
+    header (first line) — every LLM call sees the build-time date."""
+    return f"{current_date_ground()}\n\n{load_system_prompt()}"
+
+
 def truncate_tool_result_text(text: str, budget: int = TOOL_RESULT_MAX_BYTES) -> str:
     """Pre-truncate a stored tool result for the LLM context: tail-trimmed at
     ~4 KB with an explicit marker (the FULL result stays in the session jsonl)."""
@@ -320,11 +394,46 @@ def _artifact_id_of(result: Any) -> Optional[str]:
     return None
 
 
+def _served_url_of(result: Any) -> Optional[str]:
+    """Loopback URL when a server.serve tool result produced one, else None."""
+    if isinstance(result, dict):
+        url = result.get("url")
+        if isinstance(url, str) and url.strip():
+            return url.strip()
+    return None
+
+
+def synthesize_dashboard_answer(create_result: Any, serve_result: Any) -> dict:
+    """Pure synthesis of the final PT-BR answer for a COMPLETED dashboard
+    pipeline (create + serve both succeeded) — used when the model drifts or
+    fails to produce the final answer: the loop still delivers the artifact.
+
+    Returns ``{"answer": <pt-br>, "urls": [<served url>]}``; a missing/
+    malformed serve url degrades to ``urls: []`` with an explanatory answer.
+    """
+    url = _served_url_of(serve_result)
+    if url:
+        answer = f"Dashboard pronto: {url}. Abra na aba Chat para visualizar o painel."
+        return {"answer": answer, "urls": [url]}
+    return {
+        "answer": "O dashboard foi criado, mas não consegui obter a URL local de exibição.",
+        "urls": [],
+    }
+
+
 def continuation_reminder_for(records: List[dict]) -> Optional[str]:
-    """Targeted recipe re-anchoring: when the NEWEST meaningful record is a
-    SUCCESSFUL ``dashboard.create`` step, return the continuation recipe with
-    the real artifact id; otherwise None (the generic PROTOCOL_REMINDER path
-    stays untouched for every other state). Raw bookkeeping rows are skipped."""
+    """Targeted recipe re-anchoring, keyed on the NEWEST meaningful record
+    (``assistant_raw`` rows are skipped):
+
+    - successful model-driven ``dashboard.create`` -> the server.serve
+      continuation recipe with the real artifact id (kept as a defensive
+      fallback; in the normal loop the serve step runs automatically);
+    - successful loop-executed ``auto_serve`` step -> the finalize recipe
+      with the real served URL: the model only wraps up with answer+urls.
+
+    Otherwise None (the generic PROTOCOL_REMINDER path stays untouched for
+    every other state).
+    """
     record: Any = None
     for known_record in reversed(records):
         if isinstance(known_record, dict) and known_record.get("role") == "assistant_raw":
@@ -335,12 +444,19 @@ def continuation_reminder_for(records: List[dict]) -> Optional[str]:
         return None
     if record.get("role") != "assistant" or "tool" not in record:
         return None
-    if record.get("tool") != "dashboard.create" or record.get("error") is not None:
+    if record.get("error") is not None:
         return None
-    artifact_id = _artifact_id_of(record.get("result"))
-    if not artifact_id:
-        return None
-    return SERVE_CONTINUATION_TEMPLATE.replace("{artifact_id}", artifact_id)
+    if record.get("tool") == "dashboard.create":
+        artifact_id = _artifact_id_of(record.get("result"))
+        if not artifact_id:
+            return None
+        return SERVE_CONTINUATION_TEMPLATE.replace("{artifact_id}", artifact_id)
+    if record.get("tool") == "server.serve" and record.get("phase") == AUTO_SERVE_PHASE:
+        serve_url = _served_url_of(record.get("result"))
+        if not serve_url:
+            return None
+        return FINALIZE_CONTINUATION_TEMPLATE.replace("{serve_url}", serve_url)
+    return None
 
 
 def build_context(
@@ -409,10 +525,11 @@ def default_llm_fn(runtime: Any) -> Callable[[List[dict]], str]:
     return lambda messages: _ollama_chat(runtime, messages)
 
 
-def _ollama_chat(runtime: Any, messages: List[dict]) -> str:
-    """One POST to config.ollama.url ({model, stream:false, messages}) —
+def _transport_post(runtime: Any, messages: List[dict]) -> str:
+    """ONE POST to config.ollama.url ({model, stream:false, messages}) —
     same wire format as notifybot.classifier.LLMClassifier. Raises on any
-    failure; run_turn converts that into a graceful error answer."""
+    failure; ``_ollama_chat`` layers the transport retries on top of this
+    seam (monkeypatched in tests)."""
     from notifybot.api import read_config_strict  # lazy (api wires the loop)
 
     config = read_config_strict(runtime.config_path)
@@ -430,6 +547,48 @@ def _ollama_chat(runtime: Any, messages: List[dict]) -> str:
     with urllib.request.urlopen(request, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return str((data.get("message") or {}).get("content", ""))
+
+
+def _transport_backoff(attempt: int) -> None:
+    """Linear inter-attempt sleep before the next transport retry (2 s per
+    attempt number). Module-level so tests can stub the wall-clock out."""
+    time.sleep(max(0.0, OLLAMA_RETRY_BACKOFF_S * attempt))
+
+
+def _is_transient_transport_error(exc: Exception) -> bool:
+    """True for the mission's transient transport classes: URLError, HTTPError
+    5xx, socket.timeout / TimeoutError. HTTPError 4xx is NOT retried (it is a
+    deterministic request/model error, not a transport flake)."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return 500 <= exc.code < 600
+    if isinstance(exc, (urllib.error.URLError, socket.timeout, TimeoutError)):
+        return True
+    return False
+
+
+def _ollama_chat(runtime: Any, messages: List[dict]) -> str:
+    """Production LLM call with per-call transport retries: up to 2 extra
+    attempts with 2 s linear backoff on transient transport errors
+    (URLError / HTTPError 5xx / socket.timeout / TimeoutError). The
+    per-attempt timeout stays config.ollama.timeout (30 s default). After
+    the retries are exhausted the exception propagates and run_turn converts
+    it into the unchanged graceful PT-BR guard answer."""
+    attempts = 1 + OLLAMA_TRANSPORT_RETRIES
+    last_exc: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            return _transport_post(runtime, messages)
+        except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+            if not _is_transient_transport_error(e):
+                raise
+            last_exc = e
+            if attempt + 1 < attempts:
+                logger.warning(
+                    "Agent LLM transport failure (attempt %d/%d): %s", attempt + 1, attempts, e
+                )
+                _transport_backoff(attempt + 1)
+    assert last_exc is not None  # loop always sets it before exhausting
+    raise last_exc
 
 
 MOCK_DASHBOARD_TITLE = "Agent Health Overview"
@@ -584,6 +743,39 @@ def _tool_registry_for(runtime: Any) -> Optional[Any]:
     return getattr(runtime, "tool_registry", None)
 
 
+def _completed_pipeline_results(turn_steps: List[dict]) -> Tuple[Optional[dict], Optional[dict]]:
+    """Results of the LAST successful ``dashboard.create`` and a successful
+    ``server.serve`` executed AFTER it (model-driven or auto) within one
+    turn — i.e. a completed create->serve pipeline; else (None, None)."""
+    create_index: Optional[int] = None
+    for index, step in enumerate(turn_steps):
+        if (
+            isinstance(step, dict)
+            and step.get("role") == "assistant"
+            and step.get("tool") == "dashboard.create"
+            and step.get("error") is None
+        ):
+            create_index = index
+    serve_index: Optional[int] = None
+    if create_index is not None:
+        for index in range(create_index + 1, len(turn_steps)):
+            step = turn_steps[index]
+            if (
+                isinstance(step, dict)
+                and step.get("role") == "assistant"
+                and step.get("tool") == "server.serve"
+                and step.get("error") is None
+            ):
+                serve_index = index
+    if create_index is None or serve_index is None:
+        return None, None
+    create_result = turn_steps[create_index].get("result")
+    serve_result = turn_steps[serve_index].get("result")
+    if not isinstance(create_result, dict) or not isinstance(serve_result, dict):
+        return None, None
+    return create_result, serve_result
+
+
 def run_turn(
     runtime: Any,
     session_id_or_none: Optional[str],
@@ -592,11 +784,15 @@ def run_turn(
 ) -> dict:
     """Run one synchronous agent turn; returns
     ``{session_id, turn: [{role, tool, args, result?|error?, ts}...],
-    answer, urls[]}``.
+    answer, urls[]}`` (additively ``phase: 'auto_complete'`` when the final
+    answer was loop-synthesized).
 
     Failure paths (LLM error, unparsable-with-retry, max turns, budget
     exceeded) all produce PT-BR error answers with the session preserved on
-    disk — the loop never raises for content/model failures.
+    disk — the loop never raises for content/model failures. When a
+    create->serve pipeline already completed in the turn and the model fails
+    to produce the answer anyway, the guard answer is REPLACED by the
+    synthesized final answer (``auto_complete``) so the pipeline completes.
     """
     store = AgentSessionStore(runtime.config_dir)
     if not isinstance(message, str) or message.strip() == "":
@@ -619,13 +815,14 @@ def run_turn(
     records.append(user_record)
 
     resolve_llm = llm_fn if llm_fn is not None else default_llm_fn(runtime)
-    system_prompt = load_system_prompt()
+    system_prompt = grounded_system_prompt()
     registry = _tool_registry_for(runtime)
 
     started = time.monotonic()
     turn_steps: List[dict] = []
     answer_text: Optional[str] = None
     urls: List[str] = []
+    model_answered = False
 
     budget_answer = (
         f"Desculpe, a operação excedeu o tempo limite interno ({int(TURN_BUDGET_S)}s) "
@@ -724,10 +921,55 @@ def run_turn(
             store.append(session_id, step)  # append stamps the shared ts
             records.append(step)
             turn_steps.append(step)
+
+            # Deterministic recipe completion: when the MODEL-driven
+            # dashboard.create succeeded, the loop itself executes the
+            # server.serve step — no model call, and it does NOT consume a
+            # MAX_TOOL_TURNS slot (the cap counts model tool turns only).
+            # Budget guard still applies to the auto step.
+            artifact_id = (
+                _artifact_id_of(result)
+                if (tool_name == "dashboard.create" and error is None and result is not None)
+                else None
+            )
+            if artifact_id is None:
+                continue
+
+            if time.monotonic() - started > TURN_BUDGET_S:
+                answer_text = budget_answer
+                break
+
+            serve_args = {"action": "ensure", "artifact_id": artifact_id}
+            serve_error: Optional[str] = None
+            serve_result: Optional[dict] = None
+            if registry is None:
+                serve_error = "tool registry unavailable"
+            else:
+                served = registry.dispatch("server.serve", serve_args, ctx={"turn_index": turn_index, "session_id": session_id})
+                if isinstance(served, dict) and "error" in served:
+                    serve_error = str(served["error"])
+                elif isinstance(served, dict):
+                    serve_result = served
+                else:
+                    serve_error = f"invalid tool result: {served!r}"
+            auto_step: dict = {
+                "role": "assistant",
+                "tool": "server.serve",
+                "args": serve_args,
+                "phase": AUTO_SERVE_PHASE,
+            }
+            if serve_error is None:
+                auto_step["result"] = serve_result
+            else:
+                auto_step["error"] = serve_error
+            store.append(session_id, auto_step)
+            records.append(auto_step)
+            turn_steps.append(auto_step)
             continue
 
         answer_text = parsed["answer"]
         urls = list(parsed.get("urls", []))
+        model_answered = True
         break
 
     if answer_text is None:
@@ -737,11 +979,26 @@ def run_turn(
         )
 
     answer_record = {"role": "assistant", "answer": answer_text, "urls": urls}
+    if not model_answered:
+        # Deterministic completion: when create->serve already succeeded but
+        # the loop exits WITHOUT a model answer (drift/LLM-down/turn cap/
+        # budget), the guard answer is replaced by the synthesized final
+        # answer carrying the served URL — the user-facing pipeline
+        # completes; the record/turn is marked ``auto_complete``.
+        create_result, serve_result = _completed_pipeline_results(turn_steps)
+        if create_result is not None and serve_result is not None:
+            synthesized = synthesize_dashboard_answer(create_result, serve_result)
+            answer_record["answer"] = answer_text = synthesized["answer"]
+            answer_record["urls"] = urls = list(synthesized["urls"])
+            answer_record["phase"] = AUTO_COMPLETE_PHASE
     store.append(session_id, answer_record)
 
-    return {
+    payload = {
         "session_id": session_id,
         "turn": turn_steps,
         "answer": answer_text,
         "urls": urls,
     }
+    if answer_record.get("phase") == AUTO_COMPLETE_PHASE:
+        payload["phase"] = AUTO_COMPLETE_PHASE
+    return payload

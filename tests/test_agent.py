@@ -15,18 +15,28 @@ import os
 import re
 import tempfile
 import unittest
+import unittest.mock
+import urllib.error
 import urllib.request
+from datetime import datetime
 
 from tests.test_api import ApiServerFixture, valid_config_payload
+from notifybot import agent as agent_module
 from notifybot.agent import (
+    AUTO_COMPLETE_PHASE,
+    AUTO_SERVE_PHASE,
     AgentSessionStore,
     RAW_MODEL_OUTPUT_MAX_BYTES,
     REMINDER_PREFIX,
     build_context,
     continuation_reminder_for,
+    current_date_ground,
+    grounded_system_prompt,
+    load_system_prompt,
     parse_model_json,
     run_turn,
     summarize_tool_args,
+    synthesize_dashboard_answer,
     truncate_raw_model_output,
     truncate_tool_result_text,
 )
@@ -37,6 +47,7 @@ from notifybot.agent_tools import (
     prune_artifacts,
 )
 from notifybot.api import BotApiRuntime
+from notifybot.finance import FinanceLedger
 
 URL_RE = re.compile(r"^http://127\.0\.0\.1:(\d+)/([0-9a-f]{32})\.html$")
 DASHBOARD_HTML = (
@@ -97,16 +108,6 @@ def find_last_tool_result(messages, tool_name):
     return {}
 
 
-def serve_from_recipe_reminder(messages):
-    """Simulates the true-model recovery: read the real artifact id straight
-    out of the continuation reminder the loop appended (last user message)."""
-    reminder = str(messages[-1].get("content", ""))
-    assert reminder.startswith(REMINDER_PREFIX), reminder
-    match = re.search(r'"artifact_id": "([0-9a-f]{32})"', reminder)
-    assert match, reminder
-    return json.dumps({"tool": "server.serve", "args": {"action": "ensure", "artifact_id": match.group(1)}})
-
-
 # ---- runtime factory ------------------------------------------------------------
 
 
@@ -125,7 +126,8 @@ def make_runtime(tmpdir):
 
 
 class TestDashboardChainSuccess(unittest.TestCase):
-    """Full tool-chain: app.data -> dashboard.create -> server.serve -> answer."""
+    """Full tool-chain: app.data -> dashboard.create -> [loop auto_serve] ->
+    answer (the model never calls server.serve itself anymore)."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -149,14 +151,6 @@ class TestDashboardChainSuccess(unittest.TestCase):
                 ),
                 lambda messages: json.dumps(
                     {
-                        "tool": "server.serve",
-                        "args": {
-                            "artifact_id": find_last_tool_result(messages, "dashboard.create")["artifact_id"]
-                        },
-                    }
-                ),
-                lambda messages: json.dumps(
-                    {
                         "answer": "Aqui está o dashboard do bot, pronto na aba Chat.",
                         "urls": [find_last_tool_result(messages, "server.serve")["url"]],
                     }
@@ -171,13 +165,20 @@ class TestDashboardChainSuccess(unittest.TestCase):
         self.assertTrue(all(step.get("error") is None for step in response["turn"]))
         for step in response["turn"]:
             self.assertIn("ts", step)
+        # The serve step is LOOP-executed: phase auto_serve, no model slot spent.
+        self.assertEqual(response["turn"][2].get("phase"), AUTO_SERVE_PHASE)
 
-        self.assertEqual(llm.call_count, 4)
+        self.assertEqual(llm.call_count, 3)
         self.assertTrue(response["answer"])
         self.assertEqual(len(response["urls"]), 1)
         match = URL_RE.match(response["urls"][0])
         self.assertIsNotNone(match, response["urls"])
         artifact_id = match.group(2)
+
+        # The model's answer step got the finalize recipe (real served URL).
+        finalize_tail = llm.calls[2][-1]
+        self.assertTrue(finalize_tail["content"].startswith(REMINDER_PREFIX))
+        self.assertIn('"urls": ["' + response["urls"][0] + '"]', finalize_tail["content"])
 
         # Artifact file exists on disk and is served over real HTTP.
         artifact_path = os.path.join(self.artifacts_dir, f"{artifact_id}.html")
@@ -188,15 +189,18 @@ class TestDashboardChainSuccess(unittest.TestCase):
         self.assertIn("text/html", resp.headers.get("Content-Type", ""))
         self.assertIn("<title>Health Dashboard</title>", body)
 
-        # Session persisted: user + [(raw row per LLM call), tool step] ×3
-        # + answer. Raw rows (assistant_raw) capture every model output.
+        # Session persisted: user + [(raw row per LLM call), tool step] for the
+        # two model tool turns, the loop auto_serve step (NO raw row before it),
+        # then (raw row for the final answer call) + answer.
         records = AgentSessionStore(self.runtime.config_dir).load(response["session_id"])
         self.assertIsNotNone(records)
         self.assertEqual([r.get("role") for r in records],
                          ["user", "assistant_raw", "assistant",
                           "assistant_raw", "assistant",
-                          "assistant_raw", "assistant",
+                          "assistant",
                           "assistant_raw", "assistant"])
+        self.assertEqual(records[5].get("phase"), AUTO_SERVE_PHASE)
+        self.assertEqual(records[5]["tool"], "server.serve")
         self.assertIn("answer", records[-1])
         self.assertEqual(records[-1]["urls"], response["urls"])
         server_status = self.runtime.agent_registry.list()
@@ -272,9 +276,11 @@ class TestUnparsableRetry(unittest.TestCase):
 
 
 class TestDriftAfterCreateGuard(unittest.TestCase):
-    """Regression (real run 8f0ae727): after dashboard.create ok, the model
-    replies TWO unparsable outputs even WITH the serve continuation reminder —
-    guard answer fires, artifact exists, url NOT delivered."""
+    """Regression (real run 8f0ae727): after dashboard.create ok the model
+    produced TWO unparsable outputs even with re-anchoring — previously this
+    killed the pipeline and the user never got the URL. With the loop
+    executing server.serve itself (auto_serve), the turn now COMPLETES with
+    a synthesized PT-BR answer (auto_complete) carrying the served URL."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -282,7 +288,7 @@ class TestDriftAfterCreateGuard(unittest.TestCase):
         self.runtime = make_runtime(self.tmp.name)
         self.addCleanup(self.runtime.agent_registry.stop)
 
-    def test_drift_guard_artifact_kept_url_not_delivered(self):
+    def test_drift_after_create_synthesizes_completed_pipeline(self):
         llm = ScriptedLLM(
             [
                 json.dumps(
@@ -298,43 +304,84 @@ class TestDriftAfterCreateGuard(unittest.TestCase):
         response = run_turn(self.runtime, None, "Crie um dashboard financeiro deste mês", llm_fn=llm)
         self.assertEqual(llm.call_count, 3)
 
-        # Guard answer (second-failure behavior preserved) and NO delivered url.
-        self.assertIn("formato JSON", response["answer"])
-        self.assertEqual(response["urls"], [])
-        # Only the create step ran; serve/answer never happened.
-        self.assertEqual([step["tool"] for step in response["turn"]], ["dashboard.create"])
+        # Pipeline completed WITHOUT a model answer: turn = create + loop
+        # auto_serve; the synthesized answer delivers the served URL.
+        self.assertEqual([step["tool"] for step in response["turn"]], ["dashboard.create", "server.serve"])
+        self.assertEqual(response["turn"][1].get("phase"), AUTO_SERVE_PHASE)
+        self.assertEqual(response["turn"][1]["args"].get("artifact_id"),
+                         response["turn"][0]["result"]["artifact_id"])
+        self.assertEqual(response["phase"], AUTO_COMPLETE_PHASE)
+        self.assertIn("Dashboard pronto:", response["answer"])
+        self.assertEqual(len(response["urls"]), 1)
+        match = URL_RE.match(response["urls"][0])
+        self.assertIsNotNone(match, response["urls"])
+        with urllib.request.urlopen(response["urls"][0], timeout=5) as resp:
+            body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("<title>Finance Dashboard</title>", body)
 
-        # The artifact was already persisted and remains on disk.
+        # The artifact was persisted and remains on disk.
         artifact_id = response["turn"][0]["result"]["artifact_id"]
         self.assertTrue(os.path.isfile(os.path.join(self.runtime.artifacts_dir(), f"{artifact_id}.html")))
 
-        # The post-create attempt prompt AND the drift retry were re-anchored
-        # with the targeted server.serve recipe (real id), not the generic one.
-        attempt_tail = llm.calls[1][-1]
-        self.assertEqual(attempt_tail["role"], "user")
-        self.assertTrue(attempt_tail["content"].startswith(REMINDER_PREFIX))
-        self.assertIn('"tool": "server.serve"', attempt_tail["content"])
-        retry_tail = llm.calls[2][-1]
-        self.assertTrue(retry_tail["content"].startswith(REMINDER_PREFIX))
-        self.assertIn('"tool": "server.serve", "args": {"action": "ensure", "artifact_id"', retry_tail["content"])
-        self.assertIn(artifact_id, retry_tail["content"])  # real id substituted
-        self.assertNotIn("previous reply was NOT one valid protocol JSON object", retry_tail["content"])
+        # Both post-create attempts (initial + protocol retry) were
+        # re-anchored with the FINALIZE recipe: the real served URL is in the
+        # prompt, and the model is told NOT to call any tool — NOT the old
+        # server.serve args template.
+        for tail in (llm.calls[1][-1], llm.calls[2][-1]):
+            self.assertEqual(tail["role"], "user")
+            self.assertTrue(tail["content"].startswith(REMINDER_PREFIX))
+            self.assertIn('"urls": ["' + response["urls"][0] + '"]', tail["content"])
+            self.assertNotIn('"args": {"action": "ensure"', tail["content"])
 
-        # Session roles: user, raw(create call), create, raw(attempt),
-        # raw(protocol_retry), guard answer — drift outputs persisted.
+        # Session roles: user, raw(create), create, auto_serve serve (NO raw
+        # row before it — no model call), raw(attempt), raw(protocol_retry),
+        # synthesized answer — drift outputs persisted for post-mortem.
         records = AgentSessionStore(self.runtime.config_dir).load(response["session_id"])
         self.assertEqual([r.get("role") for r in records],
-                         ["user", "assistant_raw", "assistant", "assistant_raw", "assistant_raw", "assistant"])
+                         ["user", "assistant_raw", "assistant", "assistant",
+                          "assistant_raw", "assistant_raw", "assistant"])
         raw_rows = [r for r in records if r.get("role") == "assistant_raw"]
         self.assertEqual([r["phase"] for r in raw_rows], ["attempt", "attempt", "protocol_retry"])
         self.assertIn("Já montei", raw_rows[1]["raw_model_output"])
         self.assertIn("Vou exibir", raw_rows[2]["raw_model_output"])
+        self.assertEqual(records[3].get("phase"), AUTO_SERVE_PHASE)
+        self.assertEqual(records[-1]["phase"], AUTO_COMPLETE_PHASE)
         self.assertEqual(records[-1]["answer"], response["answer"])
+        self.assertEqual(records[-1]["urls"], response["urls"])
+
+    def test_create_failure_no_completion_guard_answer_kept(self):
+        """Without a completed create->serve pipeline the hard-failure guard
+        text is untouched: bad create -> drift x2 -> PT-BR JSON-guard answer."""
+        llm = ScriptedLLM(
+            [
+                json.dumps(
+                    {
+                        "tool": "dashboard.create",
+                        "args": {
+                            "title": "Broke",
+                            # forbidden pattern -> tool error
+                            "html": "<!DOCTYPE html><html><body><script>x()</script></body></html>",
+                            "data_source": "app.data:finance_summary",
+                        },
+                    }
+                ),
+                "Dashboard criado!",  # drift 1
+                "Tudo certo por aqui.",  # drift 2
+            ]
+        )
+        response = run_turn(self.runtime, None, "Crie um dashboard", llm_fn=llm)
+        self.assertEqual(llm.call_count, 3)
+        self.assertIn("formato JSON", response["answer"])
+        self.assertEqual(response["urls"], [])
+        self.assertEqual([step for step in response["turn"] if step["tool"] == "server.serve"], [])
+        self.assertNotIn("phase", response)
 
 
 class TestRecoveryAfterCreate(unittest.TestCase):
-    """Recovery path: unparsable output once post-create, then the targeted
-    recipe reminder leads the model back to server.serve -> full URL works."""
+    """Recovery path: unparsable output once after the loop's auto_serve
+    step, then the finalize recipe reminder leads the model to the final
+    answer -> full URL works."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -342,7 +389,7 @@ class TestRecoveryAfterCreate(unittest.TestCase):
         self.runtime = make_runtime(self.tmp.name)
         self.addCleanup(self.runtime.agent_registry.stop)
 
-    def test_one_drift_output_recovers_via_serve_recipe(self):
+    def test_one_drift_output_recovers_via_finalize_recipe(self):
         llm = ScriptedLLM(
             [
                 json.dumps(
@@ -352,7 +399,6 @@ class TestRecoveryAfterCreate(unittest.TestCase):
                     }
                 ),
                 "Pronto! O dashboard financeiro deste mês já está disponível.",  # drift attempt 1
-                serve_from_recipe_reminder,  # recovery on the recipe reminder
                 lambda messages: json.dumps(
                     {
                         "answer": "Aqui está o dashboard financeiro deste mês, pronto na aba Chat.",
@@ -362,8 +408,9 @@ class TestRecoveryAfterCreate(unittest.TestCase):
             ]
         )
         response = run_turn(self.runtime, None, "Crie um dashboard financeiro deste mês", llm_fn=llm)
-        self.assertEqual(llm.call_count, 4)
+        self.assertEqual(llm.call_count, 3)
         self.assertEqual([step["tool"] for step in response["turn"]], ["dashboard.create", "server.serve"])
+        self.assertEqual(response["turn"][1].get("phase"), AUTO_SERVE_PHASE)
         self.assertEqual(response["answer"], "Aqui está o dashboard financeiro deste mês, pronto na aba Chat.")
 
         # answer.urls[0] works end-to-end (HTTP GET 200 on the artifact).
@@ -374,16 +421,19 @@ class TestRecoveryAfterCreate(unittest.TestCase):
         self.assertEqual(resp.status, 200)
         self.assertIn("<title>Finance Dashboard</title>", body)
 
-        # First attempt got the continuation; the retry re-anchored too.
+        # First attempt got the finalize continuation; the re-anchoring retry
+        # re-used the same finalize recipe (real url, no tool request).
         self.assertTrue(llm.calls[1][-1]["content"].startswith(REMINDER_PREFIX))
         retry_tail = llm.calls[2][-1]
-        self.assertIn('"tool": "server.serve", "args": {"action": "ensure", "artifact_id"', retry_tail["content"])
+        self.assertTrue(retry_tail["content"].startswith(REMINDER_PREFIX))
+        self.assertIn('"urls": ["' + response["urls"][0] + '"]', retry_tail["content"])
+        self.assertNotIn('"args": {"action": "ensure"', retry_tail["content"])
 
         records = AgentSessionStore(self.runtime.config_dir).load(response["session_id"])
         self.assertEqual([r.get("role") for r in records],
                          ["user", "assistant_raw", "assistant",
-                          "assistant_raw", "assistant_raw", "assistant",
-                          "assistant_raw", "assistant"])
+                          "assistant", "assistant_raw", "assistant_raw", "assistant"])
+        self.assertEqual(records[3].get("phase"), AUTO_SERVE_PHASE)
 
 
 class TestPostCreatePromptHygiene(unittest.TestCase):
@@ -398,7 +448,7 @@ class TestPostCreatePromptHygiene(unittest.TestCase):
         self.runtime = make_runtime(self.tmp.name)
         self.addCleanup(self.runtime.agent_registry.stop)
 
-    def test_post_create_prompt_redacts_html_keeps_anchors(self):
+    def test_post_create_prompt_redacts_html_and_finalizes(self):
         llm = ScriptedLLM(
             [
                 json.dumps(
@@ -407,7 +457,6 @@ class TestPostCreatePromptHygiene(unittest.TestCase):
                         "args": {"title": "Finance Month", "html": LARGE_HTML, "data_source": "app.data:finance_summary"},
                     }
                 ),
-                serve_from_recipe_reminder,
                 lambda messages: json.dumps(
                     {
                         "answer": "Dashboard financeiro pronto.",
@@ -417,7 +466,7 @@ class TestPostCreatePromptHygiene(unittest.TestCase):
             ]
         )
         response = run_turn(self.runtime, None, "me mostre o dashboard financeiro", llm_fn=llm)
-        self.assertEqual(llm.call_count, 3)
+        self.assertEqual(llm.call_count, 2)
 
         # The post-create outgoing prompt: no raw HTML body, markers present.
         post_create_dump = json.dumps(llm.calls[1], ensure_ascii=False)
@@ -428,13 +477,18 @@ class TestPostCreatePromptHygiene(unittest.TestCase):
         # The create RESULT row (small) stays intact and carries the artifact id.
         artifact_id = find_last_tool_result(llm.calls[1], "dashboard.create")["artifact_id"]
         self.assertTrue(artifact_id)
-        # The create args never leak back into a later prompt either.
-        self.assertNotIn(DRIFT_HTML_SENTINEL, json.dumps(llm.calls[2], ensure_ascii=False))
+        # The loop's auto_serve step (with the served URL) is in the same
+        # prompt; quotes in the raw content are never escaped there.
+        serve_message = [m for m in llm.calls[1] if str(m.get("content")).startswith("tool_call:")][-1]
+        self.assertIn('"tool": "server.serve"', serve_message["content"])
+        self.assertIn('"url": "http://127.0.0.1:', serve_message["content"])
 
-        # The continuation reminder carries the exact next-step template.
+        # The finalize reminder carries the exact final-answer template with
+        # the REAL served URL substituted.
         tail = llm.calls[1][-1]
         self.assertTrue(tail["content"].startswith(REMINDER_PREFIX))
-        self.assertIn('{"tool": "server.serve", "args": {"action": "ensure", "artifact_id": "' + artifact_id, tail["content"])
+        self.assertIn('"urls": ["' + response["urls"][0] + '"]', tail["content"])
+        self.assertNotIn('"args": {"action": "ensure"', tail["content"])
 
         # Full args persist in the session file (post-mortem) and in the
         # current-turn execution path/response payload.
@@ -442,6 +496,8 @@ class TestPostCreatePromptHygiene(unittest.TestCase):
         create_record = [r for r in records if r.get("tool") == "dashboard.create"][0]
         self.assertIn(DRIFT_HTML_SENTINEL, create_record["args"]["html"])
         self.assertIn(DRIFT_HTML_SENTINEL, response["turn"][0]["args"]["html"])
+        auto_serve_record = [r for r in records if r.get("tool") == "server.serve"][0]
+        self.assertEqual(auto_serve_record.get("phase"), AUTO_SERVE_PHASE)
 
         # End-to-end: the answer's url serves the artifact (200).
         with urllib.request.urlopen(response["urls"][0], timeout=5) as resp:
@@ -472,6 +528,213 @@ class TestLLMFailureGraceful(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 run_turn(runtime, "00000000-0000-0000-0000-000000000000", "ping", llm_fn=ScriptedLLM([]))
             self.assertIn("not found", str(ctx.exception))
+
+
+# ---- date grounding (prompt header) ----------------------------------------------
+
+
+class TestDateGrounding(unittest.TestCase):
+    """The system prompt header carries a build-time English date line, and a
+    model that reads it issues CURRENT-month data calls."""
+
+    def test_current_date_ground_line_format_deterministic(self):
+        line = current_date_ground(datetime(2026, 10, 27, 9, 30, 15))
+        self.assertEqual(line, "Current local date: 2026-10-27 Tuesday (2026-10).")
+        self.assertEqual(current_date_ground(datetime(2026, 1, 3)), "Current local date: 2026-01-03 Saturday (2026-01).")
+
+    def test_current_date_ground_uses_local_now_and_english_weekday(self):
+        line = current_date_ground()
+        match = re.fullmatch(
+            r"Current local date: (\d{4}-\d{2}-\d{2}) ([A-Za-z]+) \((\d{4}-\d{2})\)\.",
+            line,
+        )
+        self.assertIsNotNone(match, line)
+        from notifybot.agent import _WEEKDAYS_EN
+
+        self.assertIn(match.group(2), _WEEKDAYS_EN)  # always an English weekday name
+        local_now = datetime.now()
+        self.assertEqual(match.group(1), local_now.strftime("%Y-%m-%d"))
+        self.assertEqual(match.group(3), local_now.strftime("%Y-%m"))
+
+    def test_grounded_system_prompt_header(self):
+        prompt = grounded_system_prompt()
+        self.assertTrue(prompt.startswith("Current local date: "))
+        self.assertIn(load_system_prompt(), prompt)
+
+    def test_run_turn_context_carries_date_line(self):
+        with tempfile.TemporaryDirectory() as root:
+            runtime = make_runtime(root)
+            llm = ScriptedLLM([])  # fallback answer, no tools
+            run_turn(runtime, None, "ping", llm_fn=llm)
+            system_message = llm.calls[0][0]
+            self.assertEqual(system_message["role"], "system")
+            self.assertIn("Current local date: ", system_message["content"])
+            self.assertRegex(system_message["content"], r"Current local date: \d{4}-\d{2}-\d{2} \w+ \(\d{4}-\d{2}\)\.")
+
+    def test_scripted_transcript_grounds_current_month_query(self):
+        """Regression (real run): the model queried finance_transactions for
+        the WRONG month ("deste mês" == current). With the date-grounded
+        header, a script that reads the date line queries the CURRENT month
+        and the tool returns the seeded current-month row."""
+        with tempfile.TemporaryDirectory() as root:
+            runtime = make_runtime(root)
+            local_now = datetime.now()
+            current_month = local_now.strftime("%Y-%m")
+            ledger = FinanceLedger(db_path=os.path.join(runtime.config_dir, "finance.db"))
+            ledger.insert_transaction(
+                {
+                    "rec_id": 901,
+                    "ts": f"{current_month}-05T12:00:00-03:00",
+                    "bundle": "com.bank",
+                    "amount": 123.45,
+                    "kind": "gasto",
+                    "category": "alimentacao",
+                    "description": "compra do mes corrente",
+                    "raw": {},
+                }
+            )
+            ledger.close()
+
+            def month_from_date_line(messages):
+                match = re.search(r"Current local date: (\d{4}-\d{2}-\d{2})", messages[0]["content"])
+                assert match, messages[0]
+                month = match.group(1)[:7]
+                return json.dumps(
+                    {
+                        "tool": "app.data",
+                        "args": {"dataset": "finance_transactions", "params": {"month": month}},
+                    }
+                )
+
+            def answer_from_result(messages):
+                result = find_last_tool_result(messages, "app.data")
+                records = result.get("records", [])
+                assert records, result  # the current-month row must be there
+                return json.dumps(
+                    {
+                        "answer": f"Encontrei {len(records)} transações no mês {result.get('month')}.",
+                        "urls": [],
+                    }
+                )
+
+            llm = ScriptedLLM([month_from_date_line, answer_from_result])
+            response = run_turn(runtime, None, "transações deste mês", llm_fn=llm)
+            self.assertEqual(response["answer"], f"Encontrei 1 transações no mês {current_month}.")
+            data_step = response["turn"][0]
+            self.assertEqual(data_step["tool"], "app.data")
+            self.assertEqual(data_step["args"]["params"]["month"], current_month)
+            self.assertEqual(data_step["result"]["month"], current_month)
+            self.assertEqual(len(data_step["result"]["records"]), 1)
+            self.assertEqual(data_step["result"]["records"][0]["description"], "compra do mes corrente")
+
+
+# ---- answer synthesis ------------------------------------------------------------
+
+
+class TestSynthesizeDashboardAnswer(unittest.TestCase):
+    """Pure helper: create+serve results -> the PT-BR auto_complete answer."""
+
+    def test_shape_and_delivered_url(self):
+        create_result = {"artifact_id": "ab" * 16, "path": "/artifacts/ab.html"}
+        served_url = "http://127.0.0.1:4770/" + "ab" * 16 + ".html"
+        synth = synthesize_dashboard_answer(create_result, {"url": served_url})
+        self.assertEqual(set(synth), {"answer", "urls"})
+        self.assertEqual(synth["urls"], [served_url])
+        self.assertEqual(synth["urls"][0], served_url)  # urls[0] == the served URL
+        self.assertIn("Dashboard pronto:", synth["answer"])
+        self.assertIn(served_url, synth["answer"])
+        # Internal artifact bookkeeping never leaks into the answer text.
+        self.assertNotIn("artifact_id", synth)
+        self.assertNotIn("ab" + "ab", synth["answer"].replace(served_url, ""))
+
+    def test_missing_url_degrades_to_empty_urls(self):
+        synth = synthesize_dashboard_answer({"artifact_id": "x"}, {})
+        self.assertEqual(synth["urls"], [])
+        self.assertTrue(synth["answer"])
+        self.assertNotIn("http", synth["answer"])
+        # Malformed/None inputs degrade the same way (never raises).
+        self.assertEqual(synthesize_dashboard_answer(None, None)["urls"], [])
+        self.assertEqual(synthesize_dashboard_answer({}, {"url": None})["urls"], [])
+
+
+# ---- Ollama transport resilience --------------------------------------------------
+
+
+class TestOllamaTransportRetry(unittest.TestCase):
+    """_ollama_chat retries transient transport errors (2 extra attempts, 2 s
+    linear backoff) at the _transport_post seam; exhaustion keeps the
+    run_turn guard path untouched."""
+
+    def setUp(self):
+        os.environ.pop("NOTIFYBOT_SMOKE_AGENT_MOCK", None)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runtime = make_runtime(self.tmp.name)
+        self.messages = [{"role": "system", "content": "system prompt"}]
+
+    def test_two_transport_failures_then_success(self):
+        post_mock = unittest.mock.patch.object(
+            agent_module,
+            "_transport_post",
+            side_effect=[
+                urllib.error.URLError("connection refused #1"),
+                urllib.error.URLError("connection refused #2"),
+                "hello model",
+            ],
+        )
+        backoff_mock = unittest.mock.patch.object(agent_module, "_transport_backoff")
+        with post_mock as posts, backoff_mock as sleeps:
+            result = agent_module._ollama_chat(self.runtime, self.messages)
+        self.assertEqual(result, "hello model")
+        self.assertEqual(posts.call_count, 3)  # 1 attempt + 2 retries
+        self.assertEqual(sleeps.call_args_list, [unittest.mock.call(1), unittest.mock.call(2)])
+
+    def test_socket_timeout_retried_then_succeeds(self):
+        with unittest.mock.patch.object(
+            agent_module,
+            "_transport_post",
+            side_effect=[TimeoutError("simulated hang"), "ok after timeout"],
+        ) as posts, unittest.mock.patch.object(agent_module, "_transport_backoff"):
+            self.assertEqual(agent_module._ollama_chat(self.runtime, self.messages), "ok after timeout")
+        self.assertEqual(posts.call_count, 2)
+
+    def test_http_error_5xx_retried_4xx_not(self):
+        http_502 = urllib.error.HTTPError("http://127.0.0.1:11434/api/chat", 502, "Bad Gateway", {}, None)
+        http_404 = urllib.error.HTTPError("http://127.0.0.1:11434/api/chat", 404, "Not Found", {}, None)
+        with unittest.mock.patch.object(agent_module, "_transport_post", side_effect=http_502) as posts_5xx, \
+                unittest.mock.patch.object(agent_module, "_transport_backoff"):
+            with self.assertRaises(urllib.error.HTTPError):
+                agent_module._ollama_chat(self.runtime, self.messages)
+            self.assertEqual(posts_5xx.call_count, 3)
+        with unittest.mock.patch.object(agent_module, "_transport_post", side_effect=http_404) as posts_4xx:
+            with self.assertRaises(urllib.error.HTTPError):
+                agent_module._ollama_chat(self.runtime, self.messages)
+            self.assertEqual(posts_4xx.call_count, 1)  # deterministic error: NO retry
+
+    def test_three_consecutive_transport_failures_raise(self):
+        with unittest.mock.patch.object(
+            agent_module,
+            "_transport_post",
+            side_effect=[urllib.error.URLError("down")] * 3,
+        ) as posts, unittest.mock.patch.object(agent_module, "_transport_backoff"):
+            with self.assertRaises(urllib.error.URLError):
+                agent_module._ollama_chat(self.runtime, self.messages)
+        self.assertEqual(posts.call_count, 3)
+
+    def test_exhausted_retries_keep_guard_answer_in_turn(self):
+        """3 consecutive transport failures at the HTTP layer -> the existing
+        PT-BR guard answer, texts unchanged (no create/serve ran -> no
+        synthesis)."""
+        with unittest.mock.patch.object(
+            agent_module,
+            "_transport_post",
+            side_effect=[urllib.error.URLError("down")] * 3,
+        ), unittest.mock.patch.object(agent_module, "_transport_backoff"):
+            response = run_turn(self.runtime, None, "status?", llm_fn=None)
+        self.assertEqual(response["turn"], [])
+        self.assertIn("não consegui falar com o modelo de IA", response["answer"])
+        self.assertIn("Ollama", response["answer"])
+        self.assertNotIn("phase", response)
 
 
 # ---- tool-level -----------------------------------------------------------------
@@ -704,16 +967,37 @@ class TestContextWindowAndTruncation(unittest.TestCase):
         reminder = continuation_reminder_for([{"role": "user", "content": "go"}, success])
         self.assertIn('"tool": "server.serve", "args": {"action": "ensure", "artifact_id": "' + "cd" * 16 + '"}', reminder)
         self.assertIn('"answer"', reminder)  # the answer shape follows the tool template
+        # Defensive fallback: a create-success at the newest meaningful slot
+        # (e.g. after a cross-continuation turn) still gets the serve recipe.
+        self.assertIn("server.serve", reminder)
+        # Auto_serve (loop-executed) -> the FINALIZE recipe with the served URL.
+        auto_serve = {
+            "role": "assistant",
+            "tool": "server.serve",
+            "args": {"action": "ensure", "artifact_id": "cd" * 16},
+            "phase": AUTO_SERVE_PHASE,
+            "result": {"url": "http://127.0.0.1:4770/" + "cd" * 16 + ".html"},
+        }
+        finalize = continuation_reminder_for([{"role": "user", "content": "go"}, auto_serve])
+        self.assertIn("urls\": [\"http://127.0.0.1:4770/" + "cd" * 16 + ".html\"]", finalize)
+        self.assertIn("Do NOT call any tool again", finalize)
+        self.assertNotIn('"args": {"action": "ensure"', finalize)  # no tool-call template
         # Any other newest meaningful record -> None (generic paths untouched).
         self.assertIsNone(continuation_reminder_for([]))
         self.assertIsNone(continuation_reminder_for([{"role": "user", "content": "go"}]))
         self.assertIsNone(continuation_reminder_for([success, {"role": "assistant", "answer": "done", "urls": []}]))
+        # A MODEL-driven serve step (no auto_serve phase) gets no finalize.
         self.assertIsNone(
             continuation_reminder_for(
                 [success, {"role": "assistant", "tool": "server.serve", "args": {}, "result": {"url": "u"}}]
             )
         )
         self.assertIsNone(continuation_reminder_for([{**success, "error": "boom", "result": None}]))
+        # Errored / url-less auto_serve step -> None (generic reminder path).
+        self.assertIsNone(
+            continuation_reminder_for([{**auto_serve, "error": "artifact not found: x", "result": None}])
+        )
+        self.assertIsNone(continuation_reminder_for([{**auto_serve, "result": {}}]))
         # Raw bookkeeping rows never mask the underlying create step.
         self.assertIsNotNone(
             continuation_reminder_for(
@@ -729,6 +1013,78 @@ class TestContextWindowAndTruncation(unittest.TestCase):
         self.assertIn("persisted in the session file", trimmed)
         # untouched when small
         self.assertEqual(truncate_tool_result_text('{"ok": true}'), '{"ok": true}')
+
+
+# ---- auto serve + deterministic completion ----------------------------------------
+
+
+class TestAutoServeLoop(unittest.TestCase):
+    """Loop-enforced recipe completion: server.serve runs WITHOUT a model
+    call after a successful model-driven dashboard.create (does not consume a
+    MAX_TOOL_TURNS slot), and a completed pipeline synthesizes the answer."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runtime = make_runtime(self.tmp.name)
+        self.addCleanup(self.runtime.agent_registry.stop)
+
+    def test_cap_counts_model_turns_only_and_completes_synthesized(self):
+        """6 model tool turns (5x app.data + create) exhaust the cap; the
+        loop STILL appends the auto_serve serve step as a 7th step and the
+        turn finally completes with the synthesized answer."""
+        llm = ScriptedLLM(
+            [json.dumps({"tool": "app.data", "args": {"dataset": "health"}}) for _ in range(5)]
+            + [
+                json.dumps(
+                    {
+                        "tool": "dashboard.create",
+                        "args": {"title": "Health Dashboard", "html": DASHBOARD_HTML, "data_source": "app.data:health"},
+                    }
+                ),
+            ]
+        )
+        response = run_turn(self.runtime, None, "dashboard completo", llm_fn=llm)
+        self.assertEqual(llm.call_count, 6)  # model turns only; serve was loop-driven
+        self.assertEqual(len(response["turn"]), 7)  # 5x app.data + create + auto_serve
+        self.assertEqual([step["tool"] for step in response["turn"]][5], "dashboard.create")
+        self.assertEqual(response["turn"][6].get("phase"), AUTO_SERVE_PHASE)
+        self.assertIn("Dashboard pronto:", response["answer"])
+        match = URL_RE.match(response["urls"][0])
+        self.assertIsNotNone(match, response["urls"])
+        self.assertEqual(response["phase"], AUTO_COMPLETE_PHASE)
+        with urllib.request.urlopen(response["urls"][0], timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
+        records = AgentSessionStore(self.runtime.config_dir).load(response["session_id"])
+        self.assertEqual(len(records), 15)  # user + 6x(raw, step) + auto_serve + answer
+
+    def test_llm_failure_after_completed_pipeline_synthesizes(self):
+        """Transport death right after create->serve: the user still gets the
+        dashboard (synthesized), not the 'não consegui falar' guard."""
+        create_json = json.dumps(
+            {
+                "tool": "dashboard.create",
+                "args": {"title": "Health Dashboard", "html": DASHBOARD_HTML, "data_source": "app.data:health"},
+            }
+        )
+
+        def flaky_llm(messages):
+            flaky_llm.calls.append(messages)
+            if len(flaky_llm.calls) == 1:
+                return create_json
+            raise TimeoutError("transport died right after auto-serve")
+
+        flaky_llm.calls = []
+        response = run_turn(self.runtime, None, "me mostre um dashboard", llm_fn=flaky_llm)
+        self.assertEqual(len(flaky_llm.calls), 2)
+        self.assertEqual([step["tool"] for step in response["turn"]], ["dashboard.create", "server.serve"])
+        self.assertEqual(response["turn"][1].get("phase"), AUTO_SERVE_PHASE)
+        self.assertIn("Dashboard pronto:", response["answer"])
+        self.assertEqual(response["phase"], AUTO_COMPLETE_PHASE)
+        with urllib.request.urlopen(response["urls"][0], timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
+        records = AgentSessionStore(self.runtime.config_dir).load(response["session_id"])
+        self.assertEqual(records[-1]["phase"], AUTO_COMPLETE_PHASE)
 
 
 # ---- API-level (rows 11-14 over HTTP, mock-mode LLM) -----------------------------

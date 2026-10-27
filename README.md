@@ -709,6 +709,10 @@ code, tool JSON) is English.
 Loop guards: max 6 tool turns, ~90 s global budget, ~4 KB tool-result truncation in
 context, one protocol-reminder retry on unparsable model output, and graceful PT-BR
 error answers (HTTP 200) when Ollama is unreachable — failures never 500 the turn.
+The loop auto-serves after `dashboard.create` (it executes `server.serve` itself and
+synthesizes the PT-BR answer when the model drifts), date-grounds the prompt header
+with a build-time `Current local date:` line, and retries transient Ollama transport
+errors (2 extra attempts, 2 s linear backoff).
 Sessions persist append-only under `<config_dir>/data/agent_sessions/<id>.jsonl`;
 ids match `^[A-Za-z0-9-]{1,64}$`.
 
