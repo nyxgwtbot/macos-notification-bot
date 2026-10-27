@@ -63,14 +63,18 @@
               </p>
             </template>
             <div class="nb-card-footer">
+              <!-- dangerous action made hard: two clicks 3s apart; click 1 arms,
+                   expiry disarms silently, only click 2 restarts -->
               <ion-button
                 size="small"
                 fill="outline"
+                class="nb-restart-btn"
+                :class="{ 'nb-restart-armed': restartArmed }"
                 :disabled="store.daemonBusy || !daemonBridge"
                 @click="onRestartDaemon"
               >
                 <ion-spinner v-if="store.daemonBusy" name="crescent" />
-                <template v-else>Restart daemon</template>
+                <template v-else>{{ restartArmed ? 'Confirm restart?' : 'Restart daemon' }}</template>
               </ion-button>
             </div>
           </ion-card-content>
@@ -288,7 +292,33 @@ function financeBadgeColor(status: string): string {
   return 'success';
 }
 
-function onRestartDaemon() {
+/** Restart double-arm (S6): click 1 arms the button for 3s ("Confirm restart?",
+ * warn tint); expiry disarms silently; only click 2 fires the existing bridge
+ * restart. No server-side change — pure client guard. */
+const RESTART_ARM_MS = 3000;
+const restartArmed = ref(false);
+let restartArmTimer: number | null = null;
+
+function clearRestartArmTimer(): void {
+  if (restartArmTimer !== null) {
+    window.clearTimeout(restartArmTimer);
+    restartArmTimer = null;
+  }
+}
+
+function disarmRestart(): void {
+  restartArmed.value = false;
+  clearRestartArmTimer();
+}
+
+function onRestartDaemon(): void {
+  if (!restartArmed.value) {
+    restartArmed.value = true;
+    clearRestartArmTimer();
+    restartArmTimer = window.setTimeout(disarmRestart, RESTART_ARM_MS);
+    return;
+  }
+  disarmRestart();
   void store.restartDaemon().then(() => store.pollDaemon());
 }
 
@@ -312,6 +342,8 @@ onMounted(() => {
 onUnmounted(() => {
   feedPoller.stop();
   statusPoller.stop();
+  // never leave the armed restart timer running past the view lifetime
+  disarmRestart();
 });
 </script>
 
@@ -353,6 +385,14 @@ onUnmounted(() => {
 
 /* Soft status chip + dot + tone classes live in theme/nb-shared.css so the
    Settings connector rows share the same tinted chip system */
+
+/* armed restart: chip-warn tint pair overrides the outline button colors */
+.nb-restart-armed {
+  --background: var(--nb-chip-warn-bg);
+  --border-color: var(--nb-warning);
+  --color: var(--nb-chip-warn-fg);
+  --box-shadow: none;
+}
 
 .nb-kv {
   display: flex;
