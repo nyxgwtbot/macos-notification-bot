@@ -25,6 +25,10 @@ from notifybot.connectors import (
     ConnectorManager,
     LIST_LIMIT_DEFAULT,
     LIST_LIMIT_MAX,
+    NOTES_CREATE,
+    NOTES_READ,
+    NOTES_SEARCH,
+    NO_ACCOUNT_MARKER,
     PROBE_SCRIPTS,
     READ_MAX_BYTES,
     SCRIPTS,
@@ -256,6 +260,24 @@ class TestRunnerSeamActions(unittest.TestCase):
         self.assertEqual(result3["name"], "Nota")
         self.assertEqual(len(result3["body"].encode("utf-8")), READ_MAX_BYTES)  # 16 KB cap
 
+    def test_notes_scripts_anchored_to_account_1(self):
+        """AppleScript targets are anchored deterministically (account 1 /
+        folder 1 of account 1) — the implicit default-target surface is the
+        one that hangs; the argv channel stays title/body/query only."""
+        self.assertIn("folder 1 of account 1", NOTES_CREATE)
+        self.assertIn("count of accounts", NOTES_CREATE)
+        self.assertIn("notes of account 1", NOTES_SEARCH)
+        self.assertIn("notes of account 1", NOTES_READ)
+        self.assertIn(NO_ACCOUNT_MARKER, NOTES_CREATE)
+
+    def test_create_argv_still_title_body_only(self):
+        """The anchor is in-script ONLY: argv stays exactly [title, body] —
+        no model-controlled target strings ever reach the anchor."""
+        self.manager.state.record("notes", "granted")
+        self.runner.register(SCRIPTS[("notes", "create")], Outcome(0, "ok", ""))
+        self.manager.run_action("notes", "create", {"title": "Título", "body": "corpo"})
+        self.assertEqual(self.runner.last_argv(), ["Título", "corpo"])
+
     def test_volume_get_set_front_app_toast(self):
         self.runner.register(SCRIPTS[("system", "volume")], Outcome(0, "37", ""))
         self.assertEqual(self.manager.run_action("system", "volume", {}), {"level": 37})
@@ -317,7 +339,9 @@ class TestFailureMappingAndConsent(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.manager = ConnectorManager(self.tmp.name, runner=lambda cmd, t: Outcome(0, "", ""))
 
-    def test_timeout_maps_to_ptbr_error_mentioning_prompt(self):
+    def test_timeout_on_granted_domain_gets_retry_copy_without_connect(self):
+        """A timeout on an ALREADY-granted domain is not a consent problem: the
+        copy must be the retry wording, with NO Settings/Connect redirect."""
         def timeout_runner(cmd, timeout):
             raise subprocess.TimeoutExpired(cmd, timeout)
 
@@ -325,8 +349,28 @@ class TestFailureMappingAndConsent(unittest.TestCase):
         self.manager.state.record("reminders", "granted")
         with self.assertRaises(ConnectorError) as ctx:
             self.manager.run_action("reminders", "add", {"list": "L", "title": "t"})
-        self.assertIn("consentimento", str(ctx.exception))
-        self.assertIn("Settings › Connectors", str(ctx.exception))
+        message = str(ctx.exception)
+        self.assertIn("não respondeu", message)
+        self.assertIn("tente de novo", message)
+        self.assertNotIn("Connect", message)
+        self.assertNotIn("Settings", message)
+
+    def test_timeout_on_ungranted_domain_keeps_settings_hint(self):
+        """Ungranted-state timeouts keep the consent copy (Settings hint).
+        `system` is ungated, so its unknown state reaches the timeout with the
+        Settings/Connect variant."""
+        def timeout_runner(cmd, timeout):
+            raise subprocess.TimeoutExpired(cmd, timeout)
+
+        self.manager._runner = timeout_runner
+        # system row is unknown -> the "ungranted" side of the split
+        self.assertEqual(self.manager.state.read()["system"]["status"], "unknown")
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("system", "front_app", {})
+        message = str(ctx.exception)
+        self.assertIn("consentimento", message)
+        self.assertIn("Settings › Connectors", message)
+        self.assertNotIn("reexecuto", message)
 
     def test_deny_maps_to_ptbr_error_and_persists_denied(self):
         def deny_runner(cmd, timeout):
@@ -339,6 +383,19 @@ class TestFailureMappingAndConsent(unittest.TestCase):
         self.assertIn("-1743", str(ctx.exception))
         self.assertIn("Settings › Connectors", str(ctx.exception))
         self.assertEqual(self.manager.state.read()["notes"]["status"], "denied")
+
+    def test_notes_create_no_account_marker_maps_to_ptbr(self):
+        """NOTES_CREATE's structured in-script error (no Notes account) maps to
+        the PT-BR account-setup tool error, not the generic script-error copy."""
+        self.manager.state.record("notes", "granted")
+        self.manager._runner = lambda cmd, timeout: Outcome(
+            1, "", "execution error: Notes got an error: %s (-2700)" % NO_ACCOUNT_MARKER
+        )
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("notes", "create", {"title": "T"})
+        message = str(ctx.exception)
+        self.assertIn("configure uma conta no Notas primeiro", message)
+        self.assertNotIn("action failed", message)
 
     def test_other_stderr_maps_to_english_trimmed_error(self):
         def boom_runner(cmd, timeout):

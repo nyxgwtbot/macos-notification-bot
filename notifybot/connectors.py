@@ -35,9 +35,13 @@ Outcome classification (actions and probes share it):
 - exit 0                                              -> ok (probe: granted)
 - subprocess.TimeoutExpired                           -> probe: needs_consent
                                                         action: PT-BR timeout error
-   (a hanging TCC consent prompt is the common cause)
+   (state split: an ALREADY-granted domain gets first-use/sync retry wording
+    with NO Settings/Connect redirect; ungranted states get the consent hint —
+    a hanging TCC consent prompt is the common cause there)
 - stderr contains -1743 / "Not authorized"            -> denied (persisted;
                                                         action: PT-BR error)
+- stderr contains the no-account marker               -> action: PT-BR error
+  (NOTES_CREATE raises "connectors-no-notes-account")    account setup first
 - any other non-zero exit                             -> probe: denied
                                                         action: error w/ trimmed
                                                         stderr (English)
@@ -122,6 +126,12 @@ ERR_PARAMS_DICT = "params must be a JSON object"
 
 # Display names used inside PT-BR user-facing error strings.
 _DISPLAY_NAMES: Dict[str, str] = {"reminders": "Reminders", "notes": "Notes", "system": "System"}
+
+# Structured in-script error marker: NOTES_CREATE raises this AppleScript error
+# literal when no Notes account exists (count of accounts is 0); the Python
+# classifier maps it to the PT-BR "set up an account first" tool error. The
+# literal lives ONLY in the frozen script + this constant (kept in sync).
+NO_ACCOUNT_MARKER = "connectors-no-notes-account"
 
 # ---------------------------------------------------------------------------
 # Static AppleScript sources — FROZEN constants; the ONLY input channel is
@@ -208,7 +218,7 @@ on run argv
 	set _maxCount to (item 2 of argv) as integer
 	set _names to {}
 	tell application id "com.apple.Notes"
-		set _names to (name of notes whose name contains _query)
+		set _names to (name of notes of account 1 whose name contains _query)
 	end tell
 	if _maxCount is less than (count of _names) then
 		set _names to items 1 through _maxCount of _names
@@ -222,7 +232,7 @@ NOTES_READ = """
 on run argv
 	set _name to (item 1 of argv) as text
 	tell application id "com.apple.Notes"
-		set _matches to (notes whose name is _name)
+		set _matches to (notes of account 1 whose name is _name)
 		if (count of _matches) is 0 then
 			return "not_found"
 		end if
@@ -236,10 +246,13 @@ on run argv
 	set _title to (item 1 of argv) as text
 	set _body to (item 2 of argv) as text
 	tell application id "com.apple.Notes"
+		if (count of accounts) is 0 then
+			error "connectors-no-notes-account"
+		end if
 		if _body is "" then
-			make new note with properties {name:_title, body:_title}
+			make new note at folder 1 of account 1 with properties {name:_title, body:_title}
 		else
-			make new note with properties {name:_title, body:_body}
+			make new note at folder 1 of account 1 with properties {name:_title, body:_body}
 		end if
 	end tell
 	return "ok"
@@ -645,9 +658,15 @@ class ConnectorManager:
         try:
             outcome = self._execute(plan.cmd)
         except _ScriptFailure as failure:
+            # Snapshot the PRE-failure consent state: the timeout copy split
+            # keys on it (granted -> retry wording only; ungranted -> the
+            # Settings/Connect consent hint).
+            pre_status = self.state.read()[domain]["status"]
             if failure.kind == "denied" and domain in GATED_DOMAINS:
                 self.state.record(domain, STATUS_DENIED)
-            raise self._action_failure_error(domain, failure) from None
+            raise self._action_failure_error(
+                domain, failure, granted=pre_status == STATUS_GRANTED
+            ) from None
 
         result = self._normalize(domain, plan, outcome)
 
@@ -700,11 +719,22 @@ class ConnectorManager:
         raise _ScriptFailure(kind, returncode, stderr)
 
     @staticmethod
-    def _action_failure_error(domain: str, failure: _ScriptFailure) -> ConnectorError:
+    def _action_failure_error(
+        domain: str, failure: _ScriptFailure, granted: bool = False
+    ) -> ConnectorError:
         """Map a classified script failure to the FINAL user-visible message
-        (PT-BR for the consent family; English for script errors)."""
+        (PT-BR for the consent family; English for script errors). The timeout
+        split is state-aware: a timeout on an ALREADY-granted domain is not a
+        consent problem (first-use/warm-up/sync is the likely cause), so it
+        gets retry wording with NO Settings/Connect redirect; the Settings
+        consent hint is reserved for ungranted-state timeouts."""
         display = _DISPLAY_NAMES[domain]
         if failure.kind == "timeout":
+            if granted:
+                return ConnectorError(
+                    f"{display} não respondeu a tempo — possível primeiro uso/sincronização; "
+                    "tente de novo que eu reexecuto."
+                )
             return ConnectorError(
                 f"{display} não respondeu em {int(CONNECTORS_TIMEOUT_S)}s — pode ter aparecido "
                 "um prompt de consentimento do macOS pendente (aprove-o com o aplicativo em "
@@ -716,6 +746,10 @@ class ConnectorManager:
                 f"O macOS negou a automação de {display} (-1743 / não autorizado). "
                 f"Conecte {domain} em Settings › Connectors e aprove o prompt de consentimento "
                 "com o aplicativo em foco."
+            )
+        if failure.kind == "error" and NO_ACCOUNT_MARKER in (failure.stderr or "").lower():
+            return ConnectorError(
+                "Nenhuma conta configurada — configure uma conta no Notas primeiro."
             )
         detail = _truncate_bytes(failure.stderr.strip(), 200) or "(sem stderr)"
         return ConnectorError(
