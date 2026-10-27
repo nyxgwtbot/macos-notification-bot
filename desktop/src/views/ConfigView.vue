@@ -4,7 +4,7 @@
       <ion-toolbar>
         <ion-title>Settings</ion-title>
         <ion-buttons slot="end">
-          <ion-button :disabled="store.configLoading || store.configSaving" aria-label="Discard changes" @click="discard">
+          <ion-button :disabled="store.configLoading || store.configSaving" aria-label="Reload settings" title="Reload settings" @click="discard">
             <ion-icon aria-hidden="true" :icon="refreshOutline" />
           </ion-button>
         </ion-buttons>
@@ -109,6 +109,14 @@
                 @ionInput="onPollIntervalInput"
               />
             </div>
+            <!-- ST4: SAVE lives in the card footer row, aligned right (it saves the whole config) -->
+            <div class="nb-card-footer nb-save-row">
+              <span v-if="store.lastSavedAt" class="nb-saved-at">saved at {{ formatIsoShort(store.lastSavedAt) }}</span>
+              <ion-button fill="solid" :disabled="store.configSaving" @click="save">
+                <ion-spinner v-if="store.configSaving" name="crescent" />
+                <template v-else>Save</template>
+              </ion-button>
+            </div>
           </ion-card-content>
         </ion-card>
 
@@ -189,15 +197,7 @@
           </ion-card-content>
         </ion-card>
 
-        <!-- save + errors -->
-        <div class="nb-save-row">
-          <ion-button fill="solid" :disabled="store.configSaving" @click="save">
-            <ion-spinner v-if="store.configSaving" name="crescent" />
-            <template v-else>Save</template>
-          </ion-button>
-          <span v-if="store.lastSavedAt" class="nb-saved-at">saved at {{ formatIsoShort(store.lastSavedAt) }}</span>
-        </div>
-
+        <!-- validation + server errors -->
         <div v-if="validationErrors.length > 0" class="nb-banner nb-banner-err">
           <div>
             <strong>Fix before saving:</strong>
@@ -538,8 +538,9 @@ onMounted(async () => {
   padding-left: var(--nb-space-4);
   font-size: var(--nb-fs-secondary);
 }
+/* ST1: calm separators — solid hairline (was dashed) */
 .nb-connector-row {
-  border-bottom: 1px dashed var(--nb-border-subtle);
+  border-bottom: 1px solid var(--nb-border-default);
   padding: var(--nb-space-2) 0;
 }
 .nb-connector-row:last-of-type {
@@ -560,13 +561,34 @@ onMounted(async () => {
   width: var(--nb-space-6);
   height: var(--nb-space-6);
 }
+/* ST2: Bot & Ollama fields read as editable inputs — elevated surface,
+   strong hairline, radius, focus ring; labels stay small/muted (Ion stacked) */
 .nb-field {
   display: flex;
   flex-direction: column;
   gap: var(--nb-space-2);
+  max-width: 520px;
+}
+.nb-field ion-input {
+  background: var(--nb-bg-elevated);
+  border: 1px solid var(--nb-border-strong);
+  border-radius: var(--nb-radius-md);
+  padding: var(--nb-space-2) var(--nb-space-3);
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+.nb-field ion-input:focus-within {
+  border-color: var(--nb-info);
+  box-shadow: 0 0 0 2px var(--nb-info-muted);
+}
+/* ST2: labels stay small + muted above the values (ion-input internals are
+   light-DOM-scoped, so :deep() reaches them) */
+.nb-field :deep(.label-text-wrapper) {
+  font-size: var(--nb-fs-secondary);
+  color: var(--nb-text-secondary);
+  margin-bottom: var(--nb-space-1);
 }
 .nb-action-row {
-  border-bottom: 1px dashed var(--nb-border-subtle);
+  border-bottom: 1px solid var(--nb-border-default);
   padding-bottom: var(--nb-space-2);
   margin-bottom: var(--nb-space-3);
 }
@@ -602,11 +624,11 @@ onMounted(async () => {
   font-family: var(--nb-mono);
   font-size: var(--nb-fs-micro);
 }
+/* ST4: right-aligned save footer inside the Bot & Ollama card
+   (.nb-card-footer supplies the 12px top inset) */
 .nb-save-row {
-  display: flex;
-  align-items: center;
+  justify-content: flex-end;
   gap: var(--nb-space-3);
-  margin: var(--nb-space-3) 0 var(--nb-space-4);
 }
 .nb-saved-at {
   font-size: var(--nb-fs-secondary);
