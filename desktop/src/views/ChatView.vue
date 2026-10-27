@@ -1,7 +1,7 @@
 <template>
   <ion-page>
     <ion-header>
-      <ion-toolbar>
+      <ion-toolbar class="nb-page-header">
         <ion-title>Chat</ion-title>
         <ion-buttons slot="end" class="nb-header-sessions">
           <ion-button

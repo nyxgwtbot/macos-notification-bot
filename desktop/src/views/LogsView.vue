@@ -1,7 +1,7 @@
 <template>
   <ion-page>
     <ion-header>
-      <ion-toolbar>
+      <ion-toolbar class="nb-page-header">
         <ion-title>Logs</ion-title>
       </ion-toolbar>
     </ion-header>

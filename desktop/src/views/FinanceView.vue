@@ -1,7 +1,7 @@
 <template>
   <ion-page>
     <ion-header>
-      <ion-toolbar>
+      <ion-toolbar class="nb-page-header">
         <ion-title>Finance (legacy)</ion-title>
         <ion-buttons slot="end">
           <ion-note class="nb-legacy-note">

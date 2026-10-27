@@ -36,11 +36,21 @@ import { chatbubblesOutline, gridOutline, settingsOutline, terminalOutline } fro
   border-bottom: 1px solid var(--nb-border-default);
 }
 
+/* X2: label+icon pairs get one micro-gap and inline page padding.
+   The icon/label gap lives on the shadow button (part=native) — the host-level
+   gap alone never reaches it. */
 .nb-nav ion-tab-button {
-  flex-direction: row;
   gap: var(--nb-space-2);
+  padding-inline: var(--nb-space-3);
   min-height: 44px;
   height: 44px;
+}
+
+.nb-nav ion-tab-button::part(native) {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: var(--nb-space-2);
 }
 
 .nb-nav ion-tab-button ion-icon {

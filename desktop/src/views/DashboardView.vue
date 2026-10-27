@@ -1,7 +1,7 @@
 <template>
   <ion-page>
     <ion-header>
-      <ion-toolbar>
+      <ion-toolbar class="nb-page-header">
         <ion-title>Status</ion-title>
         <!-- S2: page header row carries the feed liveness badge inline (title at
              fs-title-lg + badge on ONE row; shared pattern lands in X1) -->

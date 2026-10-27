@@ -1,7 +1,7 @@
 <template>
   <ion-page>
     <ion-header>
-      <ion-toolbar>
+      <ion-toolbar class="nb-page-header">
         <ion-title>Settings</ion-title>
         <ion-buttons slot="end">
           <ion-button :disabled="store.configLoading || store.configSaving" aria-label="Reload settings" title="Reload settings" @click="discard">
