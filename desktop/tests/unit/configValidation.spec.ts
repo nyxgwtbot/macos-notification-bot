@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest';
 
 import {
   KNOWN_RULE_FIELDS,
+  operationallyRelevantChange,
   splitDetailsByField,
   validateActionEntries,
   validateConfigDraft,
@@ -110,7 +111,7 @@ describe('action registry checks', () => {
       { id: 'log', match_hint: 'y', type: 'builtin' as const, enabled: true, config: {} }
     ];
     const details = validateActionEntries(actions);
-    expect(details.join('\n')).toContain("duplicado: 'log'");
+    expect(details.join('\n')).toContain("duplicate action id: 'log'");
   });
 
   test('unknown action type rejected', () => {
@@ -118,7 +119,7 @@ describe('action registry checks', () => {
       { id: 'webhook', match_hint: '', type: 'shell' as never, enabled: true, config: {} }
     ];
     const details = validateActionEntries(actions);
-    expect(details.join('\n')).toContain("'builtin' ou 'command'");
+    expect(details.join('\n')).toContain("'builtin' or 'command'");
   });
 
   test('empty id and non-bool enabled rejected', () => {
@@ -127,8 +128,8 @@ describe('action registry checks', () => {
       { id: 'log', match_hint: '', type: 'builtin', enabled: false, config: {} },
       { id: 'telegram', match_hint: '', type: 'builtin', enabled: 'true' as never, config: {} }
     ]);
-    expect(details.join('\n')).toContain('id é obrigatório');
-    expect(details.join('\n')).toContain('enabled deve ser booleano');
+    expect(details.join('\n')).toContain('id is required');
+    expect(details.join('\n')).toContain('enabled must be a boolean');
   });
 
   test('command actions are legal', () => {
@@ -145,7 +146,7 @@ describe('rule condition checks', () => {
       { name: 'r1', condition: { notAField: ['x'] }, actions: ['log'] }
     ];
     const details = validateRuleConditionKeys(rules);
-    expect(details.join('\n')).toContain("desconhecido 'notAField'");
+    expect(details.join('\n')).toContain("unknown condition field 'notAField'");
     expect(details.join('\n')).toContain(KNOWN.join(', '));
   });
 
@@ -171,8 +172,8 @@ describe('rule condition checks', () => {
       { name: 'r', condition: { urgency: 3 as never }, actions: [] }
     ]);
     const joined = details.join('\n');
-    expect(joined).toContain("valores de 'urgency'");
-    expect(joined).toContain("'actions' deve ser uma lista");
+    expect(joined).toContain("condition values for 'urgency'");
+    expect(joined).toContain("'actions' must be a list");
   });
 
   test('missing name/condition rejected', () => {
@@ -193,12 +194,22 @@ describe('full draft edge cases', () => {
   });
 
   test('non-object drafts rejected with a single message', () => {
-    expect(validateConfigDraft(null)).toEqual(['config deve ser um objeto']);
-    expect(validateConfigDraft('str')).toEqual(['config deve ser um objeto']);
+    expect(validateConfigDraft(null)).toEqual(['config must be an object']);
+    expect(validateConfigDraft('str')).toEqual(['config must be an object']);
+  });
+
+  test('no PT-BR wording leaks into client mirror details', () => {
+    const details = validateConfigDraft(
+      validConfig({ poll_interval: 0, router: { min_confidence: 5, timeout: 0 }, ollama: { url: '', model: '', timeout: 0 } })
+    );
+    const joined = details.join('\n');
+    for (const pt of ['deve ser', 'não', 'obrigatório', 'desconhecido', 'inválida']) {
+      expect(joined).not.toContain(pt);
+    }
   });
 });
 
-describe('validateDraftFields (loop2 iterB inline rules)', () => {
+describe('validateDraftFields (loop2 iterC inline rules)', () => {
   const valid = {
     ollamaUrl: 'http://127.0.0.1:11434/api/chat',
     ollamaModel: 'llama3',
@@ -211,21 +222,39 @@ describe('validateDraftFields (loop2 iterB inline rules)', () => {
     expect(validateDraftFields(valid)).toEqual({});
   });
 
-  test('url requires a non-empty http(s) address', () => {
-    expect(validateDraftFields({ ...valid, ollamaUrl: '' }).ollamaUrl).toContain('non-empty');
-    expect(validateDraftFields({ ...valid, ollamaUrl: '127.0.0.1:11434' }).ollamaUrl).toContain('http:// or https://');
-    expect(validateDraftFields({ ...valid, ollamaUrl: 'ftp://x' }).ollamaUrl).toContain('http:// or https://');
-    expect(validateDraftFields({ ...valid, ollamaUrl: 'https://ollama.lan' }).ollamaUrl).toBeUndefined();
+  test('the four mission messages surface verbatim (EN)', () => {
+    const errors = validateDraftFields({
+      ollamaUrl: 'ftp://x',
+      ollamaModel: ' ',
+      ollamaTimeout: '0',
+      minConfidence: '5',
+      pollInterval: '0'
+    });
+    expect(errors.ollamaUrl).toBe('URL must start with http:// or https://');
+    expect(errors.ollamaModel).toBe('model must not be empty');
+    expect(errors.ollamaTimeout).toBe('timeout must be greater than 0');
+    expect(errors.minConfidence).toBe('min_confidence must be between 0 and 1');
+    expect(errors.pollInterval).toBe('poll_interval must be greater than 0');
   });
 
-  test('model, timeout, min_confidence and poll_interval follow the API rules', () => {
-    expect(validateDraftFields({ ...valid, ollamaModel: '  ' }).ollamaModel).toContain('empty');
-    expect(validateDraftFields({ ...valid, ollamaTimeout: '0' }).ollamaTimeout).toContain('> 0');
-    expect(validateDraftFields({ ...valid, ollamaTimeout: 'abc' }).ollamaTimeout).toContain('> 0');
-    expect(validateDraftFields({ ...valid, minConfidence: '1.2' }).minConfidence).toContain('between 0 and 1');
-    expect(validateDraftFields({ ...valid, minConfidence: '-0.1' }).minConfidence).toContain('between 0 and 1');
-    expect(validateDraftFields({ ...valid, pollInterval: 'abc' }).pollInterval).toContain('> 0');
-    expect(validateDraftFields({ ...valid, pollInterval: '0' }).pollInterval).toContain('> 0');
+  test('url rule: empty and bad-scheme share the one message; https passes', () => {
+    expect(validateDraftFields({ ...valid, ollamaUrl: '' }).ollamaUrl).toBe('URL must start with http:// or https://');
+    expect(validateDraftFields({ ...valid, ollamaUrl: '127.0.0.1:11434' }).ollamaUrl).toBe('URL must start with http:// or https://');
+    expect(validateDraftFields({ ...valid, ollamaUrl: 'ftp://x' }).ollamaUrl).toBe('URL must start with http:// or https://');
+    expect(validateDraftFields({ ...valid, ollamaUrl: 'https://ollama.lan' }).ollamaUrl).toBeUndefined();
+    expect(validateDraftFields({ ...valid, ollamaUrl: 'HTTP://OLLAMA.LAN' }).ollamaUrl).toBeUndefined();
+  });
+
+  test('bounds: timeout/min_confidence/poll_interval edge values', () => {
+    expect(validateDraftFields({ ...valid, ollamaTimeout: 'abc' }).ollamaTimeout).toBeDefined();
+    expect(validateDraftFields({ ...valid, ollamaTimeout: '-1' }).ollamaTimeout).toBeDefined();
+    expect(validateDraftFields({ ...valid, ollamaTimeout: '0.5' }).ollamaTimeout).toBeUndefined();
+    expect(validateDraftFields({ ...valid, minConfidence: '-0.1' }).minConfidence).toBeDefined();
+    expect(validateDraftFields({ ...valid, minConfidence: '1.5' }).minConfidence).toBeDefined();
+    expect(validateDraftFields({ ...valid, minConfidence: '0' }).minConfidence).toBeUndefined();
+    expect(validateDraftFields({ ...valid, minConfidence: '1' }).minConfidence).toBeUndefined();
+    expect(validateDraftFields({ ...valid, pollInterval: 'abc' }).pollInterval).toBeDefined();
+    expect(validateDraftFields({ ...valid, pollInterval: '0.0001' }).pollInterval).toBeUndefined();
   });
 });
 
@@ -238,27 +267,34 @@ describe('splitDetailsByField (save response -> inline field mapping)', () => {
       "'ollama.timeout' deve ser um número > 0",
       "'ollama.model' deve ser uma string não vazia"
     ]);
-    expect(fieldErrors.ollamaUrl).toContain('Ollama URL');
-    expect(fieldErrors.ollamaModel).toContain('model');
-    expect(fieldErrors.ollamaTimeout).toContain('> 0');
-    expect(fieldErrors.minConfidence).toContain('between 0 and 1');
-    expect(fieldErrors.pollInterval).toContain('> 0');
+    expect(fieldErrors.ollamaUrl).toBe('URL must start with http:// or https://');
+    expect(fieldErrors.ollamaModel).toBe('model must not be empty');
+    expect(fieldErrors.ollamaTimeout).toBe('timeout must be greater than 0');
+    expect(fieldErrors.minConfidence).toBe('min_confidence must be between 0 and 1');
+    expect(fieldErrors.pollInterval).toBe('poll_interval must be greater than 0');
     expect(unmapped).toEqual([]);
   });
 
-  test('keeps non-field details in the unmapped banner list', () => {
+  test('mapped field errors never carry the PT-BR server wording', () => {
+    const { fieldErrors, unmapped } = splitDetailsByField([
+      "'router.min_confidence' deve ser um número entre 0 e 1"
+    ]);
+    expect(fieldErrors.minConfidence).not.toContain('deve ser');
+    expect(unmapped).toEqual([]);
+  });
+
+  test('keeps non-field details in the unmapped list (view shows a generic line)', () => {
     const { fieldErrors, unmapped } = splitDetailsByField([
       "regra 'x': campo de condição desconhecido 'weird' (permitidos: app)",
       "'ollama.model' deve ser uma string não vazia"
     ]);
-    expect(fieldErrors.ollamaModel).toBeDefined();
+    expect(fieldErrors.ollamaModel).toBe('model must not be empty');
     expect(unmapped).toHaveLength(1);
-    expect(unmapped[0]).toContain('desconhecido');
   });
 
   test('maps the bare 400 error text when details are absent', () => {
     const { fieldErrors } = splitDetailsByField(["config inválida: 'poll_interval' deve ser um número > 0"]);
-    expect(fieldErrors.pollInterval).toBeDefined();
+    expect(fieldErrors.pollInterval).toBe('poll_interval must be greater than 0');
   });
 
   test('first field detail wins on duplicates', () => {
@@ -266,6 +302,56 @@ describe('splitDetailsByField (save response -> inline field mapping)', () => {
       "'ollama.url' deve ser uma string não vazia",
       "'ollama.url' outro detalhe"
     ]);
-    expect(fieldErrors.ollamaUrl).toContain('Ollama URL');
+    expect(fieldErrors.ollamaUrl).toBe('URL must start with http:// or https://');
+  });
+});
+
+describe('operationallyRelevantChange (post-save restart banner gate)', () => {
+  const base = {
+    ollamaUrl: 'http://127.0.0.1:11434/api/chat',
+    ollamaModel: 'm',
+    ollamaTimeout: '30',
+    minConfidence: '0.5',
+    pollInterval: '2'
+  };
+
+  test('identical drafts mean no restart needed', () => {
+    expect(operationallyRelevantChange(base, base)).toBe(false);
+  });
+
+  test('each of the five fields triggers the change', () => {
+    const deltas: Array<[keyof typeof base, string]> = [
+      ['ollamaUrl', 'http://other:11434'],
+      ['ollamaModel', 'other-model'],
+      ['ollamaTimeout', '60'],
+      ['minConfidence', '0.9'],
+      ['pollInterval', '5']
+    ];
+    for (const [key, value] of deltas) {
+      const next = { ...base, [key]: value };
+      expect(operationallyRelevantChange(base, next)).toBe(true);
+      expect(operationallyRelevantChange(next, base)).toBe(true);
+    }
+  });
+
+  test('numeric formatting differences are not a change', () => {
+    expect(
+      operationallyRelevantChange(base, {
+        ...base,
+        minConfidence: '.5',
+        pollInterval: '2.0',
+        ollamaTimeout: '30.00'
+      })
+    ).toBe(false);
+  });
+
+  test('whitespace-only url/model edits are not a change', () => {
+    expect(
+      operationallyRelevantChange(base, {
+        ...base,
+        ollamaUrl: '  http://127.0.0.1:11434/api/chat  ',
+        ollamaModel: ' m '
+      })
+    ).toBe(false);
   });
 });

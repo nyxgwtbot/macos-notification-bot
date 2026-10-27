@@ -136,29 +136,38 @@
                 <p v-if="fieldErrors.pollInterval" class="nb-field-error">{{ fieldErrors.pollInterval }}</p>
               </div>
             </div>
+            <!-- iterC: unmapped server 400 details never surface verbatim
+                 (api.py details are PT-BR) — one muted generic line instead -->
+            <p v-if="unmappedSaveDetails.length > 0" class="nb-muted nb-save-reject-note">
+              The server rejected the config — check the values
+            </p>
             <!-- ST4: SAVE lives in the card footer row, aligned right (it saves the whole config);
-                 success = transient "Saved" flash (2s, label back) — validation is inline per field -->
+                 success = transient "Saved" flash (2s, label back) — validation is inline per field.
+                 iterC restart-to-apply: tinted banner next to SAVE, only when an ollama/router/poll
+                 value changed vs the last-loaded config. -->
             <div class="nb-card-footer nb-save-row">
               <span v-if="store.lastSavedAt" class="nb-saved-at">saved at {{ formatIsoShort(store.lastSavedAt) }}</span>
+              <div v-if="showRestartRow" class="nb-restart-apply">
+                <span class="nb-restart-apply-label" title="The daemon reads config only at boot">
+                  Restart the daemon to apply
+                </span>
+                <ion-button
+                  size="small"
+                  fill="outline"
+                  class="nb-restart-btn"
+                  :class="{ 'nb-restart-armed': restartArmed }"
+                  :disabled="store.daemonBusy"
+                  aria-label="Restart daemon to apply the saved config"
+                  @click="onSaveRestartClick"
+                >
+                  <ion-spinner v-if="store.daemonBusy" name="crescent" />
+                  <template v-else>{{ restartArmed ? 'Confirm restart?' : 'Restart' }}</template>
+                </ion-button>
+              </div>
               <ion-button fill="solid" class="nb-save-btn" :class="{ 'nb-save-flash': saveFlash }" :disabled="store.configSaving" @click="save">
                 <ion-spinner v-if="store.configSaving" name="crescent" />
                 <template v-else>{{ saveFlash ? 'Saved' : 'Save' }}</template>
               </ion-button>
-            </div>
-            <!-- post-save restart: double-arm (mirrors the Dashboard pattern), inline, no dialog -->
-            <div v-if="showRestartRow" class="nb-save-restart-row">
-              <ion-button
-                size="small"
-                fill="outline"
-                class="nb-restart-btn"
-                :class="{ 'nb-restart-armed': restartArmed }"
-                :disabled="store.daemonBusy"
-                @click="onSaveRestartClick"
-              >
-                <ion-spinner v-if="store.daemonBusy" name="crescent" />
-                <template v-else>{{ restartArmed ? 'Confirm restart?' : 'Restart daemon' }}</template>
-              </ion-button>
-              <span class="nb-muted">The daemon reads config only at boot — restart to apply the saved changes.</span>
             </div>
           </ion-card-content>
         </ion-card>
@@ -249,14 +258,6 @@
             </ul>
           </div>
         </div>
-        <div v-if="saveBannerErrors.length > 0" class="nb-banner nb-banner-err">
-          <div>
-            <strong>Server rejected the change (400):</strong>
-            <ul class="nb-details">
-              <li v-for="detail in saveBannerErrors" :key="detail">{{ detail }}</li>
-            </ul>
-          </div>
-        </div>
         <div v-if="restartNote" class="nb-banner nb-banner-warn">{{ restartNote }}</div>
       </template>
     </ion-content>
@@ -292,10 +293,12 @@ import { refreshOutline } from 'ionicons/icons';
 import { useBotStore } from '@/stores/bot';
 import { notifyClient, errorText } from '@/services/notifyClient';
 import {
+  operationallyRelevantChange,
   splitDetailsByField,
   validateConfigDraft,
   validateRuleConditionKeys,
   validateDraftFields,
+  type ConfigDraftFields,
   type ConfigFieldKey
 } from '@/services/configValidation';
 import { formatIsoShort } from '@/utils/time';
@@ -401,10 +404,20 @@ const restartArmed = ref(false);
 const restartPending = ref(false);
 let restartArmTimer: number | null = null;
 
-const saveBannerErrors = computed<string[]>(() => {
-  // only unmapped leftovers stay in the banner: every field-named server
-  // detail renders inline under its input (POST /api/config 400s always
-  // carry details[] per api.py validate_config_payload)
+/** Config values as last loaded (set in buildDraft only — not on save):
+ * the reference for "operationally relevant change" after a save, since the
+ * daemon keeps running on the loaded values until it restarts. */
+const loadedFields = ref<ConfigDraftFields>({
+  ollamaUrl: '',
+  ollamaModel: '',
+  ollamaTimeout: '',
+  minConfidence: '',
+  pollInterval: ''
+});
+
+const unmappedSaveDetails = computed<string[]>(() => {
+  // server 400 leftovers with no field match: rendered as one muted generic
+  // line (verbatim details never reach the UI — api.py phrases them PT-BR)
   return splitDetailsByField(store.configSaveErrors).unmapped;
 });
 const validationBannerErrors = computed<string[]>(() => splitDetailsByField(validationErrors.value).unmapped);
@@ -439,8 +452,13 @@ function onSaveRestartClick(): void {
     return;
   }
   disarmRestart();
-  restartPending.value = false;
-  void store.restartDaemon().then(() => store.pollDaemon());
+  // banner stays up through the busy spinner and dismisses when the restart
+  // completes; a failed restart keeps the affordance visible for a retry
+  void store.restartDaemon().then((status) => {
+    if (status === null) return;
+    restartPending.value = false;
+    return store.pollDaemon();
+  });
 }
 
 function clearFieldError(key: ConfigFieldKey): void {
@@ -464,6 +482,13 @@ function buildDraft(config: BotConfig): void {
   draft.ollamaModel = config.ollama?.model ?? '';
   draft.ollamaTimeout = String(config.ollama?.timeout ?? 30);
   draft.minConfidence = String(config.router?.min_confidence ?? 0.5);
+  loadedFields.value = {
+    ollamaUrl: draft.ollamaUrl,
+    ollamaModel: draft.ollamaModel,
+    ollamaTimeout: draft.ollamaTimeout,
+    minConfidence: draft.minConfidence,
+    pollInterval: draft.pollInterval
+  };
   draft.actions = (config.actions ?? []).map((entry) => ({
     id: entry.id,
     type: entry.type === 'command' ? 'command' : 'builtin',
@@ -638,6 +663,9 @@ async function save(): Promise<void> {
   if (clientErrors.length > 0 || Object.keys(fieldChecks).length > 0) return;
   const ok = await store.saveConfig(payload);
   if (ok) {
+    // success: previous inline errors are resolved — clean state
+    fieldErrors.value = {};
+    validationErrors.value = [];
     // success: transient "Saved" flash (2s, label back)
     clearSaveFlashTimer();
     saveFlash.value = true;
@@ -645,17 +673,28 @@ async function save(): Promise<void> {
       saveFlash.value = false;
       saveFlashTimer = null;
     }, 2000);
-    // post-save restart: double-arm affordance (electron bridge only)
-    if (restartBridge.value) {
-      disarmRestart();
-      restartPending.value = true;
-    } else {
-      restartNote.value =
-        'Config saved. Restart the daemon manually (`python3 bot.py`) — process manager is available only in the Electron app.';
+    // restart-to-apply (iterC): only when an ollama/router/poll value changed
+    // vs the last-loaded config; values still equal -> no banner
+    const changed = operationallyRelevantChange(loadedFields.value, {
+      ollamaUrl: draft.ollamaUrl,
+      ollamaModel: draft.ollamaModel,
+      ollamaTimeout: draft.ollamaTimeout,
+      minConfidence: draft.minConfidence,
+      pollInterval: draft.pollInterval
+    });
+    if (changed) {
+      if (restartBridge.value) {
+        disarmRestart();
+        restartPending.value = true;
+      } else {
+        restartNote.value =
+          'Config saved. Restart the daemon manually (`python3 bot.py`) — process manager is available only in the Electron app.';
+      }
     }
   } else {
-    // server 400: map the details[] onto the offending fields; non-field
-    // details stay in the banner (saveBannerErrors computed)
+    // server 400 fallback: map field-named details[] onto the offending fields
+    // (EN text from the same table); non-field details collapse into the one
+    // muted generic line (unmappedSaveDetails) — never verbatim PT-BR
     fieldErrors.value = { ...fieldErrors.value, ...splitDetailsByField(store.configSaveErrors).fieldErrors };
   }
 }
@@ -798,16 +837,23 @@ onUnmounted(() => {
   --border-style: solid;
   --border-color: var(--nb-green);
 }
-/* post-save restart affordance: double-arm button + inline note (no dialog) */
-.nb-save-restart-row {
+/* iterC restart-to-apply: tinted banner row next to SAVE (shown only when an
+   operationally relevant value changed); double-arm inside (armed = filled tint) */
+.nb-restart-apply {
   display: flex;
   align-items: center;
-  gap: var(--nb-space-3);
-  margin-top: var(--nb-space-2);
-  padding-top: var(--nb-space-2);
-  border-top: 1px solid var(--nb-border-subtle);
+  gap: var(--nb-space-2);
+  background: var(--nb-chip-warn-bg);
+  border: 1px solid var(--nb-warning);
+  border-radius: var(--nb-radius-md);
+  padding: var(--nb-space-1) var(--nb-space-2);
 }
-.nb-save-restart-row .nb-restart-armed {
+.nb-restart-apply-label {
+  font-size: var(--nb-fs-secondary);
+  color: var(--nb-chip-warn-fg);
+  white-space: nowrap;
+}
+.nb-restart-apply .nb-restart-armed {
   --background: var(--nb-chip-warn-bg);
   --border-color: var(--nb-warning);
   --color: var(--nb-chip-warn-fg);
@@ -816,5 +862,10 @@ onUnmounted(() => {
 .nb-saved-at {
   font-size: var(--nb-fs-secondary);
   color: var(--nb-text-secondary);
+}
+/* iterC: single muted line for unmapped server 400 details (no verbatim PT-BR) */
+.nb-save-reject-note {
+  margin: var(--nb-space-1) 0 0;
+  font-size: var(--nb-fs-secondary);
 }
 </style>
