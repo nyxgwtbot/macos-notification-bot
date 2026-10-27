@@ -4,7 +4,7 @@
       <ion-toolbar>
         <ion-title>Settings</ion-title>
         <ion-buttons slot="end">
-          <ion-button :disabled="store.configLoading || store.configSaving" @click="discard">
+          <ion-button :disabled="store.configLoading || store.configSaving" aria-label="Discard changes" @click="discard">
             <ion-icon aria-hidden="true" :icon="refreshOutline" />
           </ion-button>
         </ion-buttons>
@@ -15,8 +15,8 @@
       <ion-spinner v-if="store.configLoading && !store.config" name="crescent" class="nb-center" />
 
       <div v-if="store.configError && !store.config" class="nb-banner nb-banner-err">
-        <span>Erro ao carregar config: {{ store.configError }}</span>
-        <ion-button size="small" fill="outline" @click="discard">Tentar de novo</ion-button>
+        <span>Failed to load config: {{ store.configError }}</span>
+        <ion-button size="small" fill="outline" @click="discard">Retry</ion-button>
       </div>
 
       <!-- Telegram: strictly read-only, secrets never enter config.json via the UI -->
@@ -24,10 +24,10 @@
         <ion-card-header><ion-card-title>Telegram (env-only)</ion-card-title></ion-card-header>
         <ion-card-content>
           <p class="nb-muted">
-            Tokens NÃO são configuráveis aqui: eles vêm de variáveis de ambiente —
-            <code>TELEGRAM_BOT_TOKEN</code> ou <code>TG_BOT_TOKEN</code> e
-            <code>TELEGRAM_ALLOWED_USERS</code> ou <code>TG_CHAT_ID</code>. Segredos nunca entram em
-            <code>config.json</code> pela UI (o servidor rejeita valores não vazios nesses campos).
+            Tokens are not editable here: they come from environment variables —
+            <code>TELEGRAM_BOT_TOKEN</code>/<code>TG_BOT_TOKEN</code> and
+            <code>TELEGRAM_ALLOWED_USERS</code>/<code>TG_CHAT_ID</code>. Secrets never enter
+            <code>config.json</code> through the UI (the server rejects non-empty values for these fields).
           </p>
         </ion-card-content>
       </ion-card>
@@ -114,7 +114,7 @@
 
         <!-- action registry -->
         <ion-card>
-          <ion-card-header><ion-card-title>Registro de ações</ion-card-title></ion-card-header>
+          <ion-card-header><ion-card-title>Actions</ion-card-title></ion-card-header>
           <ion-card-content>
             <div v-for="(entry, index) in draft.actions" :key="entry.id || index" class="nb-action-row">
               <div class="nb-action-head">
@@ -122,7 +122,7 @@
                 <ion-badge color="medium">{{ entry.type }}</ion-badge>
                 <ion-toggle
                   :checked="entry.enabled"
-                  aria-label="habilitar ação"
+                  aria-label="Enable action"
                   @ionChange="onActionToggle($event as CustomEvent<{ checked: boolean }>, index)"
                 />
               </div>
@@ -146,31 +146,31 @@
 
         <!-- rules: readable table <-> raw JSON editor -->
         <ion-card>
-          <ion-card-header>
-            <ion-card-title>Regras determinísticas</ion-card-title>
-            <div class="nb-mode-switch">
-              <ion-button
-                size="small"
-                :fill="draft.mode === 'structured' ? 'solid' : 'outline'"
-                @click="showStructuredRules"
-              >Tabela</ion-button>
-              <ion-button
-                size="small"
-                :fill="draft.mode === 'raw' ? 'solid' : 'outline'"
-                @click="showRawRules"
-              >JSON</ion-button>
-            </div>
+          <ion-card-header class="nb-rules-header">
+            <ion-card-title>Rules</ion-card-title>
+            <ion-segment
+              class="nb-mode-segment"
+              :value="draft.mode"
+              @ionChange="onModeChange($event)"
+            >
+              <ion-segment-button value="structured">
+                <ion-label>Table</ion-label>
+              </ion-segment-button>
+              <ion-segment-button value="raw">
+                <ion-label>JSON</ion-label>
+              </ion-segment-button>
+            </ion-segment>
           </ion-card-header>
           <ion-card-content>
             <template v-if="draft.mode === 'structured'">
-              <p v-if="draft.rules.length === 0" class="nb-muted">Nenhuma regra — todas as notificações vão para o Router LLM.</p>
+              <p v-if="draft.rules.length === 0" class="nb-muted">No rules — every notification goes to the LLM Router.</p>
               <div v-for="(rule, index) in draft.rules" :key="index" class="nb-rule-row">
-                <div class="nb-rule-name">{{ rule.name || '(sem nome)' }}</div>
+                <div class="nb-rule-name">{{ rule.name || '(unnamed)' }}</div>
                 <div class="nb-rule-cond">
                   <span v-for="(value, key) in rule.condition" :key="key">
                     <code>{{ key }}</code> = {{ condValueText(value) }}
                   </span>
-                  <span v-if="!rule.condition || Object.keys(rule.condition).length === 0" class="nb-muted">sempre verdadeira</span>
+                  <span v-if="!rule.condition || Object.keys(rule.condition).length === 0" class="nb-muted">always true</span>
                 </div>
                 <div class="nb-rule-actions">→ {{ rule.actions.join(' + ') }}</div>
               </div>
@@ -178,7 +178,7 @@
             <template v-else>
               <ion-textarea
                 class="nb-raw-json"
-                aria-label="regras em JSON"
+                aria-label="JSON rules"
                 :auto-grow="true"
                 :rows="14"
                 :value="draft.rawRules"
@@ -193,14 +193,14 @@
         <div class="nb-save-row">
           <ion-button fill="solid" :disabled="store.configSaving" @click="save">
             <ion-spinner v-if="store.configSaving" name="crescent" />
-            <template v-else>Salvar</template>
+            <template v-else>Save</template>
           </ion-button>
-          <span v-if="store.lastSavedAt" class="nb-muted">salvo em {{ formatIsoShort(store.lastSavedAt) }}</span>
+          <span v-if="store.lastSavedAt" class="nb-saved-at">saved at {{ formatIsoShort(store.lastSavedAt) }}</span>
         </div>
 
         <div v-if="validationErrors.length > 0" class="nb-banner nb-banner-err">
           <div>
-            <strong>Corrija antes de salvar:</strong>
+            <strong>Fix before saving:</strong>
             <ul class="nb-details">
               <li v-for="detail in validationErrors" :key="detail">{{ detail }}</li>
             </ul>
@@ -208,7 +208,7 @@
         </div>
         <div v-if="store.configSaveErrors.length > 0" class="nb-banner nb-banner-err">
           <div>
-            <strong>Servidor rejeitou (400):</strong>
+            <strong>Server rejected the change (400):</strong>
             <ul class="nb-details">
               <li v-for="detail in store.configSaveErrors" :key="detail">{{ detail }}</li>
             </ul>
@@ -235,7 +235,10 @@ import {
   IonHeader,
   IonIcon,
   IonInput,
+  IonLabel,
   IonPage,
+  IonSegment,
+  IonSegmentButton,
   IonSpinner,
   IonTextarea,
   IonTitle,
@@ -368,7 +371,7 @@ function buildDraft(config: BotConfig): void {
 
 function buildPayload(): BotConfig {
   const base = store.config;
-  if (!base) throw new Error('config não carregada');
+  if (!base) throw new Error('config not loaded');
   return {
     ...base,
     poll_interval: Number(draft.pollInterval),
@@ -436,11 +439,20 @@ function showStructuredRules(): void {
       draft.rules = parsed as BotRule[];
       rawError.value = null;
     } catch (err) {
-      rawError.value = `JSON inválido: ${err instanceof Error ? err.message : String(err)}`;
+      rawError.value = `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`;
       return;
     }
   }
   draft.mode = 'structured';
+}
+
+function onModeChange(event: CustomEvent): void {
+  const nextMode = String(event.detail?.value || '');
+  if (nextMode === 'raw') {
+    showRawRules();
+  } else if (nextMode === 'structured') {
+    showStructuredRules();
+  }
 }
 
 function onRawRulesInput(event: IonValueEvent): void {
@@ -449,12 +461,12 @@ function onRawRulesInput(event: IonValueEvent): void {
     JSON.parse(draft.rawRules);
     rawError.value = null;
   } catch (err) {
-    rawError.value = `JSON inválido: ${err instanceof Error ? err.message : String(err)}`;
+    rawError.value = `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`;
   }
 }
 
 function condValueText(value: string | string[]): string {
-  return Array.isArray(value) ? value.join(' ou ') : String(value);
+  return Array.isArray(value) ? value.join(' or ') : String(value);
 }
 
 function discard(): void {
@@ -470,16 +482,16 @@ async function confirmRestart(): Promise<void> {
   const bridge = window.notifyAPI?.daemon;
   if (!bridge) {
     restartNote.value =
-      'Config salva. Reinicie o daemon manualmente (python3 bot.py) — o process manager só existe no app Electron.';
+      'Config saved. Restart the daemon manually (`python3 bot.py`) — process manager is available only in the Electron app.';
     return;
   }
   const alert = await alertController.create({
-    header: 'Reiniciar daemon?',
-    message: 'A config é lida apenas no boot do daemon. Reiniciar agora para aplicar as mudanças?',
+    header: 'Restart daemon?',
+    message: 'The daemon reads config only at boot. Restart now to apply the changes?',
     buttons: [
-      { text: 'Mais tarde', role: 'cancel' },
+      { text: 'Later', role: 'cancel' },
       {
-        text: 'Reiniciar',
+        text: 'Restart',
         role: 'destructive',
         handler: () => {
           void store.restartDaemon();
@@ -496,7 +508,7 @@ async function save(): Promise<void> {
     // Raw-mode rules must land in the draft first.
     showStructuredRules();
     if (rawError.value) {
-      validationErrors.value = [`regras em JSON: ${rawError.value}`];
+      validationErrors.value = [`JSON rules: ${rawError.value}`];
       return;
     }
     payload = buildPayload();
@@ -521,33 +533,14 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.nb-content {
-  padding: 12px;
-}
-.nb-banner {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  margin: 0 4px 12px;
-  padding: 10px 14px;
-  border-radius: 10px;
-}
-.nb-banner-err {
-  background: var(--nb-danger-muted, rgba(248, 81, 73, 0.15));
-  color: var(--ion-color-danger);
-}
-.nb-banner-warn {
-  background: var(--nb-warning-muted, rgba(210, 153, 34, 0.15));
-  color: var(--ion-color-warning);
-}
 .nb-details {
-  margin: 6px 0 0;
-  padding-left: 18px;
-  font-size: 12px;
+  margin: var(--nb-space-1) 0 0;
+  padding-left: var(--nb-space-4);
+  font-size: var(--nb-fs-secondary);
 }
 .nb-connector-row {
-  border-bottom: 1px dashed var(--nb-border-subtle, #1e2833);
-  padding: 8px 0;
+  border-bottom: 1px dashed var(--nb-border-subtle);
+  padding: var(--nb-space-2) 0;
 }
 .nb-connector-row:last-of-type {
   border-bottom: none;
@@ -555,75 +548,68 @@ onMounted(async () => {
 .nb-connector-head {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--nb-space-2);
 }
 .nb-connector-hint {
-  margin: 2px 0 4px;
-  font-size: 12px;
+  margin: var(--nb-space-1) 0 0;
+  font-size: var(--nb-fs-secondary);
 }
 .nb-connectors-loading {
   display: block;
-  margin: 12px auto;
-  width: 24px;
-  height: 24px;
+  margin: var(--nb-space-3) auto;
+  width: var(--nb-space-6);
+  height: var(--nb-space-6);
 }
 .nb-field {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--nb-space-2);
 }
 .nb-action-row {
-  border-bottom: 1px dashed var(--nb-border-subtle, #1e2833);
-  padding-bottom: 6px;
-  margin-bottom: 10px;
+  border-bottom: 1px dashed var(--nb-border-subtle);
+  padding-bottom: var(--nb-space-2);
+  margin-bottom: var(--nb-space-3);
 }
 .nb-action-head {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 4px;
+  gap: var(--nb-space-2);
+  margin-bottom: var(--nb-space-1);
 }
-.nb-mode-switch {
+.nb-rules-header {
   display: flex;
-  gap: 4px;
+  align-items: center;
+  justify-content: space-between;
+}
+.nb-mode-segment {
+  max-width: 200px;
 }
 .nb-rule-row {
-  padding: 4px 0;
-  border-bottom: 1px solid var(--nb-border-subtle, #1e2833);
-  font-size: 13px;
+  padding: var(--nb-space-1) 0;
+  border-bottom: 1px solid var(--nb-border-subtle);
+  font-size: var(--nb-fs-secondary);
 }
 .nb-rule-name {
   font-weight: 600;
 }
 .nb-rule-cond code {
-  font-family: var(--nb-mono, monospace);
-  background: var(--nb-bg-elevated, #262f3c);
-  padding: 0 4px;
-  border-radius: 4px;
+  font-family: var(--nb-mono);
+  background: var(--nb-bg-elevated);
+  padding: 0 var(--nb-space-1);
+  border-radius: var(--nb-radius-sm);
 }
 .nb-raw-json {
-  font-family: var(--nb-mono, monospace);
-  font-size: 12px;
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-micro);
 }
 .nb-save-row {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin: 8px 4px 16px;
+  gap: var(--nb-space-3);
+  margin: var(--nb-space-3) 0 var(--nb-space-4);
 }
-.nb-muted {
-  color: var(--nb-text-secondary, var(--ion-color-medium));
-  font-size: 13px;
-}
-.nb-error-line {
-  color: var(--ion-color-danger);
-  font-size: 12px;
-  margin-top: 6px;
-}
-.nb-center {
-  display: block;
-  margin: 32px auto;
-  width: 32px;
-  height: 32px;
+.nb-saved-at {
+  font-size: var(--nb-fs-secondary);
+  color: var(--nb-text-secondary);
 }
 </style>

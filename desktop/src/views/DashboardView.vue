@@ -2,7 +2,7 @@
   <ion-page>
     <ion-header>
       <ion-toolbar>
-        <ion-title>Dashboard</ion-title>
+        <ion-title>Status</ion-title>
       </ion-toolbar>
     </ion-header>
 
@@ -12,63 +12,65 @@
         <ion-spinner v-if="store.feedLoading" name="crescent" />
         <ion-icon aria-hidden="true" :icon="cloudOfflineOutline" />
         <span>API offline: {{ store.feedError }}</span>
-        <ion-button size="small" fill="outline" @click="retryPolls">Tentar de novo</ion-button>
+        <ion-button size="small" fill="outline" @click="retryPolls">Retry</ion-button>
       </div>
 
       <div class="nb-cards">
         <!-- Daemon card: process managed by Electron main (not via the API) -->
         <ion-card>
           <ion-card-header>
-            <ion-card-title>Daemon do bot</ion-card-title>
+            <ion-card-title>Daemon</ion-card-title>
             <ion-badge :color="daemonBadgeColor">{{ daemonBadgeText }}</ion-badge>
           </ion-card-header>
           <ion-card-content>
             <template v-if="store.daemon">
               <div class="nb-kv"><span>PID</span><strong>{{ store.daemon.pid ?? '—' }}</strong></div>
               <div class="nb-kv"><span>Uptime</span><strong>{{ formatUptime(store.daemon.uptimeSec) || '—' }}</strong></div>
-              <div class="nb-kv"><span>Iniciado</span><strong>{{ formatIsoShort(store.daemon.startedAt) || '—' }}</strong></div>
-              <div class="nb-kv"><span>Porta API</span><strong>{{ store.daemon.port ?? '—' }}</strong></div>
-              <div class="nb-kv"><span>Adotado</span><strong>{{ store.daemon.adopted ? 'sim (instância externa)' : 'não (gerenciado aqui)' }}</strong></div>
-              <div v-if="store.daemon.lastError" class="nb-error-line">Erro: {{ store.daemon.lastError }}</div>
+              <div class="nb-kv"><span>Started</span><strong>{{ formatIsoShort(store.daemon.startedAt) || '—' }}</strong></div>
+              <div class="nb-kv"><span>API port</span><strong>{{ store.daemon.port ?? '—' }}</strong></div>
+              <div class="nb-kv"><span>Adopted</span><strong>{{ store.daemon.adopted ? 'yes (external instance)' : 'no (managed here)' }}</strong></div>
+              <div v-if="store.daemon.lastError" class="nb-error-line">Error: {{ store.daemon.lastError }}</div>
             </template>
             <template v-else>
               <p class="nb-muted">
-                {{ store.daemonError === 'bridge-ausente' ? 'Process manager indisponível no modo navegador (vite). Gerencie o daemon via `python3 bot.py`.' : store.daemonError || 'Sem status do daemon.' }}
+                {{ store.daemonError === 'bridge-ausente' ? 'Process manager unavailable in browser mode (vite). Manage the daemon via `python3 bot.py`.' : store.daemonError || 'No daemon status.' }}
               </p>
             </template>
-            <ion-button
-              size="small"
-              fill="outline"
-              :disabled="store.daemonBusy || !daemonBridge"
-              @click="onRestartDaemon"
-            >
-              <ion-spinner v-if="store.daemonBusy" name="crescent" />
-              <template v-else>Reiniciar daemon</template>
-            </ion-button>
+            <div class="nb-card-footer">
+              <ion-button
+                size="small"
+                fill="outline"
+                :disabled="store.daemonBusy || !daemonBridge"
+                @click="onRestartDaemon"
+              >
+                <ion-spinner v-if="store.daemonBusy" name="crescent" />
+                <template v-else>Restart daemon</template>
+              </ion-button>
+            </div>
           </ion-card-content>
         </ion-card>
 
         <!-- Health card: watermark + state + ollama (from GET /api/health) -->
         <ion-card>
           <ion-card-header>
-            <ion-card-title>Estado do bot</ion-card-title>
+            <ion-card-title>Bot state</ion-card-title>
             <ion-badge :color="store.healthError ? 'danger' : 'success'">
-              {{ store.healthError ? 'erro' : 'ok' }}
+              {{ store.healthError ? 'error' : 'ok' }}
             </ion-badge>
           </ion-card-header>
           <ion-card-content>
             <template v-if="store.health">
               <div class="nb-kv"><span>Watermark (last_rec_id)</span><strong>{{ store.health.watermark.last_rec_id }}</strong></div>
-              <div class="nb-kv"><span>Último ciclo (state.updated_at)</span><strong>{{ formatIsoShort(store.health.watermark.updated_at) || '—' }}</strong></div>
+              <div class="nb-kv"><span>Last cycle (state.updated_at)</span><strong>{{ formatIsoShort(store.health.watermark.updated_at) || '—' }}</strong></div>
               <div class="nb-kv"><span>Ollama</span><strong>{{ store.health.ollama.url }}</strong></div>
-              <div class="nb-kv"><span>Modelo</span><strong>{{ store.health.ollama.model }}</strong></div>
+              <div class="nb-kv"><span>Model</span><strong>{{ store.health.ollama.model }}</strong></div>
               <div class="nb-kv"><span>Log</span><strong>{{ formatBytes(store.health.log.bytes) }} · v{{ store.health.bot_version }}/api v{{ store.health.api_version }}</strong></div>
-              <div class="nb-kv"><span>Finance</span><strong>{{ store.health.finance.enabled ? (store.health.finance.db_exists ? 'habilitado' : 'habilitado (sem ledger)') : 'desabilitado' }}</strong></div>
+              <div class="nb-kv"><span>Finance</span><strong>{{ store.health.finance.enabled ? (store.health.finance.db_exists ? 'enabled' : 'enabled (no ledger)') : 'disabled' }}</strong></div>
             </template>
             <template v-else>
               <p class="nb-muted">
                 <ion-spinner v-if="store.healthLoading" name="crescent" />
-                <span v-else>Sem resposta de /api/health{{ store.healthError ? `: ${store.healthError}` : '…' }}</span>
+                <span v-else>No response from /api/health{{ store.healthError ? `: ${store.healthError}` : '…' }}</span>
               </p>
             </template>
           </ion-card-content>
@@ -77,17 +79,17 @@
 
       <!-- Live feed -->
       <div class="nb-feed-header">
-        <h2>Eventos ao vivo</h2>
+        <h2>Live events</h2>
         <ion-badge :color="store.feedError ? 'danger' : 'primary'">
           <ion-icon aria-hidden="true" :icon="pulseOutline" />
-          {{ store.feedError ? 'offline' : 'a cada 2s' }}
+          {{ store.feedError ? 'offline' : 'every 2s' }}
         </ion-badge>
       </div>
 
       <ion-spinner v-if="store.feedLoading && store.events.length === 0" name="crescent" class="nb-center" />
 
       <p v-else-if="!store.apiDown && store.events.length === 0" class="nb-empty">
-        Nenhum evento ainda — o bot ainda não registrou nenhuma notificação. Use a aba <strong>Config</strong> para regras ou espere um evento do macOS.
+        No events yet — the bot hasn't recorded a notification. Ask the bot in <strong>Chat</strong>, or wait for a macOS event.
       </p>
 
       <div v-if="store.events.length > 0" class="nb-feed">
@@ -97,15 +99,15 @@
             <span class="nb-when">{{ formatIsoShort(row.timestamp) }}</span>
             <span v-if="row.recId !== null" class="nb-recid">rec_id {{ row.recId }}</span>
           </div>
-          <div class="nb-event-title">{{ row.kind === 'startup' ? 'inicialização' : row.title || '(sem título)' }}</div>
+          <div class="nb-event-title">{{ row.kind === 'startup' ? 'startup' : row.title || '(untitled)' }}</div>
           <template v-if="row.kind === 'notification'">
             <div class="nb-event-summary">{{ row.summary }}</div>
             <div class="nb-chips">
               <ion-chip :color="categoryColor">{{ row.category }}</ion-chip>
               <ion-chip :color="urgencyColor(row.urgency)">{{ row.urgency }}</ion-chip>
               <ion-badge v-if="row.layer" :color="layerBadgeColor(row.layer)" class="nb-badge">{{ row.layerLabel }}</ion-badge>
-              <ion-badge v-if="row.ruleMatched" color="secondary" class="nb-badge">regra: {{ row.ruleMatched }}</ion-badge>
-              <ion-badge v-if="row.confidencePct" color="tertiary" class="nb-badge">confiança {{ row.confidencePct }}</ion-badge>
+              <ion-badge v-if="row.ruleMatched" color="secondary" class="nb-badge">rule: {{ row.ruleMatched }}</ion-badge>
+              <ion-badge v-if="row.confidencePct" color="tertiary" class="nb-badge">confidence {{ row.confidencePct }}</ion-badge>
               <ion-badge v-if="row.telegramStatus" :color="telegramBadgeColor(row.telegramStatus)" class="nb-badge">telegram {{ row.telegramStatus }}</ion-badge>
               <ion-badge v-if="row.financeStatus" :color="financeBadgeColor(row.financeStatus)" class="nb-badge">finance {{ row.financeStatus }}</ion-badge>
             </div>
@@ -153,8 +155,8 @@ const daemonBadgeColor = computed(() =>
   store.daemon?.running ? (store.daemon.adopted ? 'secondary' : 'success') : 'medium'
 );
 const daemonBadgeText = computed(() => {
-  if (store.daemon) return store.daemon.running ? (store.daemon.adopted ? 'rodando (adotado)' : 'rodando') : 'parado';
-  return store.daemonError === 'bridge-ausente' ? 'bridge ausente' : 'sem status';
+  if (store.daemon) return store.daemon.running ? (store.daemon.adopted ? 'running (adopted)' : 'running') : 'stopped';
+  return store.daemonError === 'bridge-ausente' ? 'bridge missing' : 'no status';
 });
 const categoryColor = computed(() => 'primary');
 
@@ -210,74 +212,46 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-.nb-content {
-  padding: 12px;
-}
-.nb-offline {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 0 4px 12px;
-  padding: 10px 14px;
-  border-radius: 10px;
-  background: var(--nb-danger-muted, rgba(248, 81, 73, 0.15));
-  color: var(--ion-color-danger);
-}
 .nb-cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-  gap: 12px;
-  margin-bottom: 12px;
+  gap: var(--nb-space-3);
+  margin-bottom: 0;
 }
 .nb-kv {
   display: flex;
   justify-content: space-between;
-  gap: 8px;
-  font-size: 13px;
-  padding: 2px 0;
+  gap: var(--nb-space-2);
+  font-size: var(--nb-fs-secondary);
+  padding: var(--nb-space-1) 0;
 }
 .nb-kv span {
-  color: var(--nb-text-secondary, var(--ion-color-medium));
+  color: var(--nb-text-secondary);
 }
-.nb-error-line {
-  margin-top: 6px;
-  font-size: 12px;
-  color: var(--ion-color-danger);
-}
-.nb-muted {
-  font-size: 13px;
-  color: var(--nb-text-secondary, var(--ion-color-medium));
+.nb-kv strong {
+  font-weight: 600;
 }
 .nb-feed-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin: 4px 4px 10px;
+  margin: var(--nb-space-4) 0 var(--nb-space-2);
 }
 .nb-feed-header h2 {
   margin: 0;
-  font-size: 17px;
-}
-.nb-center {
-  display: block;
-  margin: 32px auto;
-  width: 32px;
-  height: 32px;
-}
-.nb-empty {
-  padding: 24px 8px;
-  color: var(--nb-text-secondary, var(--ion-color-medium));
-  text-align: center;
+  font-size: var(--nb-fs-title-lg);
+  font-weight: 600;
+  line-height: 1.3;
 }
 .nb-feed {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--nb-space-2);
 }
 .nb-event {
-  border: 1px solid var(--nb-border-default, #2a3544);
-  border-radius: 10px;
-  padding: 10px 12px;
+  border: 1px solid var(--nb-border-default);
+  border-radius: var(--nb-radius-md);
+  padding: var(--nb-space-2) var(--nb-space-3);
   background: var(--ion-card-background);
 }
 .nb-event-startup {
@@ -285,49 +259,50 @@ onUnmounted(() => {
 }
 .nb-event-top {
   display: flex;
-  gap: 10px;
+  gap: var(--nb-space-2);
   align-items: baseline;
-  font-size: 12px;
-  color: var(--nb-text-secondary, var(--ion-color-medium));
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-secondary);
 }
 .nb-app {
   font-weight: 600;
-  color: var(--nb-teal-light, var(--ion-color-primary));
+  color: var(--nb-teal-light);
 }
 .nb-when,
 .nb-recid {
-  color: var(--nb-text-muted, var(--ion-color-medium));
+  color: var(--nb-text-secondary);
 }
 .nb-event-title {
+  font-size: var(--nb-fs-body);
   font-weight: 600;
-  margin-top: 2px;
+  margin-top: var(--nb-space-1);
 }
 .nb-event-summary {
-  color: var(--nb-text-secondary, var(--ion-color-medium));
-  font-size: 13px;
-  margin-top: 2px;
+  color: var(--nb-text-secondary);
+  font-size: var(--nb-fs-secondary);
+  margin-top: var(--nb-space-1);
 }
 .nb-chips {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
-  margin-top: 8px;
+  gap: var(--nb-space-1);
+  margin-top: var(--nb-space-2);
   align-items: center;
 }
 .nb-badge {
-  font-size: 11px;
+  font-size: var(--nb-fs-micro);
 }
 .nb-actions {
-  margin-top: 6px;
+  margin-top: var(--nb-space-2);
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: var(--nb-space-1);
 }
 .nb-action {
-  font-family: var(--nb-mono, monospace);
-  font-size: 11px;
-  padding: 2px 6px;
-  border-radius: 6px;
-  background: var(--nb-purple-muted, rgba(163, 113, 217, 0.15));
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-micro);
+  padding: 2px var(--nb-space-1); /* 2px micro-inner exception */
+  border-radius: var(--nb-radius-sm);
+  background: var(--nb-purple-muted);
 }
 </style>
