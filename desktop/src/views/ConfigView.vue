@@ -402,13 +402,10 @@ const restartPending = ref(false);
 let restartArmTimer: number | null = null;
 
 const saveBannerErrors = computed<string[]>(() => {
-  const { unmapped } = splitDetailsByField(store.configSaveErrors);
-  // no details[] -> carry the 400 error text itself into the mapping
-  if (store.configSaveErrors.length === 0 && store.configError && store.config) {
-    const text = store.configError;
-    return splitDetailsByField([text]).unmapped;
-  }
-  return unmapped;
+  // only unmapped leftovers stay in the banner: every field-named server
+  // detail renders inline under its input (POST /api/config 400s always
+  // carry details[] per api.py validate_config_payload)
+  return splitDetailsByField(store.configSaveErrors).unmapped;
 });
 const validationBannerErrors = computed<string[]>(() => splitDetailsByField(validationErrors.value).unmapped);
 
@@ -657,11 +654,9 @@ async function save(): Promise<void> {
         'Config saved. Restart the daemon manually (`python3 bot.py`) — process manager is available only in the Electron app.';
     }
   } else {
-    // server 400: map the details[] (or the bare error text) onto fields;
-    // non-field details stay in the banner
-    const candidates =
-      store.configSaveErrors.length > 0 ? store.configSaveErrors : store.configError ? [store.configError] : [];
-    fieldErrors.value = { ...fieldErrors.value, ...splitDetailsByField(candidates).fieldErrors };
+    // server 400: map the details[] onto the offending fields; non-field
+    // details stay in the banner (saveBannerErrors computed)
+    fieldErrors.value = { ...fieldErrors.value, ...splitDetailsByField(store.configSaveErrors).fieldErrors };
   }
 }
 
