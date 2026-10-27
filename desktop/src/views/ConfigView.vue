@@ -810,7 +810,10 @@ onUnmounted(() => {
   justify-content: flex-end;
   gap: var(--nb-space-3);
 }
-/* inline field validation: red border + message line below the offender */
+/* inline field validation: danger border + subtle bg tint on the offending
+   input + message line below it (iterD: live-verified the HOST border does turn
+   danger — the earlier "neutral rgb(232,238,245)" reading was the native <input>'s
+   currentColor, not the host border) */
 .nb-field-slot {
   display: flex;
   flex-direction: column;
@@ -818,6 +821,7 @@ onUnmounted(() => {
 }
 .nb-field .nb-input-bad {
   border-color: var(--nb-danger);
+  background-color: var(--nb-danger-muted);
 }
 .nb-field .nb-input-bad:focus-within {
   border-color: var(--nb-danger);

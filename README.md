@@ -689,6 +689,11 @@ python3 scripts/smoke_api.py
 - The on-screen Electron smoke (window, tabs, live feed, artifact iframe) is manual —
   boot `cd desktop/electron && npm start` and click through the five tabs.
 - Debug boot: `cd desktop/electron && npm run electron:start-debug` (port 9223).
+- **Single-instance lock**: a second launch of the Electron app exits immediately
+  (`app.requestSingleInstanceLock()`) and the running instance shows+focuses its window
+  (`second-instance`). The lock keys on the userData path, so a different
+  `--remote-debugging-port` on the second launch changes nothing. The Navigate menu
+  adds ⌘1-⌘4 accelerators (Chat / Status / Logs / Settings).
 
 ## Agent & Chat (in-app tool pipeline)
 
@@ -851,7 +856,7 @@ desktop/                Desktop UI (Electron app), sibling of the Python app:
   src/views/              DashboardView / ChatView / FinanceView / ConfigView / LogsView
   tests/unit/             vitest specs (npm run test:unit -- --run)
   electron/               Electron wrapper (hydranote's scaffold, slimmed):
-    src/index.ts            app boot, menu, IPC registration
+    src/index.ts            app boot, menu (⌘1-⌘4 navigate), single-instance lock, IPC registration
     src/setup.ts            ElectronCapacitorApp (electron-serve scheme, CSP, window state)
     src/processManager.ts   spawns/adopts `bot.py api` + `bot.py`; SIGTERM on quit
     src/ipc/                botApiIpc (http proxy) / daemonIpc / reportIpc
