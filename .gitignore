@@ -13,6 +13,10 @@ finance.db-shm
 finance.db-wal
 reports/
 
+# Agent runtime artifacts (generated dashboards + chat sessions)
+artifacts/
+data/agent_sessions/
+
 # System / Runner artifacts
 .agent_runner_prompt.md
 .DS_Store
