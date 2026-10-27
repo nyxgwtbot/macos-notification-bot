@@ -827,6 +827,13 @@ onUnmounted(() => {
   border-color: var(--nb-danger);
   box-shadow: 0 0 0 2px var(--nb-danger-muted);
 }
+/* iterE: a11y-attribute parity — the standard [aria-invalid] hook drives the
+   same live-verified host-box styling as .nb-input-bad (the visible box is the
+   ion-input host; the native input inside shadow has no border of its own) */
+.nb-field ion-input[aria-invalid="true"] {
+  border-color: var(--nb-danger);
+  background-color: var(--nb-danger-muted);
+}
 .nb-field-error {
   margin: 0 0 var(--nb-space-1);
   padding-left: var(--nb-space-1);
