@@ -171,8 +171,11 @@ export class ElectronCapacitorApp {
 
 // Set a CSP up for our application based on the custom scheme.
 // Slimmed from hydranote: connect-src only 'self' + the custom scheme +
-// loopback HTTP (the bot API). No https wildcard, no blob/workers, no
-// frame-src (report opens in the system browser via shell.openPath).
+// loopback HTTP (the bot API). frame-src allows ONLY the app's own scheme
+// and the fixed artifacts sub-service on http://127.0.0.1:4770: the Chat tab
+// renders agent-generated dashboards in a sandboxed <iframe> (artifacts are
+// script-free by server-side validation). A port wildcard (http://127.0.0.1:*)
+// is deliberately refused — no other local service may ever be framed.
 export function setupContentSecurityPolicy(customScheme: string): void {
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     const connectSrc = ["'self'", `${customScheme}://*`, 'http://127.0.0.1:*', 'http://localhost:*'].join(' ');
@@ -184,6 +187,7 @@ export function setupContentSecurityPolicy(customScheme: string): void {
       `style-src 'self' ${customScheme}://* 'unsafe-inline'`,
       `img-src 'self' ${customScheme}://* data:`,
       `font-src 'self' ${customScheme}://* data:`,
+      `frame-src 'self' ${customScheme}://* http://127.0.0.1:4770`,
     ].join('; ');
 
     callback({
