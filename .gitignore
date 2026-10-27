@@ -16,6 +16,7 @@ reports/
 # Agent runtime artifacts (generated dashboards + chat sessions)
 artifacts/
 data/agent_sessions/
+data/connectors_state.json
 
 # System / Runner artifacts
 .agent_runner_prompt.md

@@ -192,6 +192,11 @@ def main() -> int:
         agent_mock = os.environ.get("NOTIFYBOT_SMOKE_AGENT_MOCK", "") == "1"
         if agent_mock:
             env["NOTIFYBOT_SMOKE_AGENT_MOCK"] = "1"
+        # Mock-mode connectors rows: forward the hook so probes/actions use the
+        # in-process connectors world (no osascript, no TCC prompt).
+        connectors_mock = os.environ.get("NOTIFYBOT_CONNECTORS_MOCK", "") == "1"
+        if connectors_mock:
+            env["NOTIFYBOT_CONNECTORS_MOCK"] = "1"
         # Artifacts port resolution for the sandbox (default 4770 when free;
         # documented test-only override otherwise). Production keeps 4770.
         artifacts_port = pick_artifacts_port()
@@ -369,6 +374,73 @@ def main() -> int:
                                           f"roles={roles}")
             else:
                 print("[SKIPPED] agent rows — rode com NOTIFYBOT_SMOKE_AGENT_MOCK=1 para exercitar o pipeline do agente (mock, sem Ollama)")
+
+            # #15-#16 connectors rows — gated on the connectors mock
+            # (NOTIFYBOT_CONNECTORS_MOCK=1 forwards to the server subprocess;
+            # without it a probe would fire real osascript + TCC prompts).
+            if connectors_mock:
+                status, conn_body = api_request(base, "GET", "/api/connectors")
+                connectors = (conn_body or {}).get("connectors", {})
+                shape_ok = (
+                    status == 200
+                    and set(connectors) == {"reminders", "notes", "system"}
+                    and all(
+                        set(connectors.get(domain, {})) == {"status", "granted", "last_probe", "hint"}
+                        for domain in ("reminders", "notes", "system")
+                    )
+                    and connectors.get("system", {}).get("status") == "granted"
+                    and connectors.get("system", {}).get("granted") is True
+                    and connectors.get("system", {}).get("hint") == "no consent required"
+                )
+                all_ok &= print_check(
+                    "connectors list shape", shape_ok,
+                    f"domains={sorted(connectors)} system={connectors.get('system')}",
+                )
+
+                status, probe_body = api_request(base, "POST", "/api/connectors/probe", {"domain": "notes"})
+                probe_ok = status == 200 and (probe_body or {}).get("status") == "granted" and (probe_body or {}).get("ok") is True
+                all_ok &= print_check(
+                    "connectors probe notes -> granted", probe_ok, str(probe_body)
+                )
+                state_exists = os.path.exists(os.path.join(root, "data", "connectors_state.json"))
+                all_ok &= print_check(
+                    "connectors state file", state_exists, "data/connectors_state.json gravado no sandbox"
+                )
+
+                status, bad_probe = api_request(base, "POST", "/api/connectors/probe", {"domain": "bogus"})
+                all_ok &= print_check("connectors probe unknown -> 400", status == 400, str(bad_probe))
+
+                if agent_mock:
+                    # consent first (probe through the SAME manager the agent uses)
+                    status, rem_probe = api_request(base, "POST", "/api/connectors/probe", {"domain": "reminders"})
+                    all_ok &= print_check(
+                        "connectors probe reminders -> granted", status == 200 and (rem_probe or {}).get("status") == "granted",
+                        str(rem_probe),
+                    )
+                    status, turn_body = api_request(
+                        base, "POST", "/api/agent/turn", {"message": "adde um reminder pro projeto X"}
+                    )
+                    conn_turn = (turn_body or {}).get("turn", [])
+                    turn_tools = [step.get("tool") for step in conn_turn]
+                    answer_text = str((turn_body or {}).get("answer", ""))
+                    steps_ok = (
+                        [step.get("args", {}).get("action") for step in conn_turn] == ["add", "list_reminders"]
+                        and all(step.get("error") is None for step in conn_turn)
+                    )
+                    agent_conn_ok = (
+                        status == 200
+                        and turn_tools == ["native.call", "native.call"]
+                        and steps_ok
+                        and "Ler o relatório do projeto X" in answer_text
+                    )
+                    all_ok &= print_check(
+                        "agent connectors turn",
+                        agent_conn_ok,
+                        f"tools={turn_tools} actions={[step.get('args', {}).get('action') for step in conn_turn]} "
+                        f"answer={answer_text[:80]!r}",
+                    )
+            else:
+                print("[SKIPPED] connectors rows — rode com NOTIFYBOT_CONNECTORS_MOCK=1 para exercitar probes/actions (mock, sem osascript)")
         finally:
             proc.terminate()
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
@@ -398,4 +470,14 @@ if __name__ == "__main__":
 #      the iframe PAINTS the artifact (non-blank pixels, not a blank frame).
 #   5. Confirm GET /api/services shows the artifacts row running on 4770 and
 #      the tab bar reads Dashboard / Finance / Chat / Settings / Logs.
+#   6. Open Settings › Connectors: press Connect on reminders and notes and
+#      approve the macOS AUTOMATION consent prompt WHILE THE APP IS FOCUSED
+#      (TCC attributes consent to the responsible parent — the
+#      Electron-spawned python child may not see the same dialog from
+#      Terminal runs). Both rows should flip to Granted after the probe.
+#   7. In Chat, ask "adiciona um lembrete Ler o relatório X" with the REAL
+#      model: verify the agent calls native.call (add step chip) and the
+#      reminder actually lands in Reminders.app (iCloud sync may lag a few
+#      seconds); an ungranted domain must answer the PT-BR "conecte <domain>
+#      em Settings › Connectors" error verbatim and NOT retry.
 # ---------------------------------------------------------------------------

@@ -663,8 +663,10 @@ python3 scripts/smoke_api.py
   /api/config`, `GET /api/finance/summary|transactions?month=YYYY-MM`,
   `GET|POST /api/finance/report?month=`, `POST /api/test-notify`, `POST
   /api/agent/turn`, `GET /api/agent/sessions`, `GET /api/agent/session/{id}`,
-  `GET /api/services`, plus `GET /api/logs/tail?lines=N` (raw tail for the Logs
-  screen). Unknown paths/methods answer `404/405` as JSON.
+  `GET /api/services`, `GET /api/connectors`,
+  `POST /api/connectors/probe {domain}` (single-flight per domain; concurrent
+  probe → 409, unknown domain → 400), plus `GET /api/logs/tail?lines=N` (raw
+  tail for the Logs screen). Unknown paths/methods answer `404/405` as JSON.
 - The API **never spawns or manages the daemon** and never touches the Notification
   Center db2; finance reads use read-only SQLite connections (`mode=ro`, 3s busy
   timeout); config writes are atomic (tmp file + `os.replace`) with schema-lite
@@ -705,6 +707,7 @@ code, tool JSON) is English.
 | `dashboard.create` | `{"title", "html", "data_source"}` | Server-side `artifact_id` (uuid4 hex); validates the HTML is self-contained (rejects `<script>`, external refs, `@import`, `url(http`, `fetch(`, `XMLHttpRequest`, >512 KB) and writes `<config_dir>/artifacts/<id>.html` (rotation: newest 200 kept). |
 | `server.serve` | `{"artifact_id"}` | Ensures the loopback artifacts sub-service is healthy on **127.0.0.1:4770** (fixed constant; port-0 injection is test-only via `NOTIFYBOT_ARTIFACTS_PORT`) and returns the artifact URL. |
 | `notify.test` | `{}` | Posts 3 REAL macOS notifications (reuses `POST /api/test-notify` semantics); osascript failures surface as tool errors. |
+| `native.call` | `{"domain", "action", "params"}` | Drives native macOS apps through the connectors whitelist (`reminders` list/add/complete, `notes` search/read/create, `system` volume/front_app/open/toast). Model strings travel ONLY as argv items to a frozen AppleScript source (`osascript -e <const> <argv…>`, no shell, no interpolation); hard 8 s per-call timeout; `reminders`/`notes` require consent granted from Settings › Connectors and surface PT-BR consent errors that the agent relays verbatim without retrying that domain in the turn. |
 
 Loop guards: max 6 tool turns, ~90 s global budget, ~4 KB tool-result truncation in
 context, one protocol-reminder retry on unparsable model output, and graceful PT-BR
@@ -723,6 +726,41 @@ free-form drift still lands on the clean PT-BR guard answer (the accepted UX for
 Sessions persist append-only under `<config_dir>/data/agent_sessions/<id>.jsonl`;
 ids match `^[A-Za-z0-9-]{1,64}$`.
 
+### Connectors (native.call)
+
+`native.call` lets the Chat agent drive native macOS apps. Every
+(domain, action) pair is whitelisted server-side (`notifybot/connectors.py`):
+`reminders` (`list_lists`, `list_reminders`, `add`, `complete`), `notes`
+(`search`, `read`, `create`), and `system` (`volume`, `front_app`, `open`,
+`toast`). Injection safety is structural: the model's strings are passed as
+positional **argv** items to a *constant* AppleScript source
+(`subprocess.run(["osascript", "-e", SCRIPT_CONST, *argv])`) — user bytes never
+appear in script source, and list results join on ASCII character 31 in-script
+(never comma-split).
+
+Consent (macOS TCC): `reminders`/`notes` actions need per-domain state
+`granted`, which is produced by the Settings › Connectors **Connect/Re-check**
+button (`POST /api/connectors/probe`) or self-heals after a successful action;
+a `-1743`/not-authorized osascript error persists `denied`, a probe timeout
+classifies `needs_consent` (a hanging consent dialog is the usual cause), and
+an ungranted action answers a PT-BR error ("…conecte <domain> em Settings ›
+Connectors.") that the agent relays verbatim without retrying the domain in
+the turn. `system` is ungated (no consent). Probes are single-flight per
+domain (concurrent probe → 409). Per-domain state persists atomically to
+`data/connectors_state.json` (runtime file, gitignored, holds no secrets).
+
+- Endpoints: `GET /api/connectors` (per-domain `status`/`granted`/
+  `last_probe`/`hint`; `system` always granted), `POST
+  /api/connectors/probe` `{"domain": …}` (→ `{ok, domain, status,
+  last_probe}`; 400 unknown domain, 409 busy).
+- Deferred to v2 (documentation only, not rows of `GET /api/connectors`):
+  `mail`, `contacts`, `messages`, `findmy` — read-sensitive domains that need
+  their own consent/privacy design pass; no secrets are involved anywhere.
+- Mock hook: `NOTIFYBOT_CONNECTORS_MOCK=1` swaps the osascript runner for a
+  per-process in-memory world (reminders lists + notes + volume + toasts), so
+  `add` → `list_reminders` stays observable and smokes exercise the endpoints
+  without executing AppleScript or touching TCC.
+
 ### API rows
 
 - `POST /api/agent/turn` `{session_id?, message}` (synchronous; missing/empty/oversize
@@ -730,6 +768,9 @@ ids match `^[A-Za-z0-9-]{1,64}$`.
 - `GET /api/agent/sessions` — newest-first summaries.
 - `GET /api/agent/session/{id}` — full transcript (id regex-validated).
 - `GET /api/services` — sub-service registry (`artifacts` running/port/root/since).
+- `GET /api/connectors` — connectors status rows (see Connectors above).
+- `POST /api/connectors/probe` — one trivial per-domain osascript touch
+  (≤ 8 s) that classifies + persists consent; English endpoint errors.
 
 ### Rendering + CSP
 
@@ -744,12 +785,17 @@ additionally allowlists only `http://127.0.0.1:4770/<32-hex>.html` URLs.
 
 ```bash
 NOTIFYBOT_SMOKE_AGENT_MOCK=1 python3 scripts/smoke_api.py
+# with the connectors mock (same run also exercises rows 15/16 and the
+# native.call agent turn — no osascript, no TCC prompt):
+NOTIFYBOT_SMOKE_AGENT_MOCK=1 NOTIFYBOT_CONNECTORS_MOCK=1 python3 scripts/smoke_api.py
 ```
 
 `NOTIFYBOT_SMOKE_AGENT_MOCK=1` selects a deterministic scripted LLM (test/smoke-only
 hook documented in `notifybot/agent.py`) that walks the dashboard pipeline
-(`app.data` → `dashboard.create` → `server.serve` → answer with urls). Unit tests
-inject their own `llm_fn` transcripts instead (`tests/test_agent.py`);
+(`app.data` → `dashboard.create` → `server.serve` → answer with urls) and — with
+`NOTIFYBOT_CONNECTORS_MOCK=1` — a reminders flow (`native.call add` →
+`list_reminders` → PT-BR answer). Unit tests inject their own `llm_fn`
+transcripts instead (`tests/test_agent.py`);
 
 > If something else owns port 4770 when `server.serve` runs, the tool fails with a
 > clear error ("artifacts port 4770 busy — close the other process"); there is no
