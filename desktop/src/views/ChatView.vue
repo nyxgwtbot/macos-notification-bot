@@ -24,7 +24,7 @@
               {{ session.preview }} ({{ session.turns }} turns)
             </ion-select-option>
           </ion-select>
-          <ion-button size="small" fill="outline" @click="newSession">New chat</ion-button>
+          <ion-button size="small" fill="outline" class="nb-btn-quiet" @click="newSession">New chat</ion-button>
         </ion-buttons>
       </ion-toolbar>
     </ion-header>
@@ -50,7 +50,10 @@
               class="nb-bubble"
               :class="bubble.role === 'user' ? 'nb-bubble-user' : 'nb-bubble-assistant'"
             >
-              {{ bubble.text }}
+              <span v-if="bubble.role === 'user'" class="nb-bubble-plain">{{ bubble.text }}</span>
+              <!-- C6: assistant replies render through mdLite (escape-first; uniform
+                   .nb-md rhythm). User replies stay verbatim pre-wrap. -->
+              <div v-else class="nb-md" v-html="mdLite(bubble.text)"></div>
             </div>
 
             <!-- Onboarding empty state when no conversation is active -->
@@ -79,20 +82,32 @@
             </div>
           </div>
 
-          <!-- Tool activity: compact chips in flow before composer -->
-          <div v-if="state.chips.length > 0" class="nb-tool-activity">
-            <h3>Tool activity</h3>
-            <div v-for="chip in state.chips" :key="chip.id" class="nb-tool-chip" :class="{ 'nb-tool-chip-error': !chip.ok }">
-              <button
-                type="button"
-                class="nb-tool-chip-head"
-                :aria-expanded="expandedChips.has(chip.id)"
-                @click="toggleChip(chip.id)"
-              >
-                <span class="nb-tool-tool">{{ chip.tool }}</span>
-                <ion-badge :color="chip.ok ? 'success' : 'danger'">{{ chip.ok ? 'ok' : 'error' }}</ion-badge>
-              </button>
-              <pre v-if="expandedChips.has(chip.id)" class="nb-tool-preview">{{ chip.preview }}</pre>
+          <!-- Tool activity: collapsible section above the composer (C7) with
+               compact inline chips (C2), count label and per-session open state -->
+          <div v-if="state.chips.length > 0" class="nb-tool-section">
+            <button
+              type="button"
+              class="nb-tool-section-head"
+              :aria-expanded="toolsOpen"
+              aria-controls="nb-tool-chips"
+              @click="toggleTools"
+            >
+              <span class="nb-tool-section-label">Tool activity · {{ state.chips.length }}</span>
+              <ion-icon aria-hidden="true" :icon="toolsOpen ? chevronUpOutline : chevronDownOutline" />
+            </button>
+            <div v-show="toolsOpen" id="nb-tool-chips" class="nb-tool-activity">
+              <div v-for="chip in state.chips" :key="chip.id" class="nb-tool-chip" :class="{ 'nb-tool-chip-error': !chip.ok }">
+                <button
+                  type="button"
+                  class="nb-tool-chip-head"
+                  :aria-expanded="expandedChips.has(chip.id)"
+                  @click="toggleChip(chip.id)"
+                >
+                  <span class="nb-tool-tool">{{ chip.tool }}</span>
+                  <ion-badge :color="chip.ok ? 'success' : 'danger'">{{ chip.ok ? 'ok' : 'error' }}</ion-badge>
+                </button>
+                <pre v-if="expandedChips.has(chip.id)" class="nb-tool-preview">{{ chip.preview }}</pre>
+              </div>
             </div>
           </div>
 
@@ -105,21 +120,24 @@
             <ion-button size="small" fill="outline" @click="retryLast">Retry</ion-button>
           </div>
 
-          <!-- Composer: pinned at bottom of main column, always visible -->
-          <!-- Verified: Pane scroll model with --overflow:hidden on .nb-chat-content, .nb-transcript handles internal scroll (flex: 1 1 0; overflow-y: auto), composer is flex-shrink: 0 and stays pinned at the bottom left, preserving full visibility without page-level scroll. -->
+          <!-- Composer: bordered group (C3) — textarea + Send bottom-right inside one surface -->
           <div class="nb-composer">
-            <ion-textarea
-              v-model="draft"
-              class="nb-composer-input"
-              placeholder="Message the bot…"
-              :auto-grow="true"
-              :rows="1"
-              @keydown="onComposerKeydown($event)"
-            />
-            <ion-button :disabled="!canSend" fill="solid" @click="send">
-              <ion-spinner v-if="state.pending" name="crescent" />
-              <template v-else>Send</template>
-            </ion-button>
+            <div class="nb-composer-surface">
+              <ion-textarea
+                v-model="draft"
+                class="nb-composer-input"
+                placeholder="Message the bot…"
+                :auto-grow="true"
+                :rows="1"
+                @keydown="onComposerKeydown($event)"
+              />
+              <div class="nb-composer-send">
+                <ion-button :disabled="!canSend" fill="solid" @click="send">
+                  <ion-spinner v-if="state.pending" name="crescent" />
+                  <template v-else>Send</template>
+                </ion-button>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -182,6 +200,8 @@ import {
 import {
   alertCircleOutline,
   checkmarkOutline,
+  chevronDownOutline,
+  chevronUpOutline,
   closeOutline,
   cloudOfflineOutline,
   copyOutline,
@@ -196,18 +216,35 @@ import {
   type ChatEvent,
   type ChatState
 } from '@/viewModels/chatViewModel';
+import { mdLite } from '@/utils/mdLite';
 
 const state = ref<ChatState>(initialChatState());
 const draft = ref('');
 const loadError = ref<string | null>(null);
 const lastMessage = ref<string | null>(null);
 const expandedChips = reactive(new Set<string>());
+/** C7: tool-activity panel open state per session (component-only memory). */
+const toolsOpenBySession = reactive(new Map<string | null, boolean>());
+/** Default: visible inline while the list is small, collapsed past this size. */
+const TOOL_PANEL_INLINE_MAX = 6;
 const railOpen = ref(true);
 const reloadKey = ref(0);
 const copiedRecently = ref(false);
 const transcriptEl = ref<HTMLElement | null>(null);
 
 const canSend = computed(() => !state.value.pending && draft.value.trim() !== '');
+
+/** C7: open state for the current session — manual toggle wins, otherwise
+ * "closed by default only past the inline cap". */
+const toolsOpen = computed(() => {
+  const manual = toolsOpenBySession.get(state.value.sessionId);
+  if (manual !== undefined) return manual;
+  return state.value.chips.length <= TOOL_PANEL_INLINE_MAX;
+});
+
+function toggleTools(): void {
+  toolsOpenBySession.set(state.value.sessionId, !toolsOpen.value);
+}
 
 function dispatch(event: ChatEvent): void {
   state.value = reduceChat(state.value, event);
@@ -355,8 +392,38 @@ onMounted(loadSessions);
   margin-inline-end: var(--nb-space-2);
 }
 
+/* C1: quiet secondary header button — must not out-shout the primary flow.
+   md outline buttons in a toolbar read var(--ion-toolbar-color) for text AND
+   border (that's the loud white outline) — re-point that custom property to
+   the secondary text tone. Background/radius need outer !important because
+   Chromium lets :host() declarations beat equal-specificity outer rules. */
+.nb-btn-quiet {
+  --background: var(--nb-bg-elevated) !important;
+  --background-hover: var(--nb-bg-hover) !important;
+  --background-activated: var(--nb-bg-hover) !important;
+  --background-focused: var(--nb-bg-hover) !important;
+  --background-focused-opacity: 1 !important;
+  --ion-toolbar-color: var(--nb-text-secondary);
+  --color: var(--nb-text-secondary) !important;
+  --color-hover: var(--nb-text-primary) !important;
+  --color-activated: var(--nb-text-primary) !important;
+  --color-focused: var(--nb-text-primary) !important;
+  --border-radius: var(--nb-radius-full) !important;
+}
+
+/* C4: one shared control height for the header end-slot (select + buttons
+   align on the same row/baseline regardless of Ionic's in-toolbar sizing). */
+.nb-header-sessions ion-button,
+.nb-header-sessions .nb-session-select {
+  min-height: 28px !important;
+  height: 28px !important;
+}
+
 .nb-session-select {
-  min-height: 36px;
+  flex: 0 1 auto;
+  /* C4: cap the pill; long session labels truncate instead of stretching the header */
+  max-width: 360px;
+  min-height: 28px; /* shared end-slot height (see .nb-header-sessions rule) */
   border-radius: var(--nb-radius-full);
   background: var(--nb-bg-elevated);
   border: 1px solid var(--nb-border-default);
@@ -396,6 +463,8 @@ onMounted(loadSessions);
   display: flex;
   flex-direction: column;
   gap: var(--nb-space-2);
+  /* C5: top breathing under the header — first bubble never sits flush */
+  padding-top: var(--nb-space-3);
 }
 
 .nb-bubble {
@@ -418,6 +487,48 @@ onMounted(loadSessions);
   align-self: flex-start;
   background: var(--ion-card-background);
   border: 1px solid var(--nb-border-default);
+  /* C6: assistant replies are structured markdown now — no pre-wrap rhythm */
+  white-space: normal;
+}
+
+/* C6: uniform block margins inside markdown (p/h/li share one step; the
+   bubble's own padding frames the content). Headings stay at body size.
+   All md rules use :deep() — the markup is produced by v-html and carries
+   no scoped data attribute of its own. */
+.nb-bubble-plain {
+  display: inline;
+}
+.nb-bubble-assistant :deep(.nb-md :is(p, h1, h2, h3, h4, h5, h6, ul, ol, li)) {
+  margin: var(--nb-space-2) 0;
+}
+.nb-bubble-assistant :deep(.nb-md > :first-child) {
+  margin-top: 0;
+}
+.nb-bubble-assistant :deep(.nb-md > :last-child) {
+  margin-bottom: 0;
+}
+.nb-bubble-assistant :deep(.nb-md h1),
+.nb-bubble-assistant :deep(.nb-md h2),
+.nb-bubble-assistant :deep(.nb-md h3),
+.nb-bubble-assistant :deep(.nb-md h4),
+.nb-bubble-assistant :deep(.nb-md h5),
+.nb-bubble-assistant :deep(.nb-md h6) {
+  font-size: var(--nb-fs-body);
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--nb-text-primary);
+}
+/* list markers aligned with the text column */
+.nb-bubble-assistant :deep(.nb-md ul),
+.nb-bubble-assistant :deep(.nb-md ol) {
+  padding-inline-start: 1.25em;
+}
+.nb-bubble-assistant :deep(.nb-md code) {
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-secondary);
+  background: var(--nb-bg-elevated);
+  padding: 0 var(--nb-space-1);
+  border-radius: var(--nb-radius-sm);
 }
 
 .nb-pending-bubble {
@@ -478,24 +589,55 @@ onMounted(loadSessions);
   border-color: var(--nb-teal);
 }
 
-.nb-tool-activity {
-  display: flex;
-  flex-direction: column;
-  gap: var(--nb-space-1);
+/* C7: collapsible tool-activity section — hairline divider above the composer */
+.nb-tool-section {
+  border-top: 1px solid var(--nb-border-default);
   margin-top: var(--nb-space-2);
-  margin-bottom: var(--nb-space-2);
+  padding: var(--nb-space-2) 0;
   flex-shrink: 0;
 }
 
-.nb-tool-activity h3 {
+.nb-tool-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  margin: 0;
+  padding: var(--nb-space-1) var(--nb-space-1) var(--nb-space-2);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--nb-text-secondary);
+  font: inherit;
+}
+
+.nb-tool-section-label {
   font-size: var(--nb-fs-secondary);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+.nb-tool-section-head ion-icon {
+  font-size: 14px;
   color: var(--nb-text-secondary);
-  margin: 0 0 var(--nb-space-1);
+}
+
+/* C2: compact inline chips — one wrapping flex row, tight gap */
+.nb-tool-activity {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--nb-space-1);
+  margin: 0;
+  flex-shrink: 0;
 }
 
 .nb-tool-chip {
+  display: inline-flex;
+  flex-direction: column;
+  flex: 0 1 auto;
+  max-width: 100%;
   border: 1px solid var(--nb-border-default);
   border-radius: var(--nb-radius-md);
   background: var(--ion-card-background);
@@ -505,18 +647,19 @@ onMounted(loadSessions);
   border-color: var(--ion-color-danger);
 }
 
+/* badge sits adjacent to the label */
 .nb-tool-chip-head {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: var(--nb-space-2);
-  width: 100%;
   padding: var(--nb-space-1) var(--nb-space-2);
   background: transparent;
   border: none;
   cursor: pointer;
   color: inherit;
   font: inherit;
+  white-space: nowrap;
 }
 
 .nb-tool-tool {
@@ -526,6 +669,8 @@ onMounted(loadSessions);
 
 .nb-tool-preview {
   margin: 0;
+  width: max-content;
+  max-width: min(420px, 100%);
   max-height: 220px;
   overflow-y: auto;
   overflow-x: auto;
@@ -536,23 +681,39 @@ onMounted(loadSessions);
   color: var(--nb-text-secondary);
 }
 
+/* C3: one bordered composer group — textarea + Send bottom-right inside it */
 .nb-composer {
-  display: flex;
-  gap: var(--nb-space-2);
-  border-top: 1px solid var(--nb-border-default);
-  padding-top: var(--nb-space-2);
-  margin-top: var(--nb-space-2);
-  align-items: flex-end;
   flex-shrink: 0;
+  margin-top: var(--nb-space-2);
+}
+
+.nb-composer-surface {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--nb-border-strong);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-bg-elevated);
+  padding: var(--nb-space-2) var(--nb-space-2) var(--nb-space-1);
+  transition: border-color 120ms ease;
+}
+
+.nb-composer-surface:focus-within {
+  border-color: var(--nb-teal);
 }
 
 .nb-composer-input {
-  flex: 1;
-  border: 1px solid var(--nb-border-default);
-  border-radius: var(--nb-radius-md);
-  padding: var(--nb-space-2) var(--nb-space-3);
   --background: transparent;
+  --padding-start: var(--nb-space-2);
+  --padding-end: var(--nb-space-2);
+  --padding-top: 0;
+  --padding-bottom: 0;
   font-size: var(--nb-fs-body);
+}
+
+.nb-composer-send {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
 }
 
 .nb-chat-rail {
