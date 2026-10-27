@@ -37,7 +37,15 @@
             <template v-if="store.daemon">
               <div class="nb-kv"><span>PID</span><strong>{{ store.daemon.pid ?? '—' }}</strong></div>
               <div class="nb-kv"><span>Uptime</span><strong>{{ formatUptime(store.daemon.uptimeSec) || '—' }}</strong></div>
-              <div class="nb-kv"><span>Started</span><strong>{{ formatIsoShort(store.daemon.startedAt) || '—' }}</strong></div>
+              <!-- R2: the stamp stays the primary value, with the live age as
+                   a fs-micro muted secondary hanging under it -->
+              <div class="nb-kv">
+                <span>Started</span>
+                <span class="nb-kv-stack">
+                  <strong :title="formatIsoShort(store.daemon.startedAt) || undefined">{{ formatIsoShort(store.daemon.startedAt) || '—' }}</strong>
+                  <span v-if="daemonStartedAge" class="nb-age-secondary">{{ daemonStartedAge }}</span>
+                </span>
+              </div>
               <div class="nb-kv"><span>API port</span><strong>{{ apiPortDisplay }}</strong></div>
               <div class="nb-kv"><span>Adopted</span><strong>{{ store.daemon.adopted ? 'yes (external instance)' : 'no (managed here)' }}</strong></div>
               <div v-if="store.daemon.lastError" class="nb-error-line">Error: {{ store.daemon.lastError }}</div>
@@ -76,10 +84,18 @@
           <ion-card-content>
             <template v-if="store.health">
               <div class="nb-kv"><span title="last_rec_id">Watermark</span><strong>{{ store.health.watermark.last_rec_id }}</strong></div>
-              <div class="nb-kv"><span title="state.updated_at">Last cycle</span><strong>{{ formatIsoShort(store.health.watermark.updated_at) || '—' }}</strong></div>
+              <!-- R2: the AGE is the live value (recomputed on each 2s poll
+                   tick via nowMs); the absolute stamp survives as tooltip -->
+              <div class="nb-kv">
+                <span title="state.updated_at">Last cycle</span>
+                <strong :title="formatIsoShort(store.health.watermark.updated_at) || undefined">{{ lastCycleAge || '—' }}</strong>
+              </div>
               <div class="nb-kv"><span>Ollama</span><strong>{{ store.health.ollama.url }}</strong></div>
               <div class="nb-kv"><span>Model</span><strong>{{ store.health.ollama.model }}</strong></div>
-              <div class="nb-kv"><span>Log</span><strong>{{ formatBytes(store.health.log.bytes) }} · v{{ store.health.bot_version }}/api v{{ store.health.api_version }}</strong></div>
+              <!-- R2 split: the log size is one row (value only), versions
+                   read as their own row instead of a cryptic cram suffix -->
+              <div class="nb-kv"><span>Log</span><strong>{{ formatBytes(store.health.log.bytes) }}</strong></div>
+              <div class="nb-kv"><span>Version</span><strong>{{ store.health.bot_version }} (api v{{ store.health.api_version }})</strong></div>
               <div class="nb-kv"><span>Finance</span><strong>{{ store.health.finance.enabled ? (store.health.finance.db_exists ? 'enabled' : 'enabled (no ledger)') : 'disabled' }}</strong></div>
             </template>
             <template v-else>
@@ -114,6 +130,13 @@
         </div>
       </div>
 
+      <!-- R2 finding 4: all-startup feed cue — the filtered feed has zero
+           macOS notification events yet (startup lines only), so the user
+           hasn't seen the full notification flow; static EN copy -->
+      <p v-if="showStartupHint" class="nb-feed-hint">
+        Nothing from macOS yet — send a test notification from Chat to see the full flow.
+      </p>
+
       <ion-spinner v-if="store.feedLoading && store.events.length === 0" name="crescent" class="nb-center" />
 
       <p v-else-if="!store.apiDown && store.events.length === 0" class="nb-empty">
@@ -135,17 +158,24 @@
         >
           <div class="nb-event-top">
             <ion-icon class="nb-event-chev" aria-hidden="true" :icon="chevronForwardOutline" />
-            <!-- kind identity: leading tinted icon chip replaces the repeated
-                 "bot" app label (it stays as a micro caption in the expanded raw) -->
+            <!-- kind identity: leading tinted icon chip; R2 finding 1 — the
+                 collapsed row reads as chevron + icon + tag + timestamps and
+                 the per-row source label lives ONLY in the expanded inset -->
             <span class="nb-kind" :class="'nb-kind-' + eventKindIdentity(row)" aria-hidden="true">
               <ion-icon :icon="KIND_ICONS[eventKindIdentity(row)]" />
             </span>
+            <!-- startup rows: muted kind tag next to the icon is the whole
+                 "summary" (startup events carry no body/summary fields) -->
+            <span v-if="row.kind === 'startup'" class="nb-kind-caption">startup</span>
             <span class="nb-when">{{ formatIsoShort(row.timestamp) }}</span>
             <!-- relative age recomputed on every 2s feed poll tick -->
             <span v-if="row.relText" class="nb-when nb-when-rel">{{ row.relText }}</span>
             <span v-if="row.recId !== null" class="nb-recid">rec_id {{ row.recId }}</span>
           </div>
-          <div class="nb-event-title">{{ row.kind === 'startup' ? 'startup' : row.title || '(untitled)' }}</div>
+          <!-- R2 finding 1: the repeated bold kind/title line is gone from the
+               collapsed row — notifications speak with their classifier
+               summary (better signal); the label survives as the micro
+               caption in the expanded raw inset -->
           <template v-if="row.kind === 'notification'">
             <div class="nb-event-summary">{{ row.summary }}</div>
             <div class="nb-chips">
@@ -173,9 +203,9 @@
               <ion-icon aria-hidden="true" :icon="copyOutline" />
               <span v-if="copiedKey === row.key" class="nb-raw-copied">Copied</span>
             </button>
-            <!-- the per-row source label ("bot" etc.) lives only in the expanded
-                 view now, as a micro caption above the raw JSON -->
-            <span v-if="row.app && row.app !== '—'" class="nb-event-raw-source">{{ row.app }}</span>
+            <!-- the row label (source app + notification title) lives only in
+                 the expanded view now, as a micro caption above the raw JSON -->
+            <span v-if="expandedRowCaption(row)" class="nb-event-raw-source">{{ expandedRowCaption(row) }}</span>
             <pre class="nb-event-raw-text">{{ rawPreview(row).text }}</pre>
             <span v-if="rawPreview(row).truncatedChars > 0" class="nb-event-raw-note">
               … {{ rawPreview(row).truncatedChars }} chars trimmed (2 KB display cap) — copy takes the full payload
@@ -211,10 +241,12 @@ import { useBotStore } from '@/stores/bot';
 import { usePolling } from '@/composables/usePolling';
 import { copyText } from '@/utils/clipboard';
 import { formatBytes, formatIsoShort, formatUptime } from '@/utils/time';
-import { formatApiPort } from '@/viewModels/statusViewModel';
+import { ageLabel, formatApiPort } from '@/viewModels/statusViewModel';
 import {
   EVENT_KIND_OPTIONS,
   eventKindIdentity,
+  expandedRowCaption,
+  feedIsAllStartup,
   payloadPreview,
   relativeTimeLabel,
   type EventKindIdentity,
@@ -243,6 +275,17 @@ const feedRows = computed<FeedRow[]>(() =>
     .reverse()
     .map((row) => ({ ...row, relText: relativeTimeLabel(row.timestamp, nowMs.value) }))
 );
+
+/** R2 finding 2: realtime card ages — recomputed on every 2s feed tick
+ * (nowMs), so "4s ago" -> "12s ago" reads live although health itself
+ * refreshes on the slower 5s loop. */
+const lastCycleAge = computed(() => ageLabel(store.health?.watermark.updated_at ?? '', nowMs.value));
+const daemonStartedAge = computed(() => ageLabel(store.daemon?.startedAt ?? '', nowMs.value));
+
+/** R2 finding 4: the all-startup cue renders whenever the filtered feed is
+ * non-empty and carries zero notification-kind rows (API down keeps the
+ * offline banner in charge; an empty feed keeps the plain empty state). */
+const showStartupHint = computed(() => !store.apiDown && feedIsAllStartup(store.events));
 
 /** Event expand state: per-row key, component-local (like the chat tool chips). */
 const expandedRows = reactive(new Set<string>());
@@ -443,6 +486,18 @@ onUnmounted(() => {
 .nb-kv strong {
   font-weight: 600;
 }
+/* R2: value column that stacks the live age under the absolute stamp */
+.nb-kv-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  text-align: right;
+  min-width: 0;
+}
+.nb-age-secondary {
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-muted);
+}
 /* feed header + its kind chips share ONE row; wraps under the h2 when narrow
    (chips use the shared .nb-filter-chips container from theme/nb-shared.css) */
 .nb-feed-header {
@@ -576,6 +631,12 @@ onUnmounted(() => {
 .nb-kind ion-icon {
   font-size: 14px;
 }
+/* R2: the muted kind tag next to the icon ("startup") — one step quieter
+   than the meta row's secondary copy; replaces the redundant bold label */
+.nb-kind-caption {
+  flex: none;
+  color: var(--nb-text-muted);
+}
 .nb-kind-notification {
   background: var(--nb-teal-muted);
   color: var(--nb-teal-light);
@@ -592,10 +653,11 @@ onUnmounted(() => {
 .nb-when-rel {
   color: var(--nb-text-muted);
 }
-.nb-event-title {
-  font-size: var(--nb-fs-body);
-  font-weight: 600;
-  margin-top: var(--nb-space-1);
+/* R2 finding 4: one-line cue under the filter chips for an all-startup feed */
+.nb-feed-hint {
+  margin: 0 0 var(--nb-space-2);
+  font-size: var(--nb-fs-secondary);
+  color: var(--nb-text-muted);
 }
 .nb-event-summary {
   color: var(--nb-text-secondary);

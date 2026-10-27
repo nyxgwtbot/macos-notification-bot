@@ -5,6 +5,8 @@ import {
   eventKey,
   eventKindIdentity,
   eventToRow,
+  expandedRowCaption,
+  feedIsAllStartup,
   isErrorStatus,
   payloadPreview,
   relativeTimeLabel,
@@ -226,5 +228,49 @@ describe('eventKey / isErrorStatus', () => {
     expect(isErrorStatus('error: timeout')).toBe(true);
     expect(isErrorStatus('ok')).toBe(false);
     expect(isErrorStatus(null)).toBe(false);
+  });
+});
+
+describe('feedIsAllStartup', () => {
+  const startupRow = eventToRow({ event: 'startup', timestamp: '2026-10-26T12:00:00Z' });
+
+  test('true when the feed has rows but zero notification-kind rows', () => {
+    expect(feedIsAllStartup([startupRow])).toBe(true);
+    expect(feedIsAllStartup([startupRow, { ...startupRow, key: 'startup:other' }])).toBe(true);
+  });
+
+  test('false the moment one notification-kind row appears (any position)', () => {
+    const notificationRow = eventToRow(notifEvent());
+    expect(feedIsAllStartup([notificationRow])).toBe(false);
+    expect(feedIsAllStartup([startupRow, notificationRow])).toBe(false);
+    expect(feedIsAllStartup([notificationRow, startupRow])).toBe(false);
+  });
+
+  test('an empty feed is not "all-startup" — it renders the plain empty state', () => {
+    expect(feedIsAllStartup([])).toBe(false);
+  });
+
+  test('finance-acted rows keep kind notification, so they break the cue', () => {
+    const financeRow = eventToRow(notifEvent({ finance: { status: 'ok', method: 'regex' } }));
+    expect(financeRow.kind).toBe('notification');
+    expect(feedIsAllStartup([startupRow, financeRow])).toBe(false);
+  });
+});
+
+describe('expandedRowCaption', () => {
+  test('notification rows caption as "app · Title" (the dropped bold label)', () => {
+    expect(expandedRowCaption(eventToRow(notifEvent()))).toBe('com.apple.mail · Fatura');
+  });
+
+  test('startup rows keep the bot source tag (no title to append)', () => {
+    const startup = eventToRow({ event: 'startup', timestamp: '2026-10-26T12:00:00Z' });
+    expect(expandedRowCaption(startup)).toBe('bot');
+  });
+
+  test('unknown app ("—") degrades to the title alone; empty title drops out', () => {
+    expect(expandedRowCaption(eventToRow(notifEvent({ app: null as never })))).toBe('Fatura');
+    expect(expandedRowCaption(eventToRow(notifEvent({ title: null as never })))).toBe('com.apple.mail');
+    // nothing meaningful at all -> the caption slot is skipped by the caller
+    expect(expandedRowCaption(eventToRow(notifEvent({ app: null as never, title: null as never })))).toBe('');
   });
 });

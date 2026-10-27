@@ -30,3 +30,23 @@ export function formatApiPort(input: ApiPortStatusInput): string {
   }
   return input.adopted ? `${port} (adopted)` : `${port}`;
 }
+
+/**
+ * Wall-clock age caption for the Status cards: seconds-granularity ages that
+ * read live ("4s ago" / "12s ago"), stepping up through min/h/d. Pure in the
+ * render clock: the caller passes `nowMs` from the poll tick, so each poll
+ * recomputes the label. Empty for a missing/unparseable stamp; a future
+ * timestamp (clock skew) clamps to "0s ago".
+ */
+export function ageLabel(iso: string | null | undefined, nowMs: number): string {
+  if (!iso || !Number.isFinite(nowMs)) return '';
+  const time = new Date(iso).getTime();
+  if (Number.isNaN(time)) return '';
+  const seconds = Math.floor(Math.max(0, nowMs - time) / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  return `${Math.floor(hours / 24)} d ago`;
+}

@@ -162,3 +162,24 @@ export function relativeTimeLabel(iso: string, nowMs: number): string {
   if (hours < 24) return `${hours} h ago`;
   return `${Math.floor(hours / 24)} d ago`;
 }
+
+/** True when the filtered feed carries at least one row but ZERO
+ * notification-kind rows (startup lines only) — the Status view then cues
+ * the user that macOS itself hasn't produced anything yet (R2 finding 4).
+ * An empty feed is NOT "all-startup": it renders the existing empty state
+ * (tests: eventViewModel.spec.ts). */
+export function feedIsAllStartup(rows: ReadonlyArray<EventRow>): boolean {
+  return rows.length > 0 && !rows.some((row) => row.kind === 'notification');
+}
+
+/** Expanded-row micro caption: the source app plus the notification title —
+ * the row label/bold title line now lives ONLY in the expanded view (R2
+ * finding 1); collapsed rows show the summary (notifications) or the muted
+ * kind tag next to the icon (startup). Startup rows carry no title, so
+ * their caption stays just "bot" (tests: eventViewModel.spec.ts). */
+export function expandedRowCaption(row: EventRow): string {
+  const parts: string[] = [];
+  if (row.app && row.app !== '—') parts.push(row.app);
+  if (row.kind === 'notification' && row.title) parts.push(row.title);
+  return parts.join(' · ');
+}
