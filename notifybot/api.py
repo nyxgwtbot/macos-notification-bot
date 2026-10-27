@@ -13,6 +13,10 @@ Serves the endpoint rows of the Electron desktop plan over a stdlib
 8. POST /api/finance/report         -> builds reports/<YYYY-MM>.html
 9. POST /api/test-notify            -> reuses cli.trigger_test_notifications()
 10. anything else                   -> 404 / 405 JSON
+11. POST /api/agent/turn            -> in-process agent tool loop (synchronous)
+12. GET  /api/agent/sessions        -> agent chat sessions (newest first)
+13. GET  /api/agent/session/<id>    -> full agent session transcript (validated id)
+14. GET  /api/services              -> sub-service registry status (artifacts)
 Plus one support endpoint for the Logs screen (raw text tail with malformed
 lines flagged, needed to render them dimmed): GET /api/logs/tail?lines=N.
 
@@ -48,6 +52,20 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from notifybot import __version__
+from notifybot.agent import (
+    AGENT_MESSAGE_MAX_BYTES,
+    AgentSessionError,
+    AgentSessionNotFound,
+    AgentSessionStore,
+    run_turn,
+)
+from notifybot.agent_tools import (
+    ARTIFACTS_PORT,
+    ArtifactServerRegistry,
+    ToolRegistry,
+    artifacts_dir_for,
+    artifacts_port_from_env,
+)
 from notifybot.finance import LEDGER_SCHEMA, FinanceLedger, previous_month
 from notifybot.report import FinanceReporter, validate_month
 
@@ -494,6 +512,10 @@ class BotApiRuntime:
     def __init__(self, config_path: str):
         self.config_path = os.path.abspath(config_path)
         self.config_dir = os.path.dirname(self.config_path) or "."
+        # Agent sub-services (rows 11-14): lazily built so importing/starting
+        # the API never binds ports or creates directories as a side effect.
+        self.agent_registry: Optional[ArtifactServerRegistry] = None
+        self.tool_registry: Optional[ToolRegistry] = None
 
     # ---- path resolution (relative paths live beside config.json) ----
 
@@ -517,6 +539,26 @@ class BotApiRuntime:
 
     def reports_dir(self) -> str:
         return os.path.join(self.config_dir, "reports")
+
+    # ---- agent sub-services (rows 11-14) ----
+
+    def agent_sessions_dir(self) -> str:
+        return AgentSessionStore(self.config_dir).sessions_dir
+
+    def artifacts_dir(self) -> str:
+        return artifacts_dir_for(self.config_dir)
+
+    def ensure_agent_registry(self) -> ArtifactServerRegistry:
+        """Lazy artifacts sub-service registry: one per server process (the
+        single BotApiRuntime keeps it singleton). The registry binds nothing
+        here — the listener starts on the first server.serve tool call."""
+        if self.agent_registry is None:
+            self.agent_registry = ArtifactServerRegistry(
+                self.artifacts_dir(), port=artifacts_port_from_env()
+            )
+        if self.tool_registry is None:
+            self.tool_registry = ToolRegistry(self, self.agent_registry)
+        return self.agent_registry
 
     # ---- shared reads ----
 
@@ -786,6 +828,55 @@ class BotApiRuntime:
             )
         return {"ok": True, "posted": posted}
 
+    # ---------- agent endpoint handlers (rows 11-14; all error strings NEW -> English) ----------
+
+    # #11 POST /api/agent/turn — synchronous agent turn (Risks decision:
+    # worst-case turn <= 90s budget + one 30s Ollama call fits a single
+    # round-trip on this threading server; daemon_threads keeps /api/health
+    # responsive during the turn).
+    def agent_turn(self, body: Any) -> dict:
+        if not isinstance(body, dict):
+            raise ApiError(400, "body must be a JSON object with a 'message' string")
+        session_id = body.get("session_id")
+        if session_id is not None and not isinstance(session_id, str):
+            raise ApiError(400, "'session_id' must be a string")
+        message = body.get("message")
+        if not isinstance(message, str) or message.strip() == "":
+            raise ApiError(400, "'message' must be a non-empty string")
+        if len(message.encode("utf-8")) > AGENT_MESSAGE_MAX_BYTES:
+            raise ApiError(400, f"'message' is too large (limit is {AGENT_MESSAGE_MAX_BYTES} bytes)")
+        self.ensure_agent_registry()
+        try:
+            return run_turn(self, session_id, message.strip(), llm_fn=None)
+        except AgentSessionNotFound as e:
+            raise ApiError(404, str(e)) from None
+        except AgentSessionError as e:  # noqa: B014 - separate statuses: 404 above, 400 here
+            raise ApiError(400, str(e)) from None
+        except ValueError as e_400:  # message contract violations from run_turn
+            raise ApiError(400, str(e_400)) from None
+
+    # #12 GET /api/agent/sessions
+    def agent_sessions(self, params: Dict[str, List[str]]) -> dict:
+        del params  # no query knobs in v1
+        store = AgentSessionStore(self.config_dir)
+        return {"sessions": store.scan()}
+
+    # #13 GET /api/agent/session/<id> (DYNAMIC_ROUTES prefix)
+    def agent_session(self, session_id: str) -> dict:
+        try:
+            session_id = AgentSessionStore.validate_session_id(session_id)
+        except AgentSessionError:
+            raise ApiError(400, f"invalid agent session id: {session_id!r}") from None
+        records = AgentSessionStore(self.config_dir).load(session_id)
+        if records is None:
+            raise ApiError(404, f"agent session not found: {session_id}")
+        return {"session_id": session_id, "records": records}
+
+    # #14 GET /api/services
+    def services(self) -> dict:
+        registry = self.ensure_agent_registry()
+        return {"services": {"artifacts": registry.list()}}
+
     # ---------- param helpers ----------
 
     # GET /api/logs/tail — raw tail support endpoint for the Logs screen
@@ -837,14 +928,25 @@ ROUTES: Dict[str, Dict[str, str]] = {
         "/api/finance/transactions": "finance_transactions",
         "/api/finance/report": "finance_report_status",
         "/api/logs/tail": "logs_tail",
+        "/api/agent/sessions": "agent_sessions",
+        "/api/services": "services",
     },
     "POST": {
         "/api/config": "config_post",
         "/api/finance/report": "finance_report_build",
         "/api/test-notify": "test_notify",
+        "/api/agent/turn": "agent_turn",
     },
 }
-QUERY_HANDLERS = frozenset({"events", "finance_summary", "finance_transactions", "finance_report_status", "logs_tail"})
+QUERY_HANDLERS = frozenset({"events", "finance_summary", "finance_transactions", "finance_report_status", "logs_tail", "agent_sessions"})
+
+# Dynamic route prefixes consulted BEFORE the exact-match table. v1 has a
+# single row: GET /api/agent/session/<id> — the id is validated inside the
+# handler (regex -> 400, unknown -> 404); no wildcard routing beyond this
+# prefix.
+DYNAMIC_ROUTES: Tuple[Tuple[str, str, str], ...] = (
+    ("/api/agent/session/", "GET", "agent_session"),
+)
 
 
 class BotApiHTTPServer(ThreadingHTTPServer):
@@ -919,16 +1021,25 @@ class BotApiHandler(BaseHTTPRequestHandler):
         path = parsed.path or "/"
         params = parse_qs(parsed.query, keep_blank_values=True)
 
-        if not any(path in methods for methods in ROUTES.values()):
-            self.send_json(404, {"error": f"rota não encontrada: {path}"})
-            return
-        handler_name = ROUTES.get(method, {}).get(path)
-        if handler_name is None:
-            self.send_json(405, {"error": f"método {method} não permitido para {path}"})
-            return
+        # Dynamic-prefix routes first (v1: GET /api/agent/session/<id>).
+        dynamic_match: Optional[Tuple[str, str]] = None
+        for prefix, dyn_method, dyn_handler in DYNAMIC_ROUTES:
+            if method == dyn_method and path.startswith(prefix):
+                dynamic_match = (dyn_handler, path[len(prefix):])
+                break
+        if dynamic_match is None:
+            if not any(path in methods for methods in ROUTES.values()):
+                self.send_json(404, {"error": f"rota não encontrada: {path}"})
+                return
+            handler_name = ROUTES.get(method, {}).get(path)
+            if handler_name is None:
+                self.send_json(405, {"error": f"método {method} não permitido para {path}"})
+                return
 
         try:
-            if handler_name in QUERY_HANDLERS:
+            if dynamic_match is not None:
+                payload = getattr(runtime, dynamic_match[0])(dynamic_match[1])
+            elif handler_name in QUERY_HANDLERS:
                 payload = getattr(runtime, handler_name)(params)
             elif method == "POST":
                 payload = getattr(runtime, handler_name)(self.read_json_body())
