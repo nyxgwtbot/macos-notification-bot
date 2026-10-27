@@ -17,6 +17,7 @@ per run; the server process is always terminated.
 import contextlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -34,7 +35,9 @@ if REPO_ROOT not in sys.path:
 from notifybot.finance import FinanceLedger
 from notifybot.report import validate_month  # noqa: F401  (contract reference)
 
-PREFERRED_PORT = 4770
+# 4770 reserved for the artifacts sub-service (server.serve) — the API smoke
+# must never occupy the port it is about to exercise.
+PREFERRED_PORT = 4789
 HEALTH_TIMEOUT_S = 20.0
 
 
@@ -154,6 +157,11 @@ def main() -> int:
 
         env = dict(os.environ)
         env.pop("NOTIFYBOT_API_PORT", None)  # --port wins for the sandbox server
+        # Mock-mode agent rows: forward the hook to the server subprocess so
+        # the agent loop uses the deterministic scripted LLM (no Ollama calls).
+        agent_mock = os.environ.get("NOTIFYBOT_SMOKE_AGENT_MOCK", "") == "1"
+        if agent_mock:
+            env["NOTIFYBOT_SMOKE_AGENT_MOCK"] = "1"
         proc = subprocess.Popen(
             [sys.executable, "bot.py", "api", "--config", config_path, "--port", str(port)],
             cwd=REPO_ROOT,
@@ -274,6 +282,50 @@ def main() -> int:
                                       and body.get("posted") == 3, str(body))
             else:
                 print("[SKIPPED] test-notify POST — publique notificações reais com NOTIFYBOT_SMOKE_TEST_NOTIFY=1")
+
+            # #11-#14 agent rows — mock-mode only (NOTIFYBOT_SMOKE_AGENT_MOCK=1
+            # forwards to the server subprocess; never talks to a live Ollama).
+            if agent_mock:
+                status, body = api_request(base, "POST", "/api/agent/turn", {"message": "dashboard, por favor"})
+                url = (body or {}).get("urls", [None])[0] if status == 200 and body else None
+                turn_ok = (
+                    status == 200 and bool(body) and bool(body.get("answer"))
+                    and url is not None
+                    and re.match(r"^http://127\.0\.0\.1:4770/[0-9a-f]{32}\.html$", url) is not None
+                )
+                all_ok &= print_check("agent turn pipeline", turn_ok,
+                                      f"status={status} answer={(body or {}).get('answer', '')[:60]!r} urls={url}")
+
+                if turn_ok:
+                    session_id = body["session_id"]
+                    with urllib.request.urlopen(url, timeout=10) as resp:
+                        served_html = resp.read().decode("utf-8")
+                    all_ok &= print_check("agent artifact served", resp.status == 200
+                                          and "Agent Health Overview" in served_html,
+                                          f"GET {url} -> {len(served_html)} bytes com título do dashboard")
+
+                    status, services = api_request(base, "GET", "/api/services")
+                    artifacts_row = (services or {}).get("services", {}).get("artifacts", {})
+                    all_ok &= print_check("agent services row", status == 200
+                                          and artifacts_row.get("running") is True
+                                          and artifacts_row.get("port") == 4770
+                                          and bool(artifacts_row.get("root")) and bool(artifacts_row.get("since")),
+                                          str(artifacts_row))
+
+                    status, sessions = api_request(base, "GET", "/api/agent/sessions")
+                    found = [row for row in (sessions or {}).get("sessions", []) if row.get("session_id") == session_id]
+                    all_ok &= print_check("agent sessions list", status == 200 and len(found) == 1
+                                          and found[0].get("preview", "").startswith("dashboard"),
+                                          f"1 sessão com preview={found[0].get('preview', '')[:40]!r}" if found else str(sessions))
+
+                    status, detail = api_request(base, "GET", f"/api/agent/session/{session_id}")
+                    records = (detail or {}).get("records", []) if status == 200 else []
+                    roles = [record.get("role") for record in records]
+                    all_ok &= print_check("agent session fetch", status == 200 and bool(records)
+                                          and roles[0] == "user" and roles[-1] == "assistant",
+                                          f"roles={roles}")
+            else:
+                print("[SKIPPED] agent rows — rode com NOTIFYBOT_SMOKE_AGENT_MOCK=1 para exercitar o pipeline do agente (mock, sem Ollama)")
         finally:
             proc.terminate()
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
@@ -285,3 +337,22 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+# ---------------------------------------------------------------------------
+# Supervisor REAL-WINDOW smoke checklist (executed by the supervisor ONLY —
+# this script covers the mock-mode path; these items need a human + the real
+# Electron window + real Ollama + osascript consent):
+#
+#   1. Launch the packaged/dev desktop app (`cd desktop && npm run desktop:start`).
+#   2. Open the Chat tab and ask for "notificações de teste" -> the agent calls
+#      notify.test; verify 3 macOS banners appear and any osascript/automation
+#      CONSENT prompt is granted (consent identity may differ under the
+#      Electron-spawned python child vs terminal runs).
+#   3. If a daemon is live, confirm it CONSUMED the 3 test events (watermark
+#      advanced in the Dashboard tab / .bot_state.json).
+#   4. Ask for a dashboard with the REAL model (Ollama live): verify the agent
+#      produces turn chips (app.data -> dashboard.create -> server.serve) and
+#      the iframe PAINTS the artifact (non-blank pixels, not a blank frame).
+#   5. Confirm GET /api/services shows the artifacts row running on 4770 and
+#      the tab bar reads Dashboard / Finance / Chat / Settings / Logs.
+# ---------------------------------------------------------------------------
