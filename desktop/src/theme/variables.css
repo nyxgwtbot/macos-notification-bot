@@ -44,7 +44,7 @@
   --nb-fs-title: 16px;    /* w600 lh1.3 — ion-card-title */
   --nb-fs-body: 14px;     /* w400 lh1.5 — bubbles, feed titles, ledger */
   --nb-fs-secondary: 13px;/* w400 lh1.45 — kv, hints, mom, muted copy */
-  --nb-fs-micro: 11px;    /* w400 lh1.45 — mono raw logs, previews, top meta, badges */
+  --nb-fs-micro: 11px;    /* w400 — mono raw logs (compact, lh1.35), line numbers, previews, top meta, badges */
 
   /* ========================================
      RADIUS

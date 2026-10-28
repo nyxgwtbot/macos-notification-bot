@@ -79,7 +79,7 @@ describe('eventToRow', () => {
   });
 
   test('layer labels cover all Router v2 layers', () => {
-    expect(eventToRow(notifEvent({ layer: 'rule' as never })).layerLabel).toBe('Regra');
+    expect(eventToRow(notifEvent({ layer: 'rule' as never })).layerLabel).toBe('Rule');
     expect(eventToRow(notifEvent({ layer: 'fallback_in_fallback' as never })).layerLabel).toBe('Fallback');
   });
 

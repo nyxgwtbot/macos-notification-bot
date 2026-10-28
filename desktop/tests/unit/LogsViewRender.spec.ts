@@ -4,7 +4,7 @@
  * escape-then-wrap order (Vue HTML-escapes every interpolation BEFORE the
  * spans wrap it, with no innerHTML path at all) is proven here at the DOM
  * level: a line containing `<script>` must render INERT. Also covers the
- * R3 search wiring (150ms debounce + "n of m lines" counter) and the
+ * R3 search wiring (150ms debounce + merged "Raw tail · n of m lines" title) and the
  * density chip persistence contract.
  */
 
@@ -68,14 +68,16 @@ describe('LogsView rendered log lines (R3)', () => {
     wrapper.unmount();
   });
 
-  test('search filters rows after the 150ms debounce and updates the "n of m lines" counter', async () => {
+  test('search filters rows after the 150ms debounce and updates the merged "Raw tail · n of m lines" title', async () => {
     const wrapper = await mountLogs([
       '{"event": "notification", "telegram": "failed"}',
       STARTUP_LINE,
       '{"event": "notification", "telegram": "ok"}'
     ]);
     expect(wrapper.findAll('.nb-line').length).toBe(3);
-    expect(wrapper.find('.nb-log-count').text()).toBe('3 of 3 lines');
+    expect(wrapper.find('.nb-log-header-row .nb-muted').text()).toBe('Raw tail · 3 of 3 lines');
+    expect(wrapper.find('.nb-log-count').exists()).toBe(false);
+    expect(wrapper.find('.nb-log-header-row [aria-live="polite"]').exists()).toBe(true);
 
     await wrapper.find('input.nb-log-search').setValue('telegram');
     await flushPromises();
@@ -83,7 +85,7 @@ describe('LogsView rendered log lines (R3)', () => {
     await flushPromises();
 
     expect(wrapper.findAll('.nb-line').length).toBe(2);
-    expect(wrapper.find('.nb-log-count').text()).toBe('2 of 3 lines');
+    expect(wrapper.find('.nb-log-header-row .nb-muted').text()).toBe('Raw tail · 2 of 3 lines');
 
     wrapper.unmount();
   });
@@ -93,15 +95,21 @@ describe('LogsView rendered log lines (R3)', () => {
     const scroller = wrapper.find('.nb-log-scroller');
     // comfortable is the default for a fresh store
     expect(scroller.attributes('data-density')).toBe('comfortable');
+    expect(wrapper.find(".nb-log-scroller[data-density='comfortable'] .nb-raw").exists()).toBe(true);
+    expect(wrapper.find(".nb-log-scroller[data-density='compact'] .nb-raw").exists()).toBe(false);
     const chips = wrapper.findAll('.nb-density .nb-filter-chip');
     expect(chips.map((c) => c.text())).toEqual(['Compact', 'Comfortable']);
 
     await chips[0].trigger('click');
     expect(scroller.attributes('data-density')).toBe('compact');
+    expect(wrapper.find(".nb-log-scroller[data-density='compact'] .nb-raw").exists()).toBe(true);
+    expect(wrapper.find(".nb-log-scroller[data-density='comfortable'] .nb-raw").exists()).toBe(false);
     expect(localStorage.getItem(LOGS_DENSITY_KEY)).toBe('compact');
 
     await chips[1].trigger('click');
     expect(scroller.attributes('data-density')).toBe('comfortable');
+    expect(wrapper.find(".nb-log-scroller[data-density='comfortable'] .nb-raw").exists()).toBe(true);
+    expect(wrapper.find(".nb-log-scroller[data-density='compact'] .nb-raw").exists()).toBe(false);
     expect(localStorage.getItem(LOGS_DENSITY_KEY)).toBe('comfortable');
 
     wrapper.unmount();
@@ -202,6 +210,8 @@ describe('LogsView R7 semantics, persistence, highlight', () => {
     const wrapper = await mountLogs([NOTIF_LINE, STARTUP_LINE]);
     const chip = wrapper.find('.nb-follow-chip');
     expect(chip.attributes('aria-pressed')).toBe('true');
+    expect(chip.text()).toBe('Following');
+    expect(chip.attributes('aria-label')).toBe('Following the tail — click to pause');
     await chip.trigger('click'); // pause
     expect(localStorage.getItem(LOGS_FOLLOW_KEY)).toBe('false');
     wrapper.unmount();
@@ -210,7 +220,8 @@ describe('LogsView R7 semantics, persistence, highlight', () => {
     const restored = await mountLogs([NOTIF_LINE, STARTUP_LINE]);
     const restoredChip = restored.find('.nb-follow-chip');
     expect(restoredChip.attributes('aria-pressed')).toBe('false');
-    expect(restoredChip.text()).toBe('Paused — follow?');
+    expect(restoredChip.text()).toBe('Paused · Resume');
+    expect(restoredChip.attributes('aria-label')).toBe('Following paused — click to resume');
 
     await restoredChip.trigger('click'); // re-enable writes back 'true'
     expect(localStorage.getItem(LOGS_FOLLOW_KEY)).toBe('true');

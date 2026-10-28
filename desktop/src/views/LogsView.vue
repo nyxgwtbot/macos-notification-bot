@@ -17,7 +17,7 @@
 
         <div class="nb-log-header">
           <div class="nb-log-header-row">
-            <span class="nb-muted">{{ logTitle }}</span>
+            <span class="nb-muted" aria-live="polite">{{ logTitle }}</span>
             <div class="nb-log-header-end">
             <ion-badge v-if="!followOn && newCount > 0" color="secondary">+{{ newCount }} new</ion-badge>
             <!-- R8: one shared live-badge wording app-wide — "Live" + the
@@ -45,13 +45,13 @@
               class="nb-follow-chip"
               :data-active="followOn"
               :aria-pressed="followOn"
-              :aria-label="followOn ? 'Following the tail — click to pause' : 'Paused — click to follow the tail again'"
+              :aria-label="followOn ? 'Following the tail — click to pause' : 'Following paused — click to resume'"
               @click="onFollowChipClick"
             >
-              {{ followOn ? 'Follow' : 'Paused — follow?' }}
+              {{ followOn ? 'Following' : 'Paused · Resume' }}
             </button>
             <!-- R3: right-side header tools — debounced client-side search,
-                 live "n of m lines" counter, density switch chip, copy-all -->
+                 density switch chip, copy-all (R4: counter merged into the title) -->
             <div class="nb-log-tools">
               <input
                 class="nb-log-search"
@@ -61,7 +61,6 @@
                 aria-label="Filter log lines"
                 @input="onSearchInput"
               />
-              <span class="nb-log-count" aria-live="polite">{{ lineCount }}</span>
               <div class="nb-density" role="group" aria-label="Log line density">
                 <button
                   type="button"
@@ -205,7 +204,7 @@ function writeStoredValue(key: string, value: string): void {
 }
 
 /** Follow-tail control: ON pins the scroller to the bottom; a manual scroll
- * up pauses it (chip switches to "Paused — follow?"); clicking re-enables.
+ * up pauses it (chip switches to "Paused · Resume"); clicking re-enables.
  * R7: the choice persists (stored 'false' restores paused). */
 const followOn = ref(parseLogFollow(readStoredValue(LOGS_FOLLOW_KEY)));
 watch(followOn, (value) => writeStoredValue(LOGS_FOLLOW_KEY, String(value)));
@@ -250,7 +249,7 @@ function onSearchInput(event: Event): void {
 }
 
 /* ========================================
-   R3: DENSITY — compact (fs 11/lh 1.35) vs comfortable (fs 12/lh 1.65);
+   R3: DENSITY — compact (fs 11/lh 1.35) vs comfortable (fs 13/lh 1.55);
    persisted under LOGS_DENSITY_KEY, tampered values degrade to comfortable.
    localStorage itself can throw in privacy modes — degrade to session-only.
    ======================================== */
@@ -261,8 +260,11 @@ function onDensityChange(value: LogDensity): void {
   writeStoredValue(LOGS_DENSITY_KEY, value);
 }
 
-const logTitle = computed(() =>
-  `Raw tail · ${visibleLines.value.length} line${visibleLines.value.length === 1 ? '' : 's'}`
+/** R4: merged header title — "Raw tail · n of m lines"; n = currently visible rows
+ *  (kind + search filtered), m = loaded tail size. Replaces the deleted count span,
+ *  which now lives here as one string; politeness moved to the header span. */
+const logTitle = computed(
+  () => `Raw tail · ${visibleLines.value.length} of ${store.logLines.length} lines`
 );
 
 /** L4: rows whose raw JSON carries "urgency": "high" get the warn treatment.
@@ -282,12 +284,6 @@ const visibleLines = computed(() =>
   }))
 );
 
-/** R3: "n of m lines" beside the search input — n = currently visible rows
- * (kind + search filtered), m = loaded tail size. */
-const lineCount = computed(
-  () => `${visibleLines.value.length} of ${store.logLines.length} lines`
-);
-
 function onKindFilterChange(kind: LogKindFilter): void {
   if (kindFilter.value === kind) return;
   kindFilter.value = kind;
@@ -300,7 +296,7 @@ function onKindFilterChange(kind: LogKindFilter): void {
 watch(appliedSearch, () => rebaseNewCount());
 
 /** Keep auto-scroll pinned to the bottom unless the user scrolled up; a scroll
- * up pauses follow (chip -> "Paused — follow?"), the chip click re-enables. */
+ * up pauses follow (chip -> "Paused · Resume"), the chip click re-enables. */
 function onScroll(event: Event): void {
   const el = event.target as HTMLElement;
   if (!el) return;
@@ -476,6 +472,7 @@ onUnmounted(() => {
   flex-direction: column;
   height: 100%;
   min-height: 0;
+  position: relative; /* R4: anchors the copy feedback overlay above the scroller */
 }
 
 .nb-log-header {
@@ -500,7 +497,7 @@ onUnmounted(() => {
 }
 
 /* follow chip: same tinted-chip DNA as the shared filter chips; the tealed
-   state = following (active/pinned), neutral = paused */
+   state = following (active/pinned), dashed neutral = paused (R4) */
 .nb-follow-chip {
   display: inline-flex;
   align-items: center;
@@ -521,6 +518,11 @@ onUnmounted(() => {
 .nb-follow-chip[data-active='true'] {
   background: var(--nb-info-muted);
   color: var(--nb-info);
+}
+/* paused: neutral dashed border keeps the affordance visible without the active tint */
+.nb-follow-chip[data-active='false'] {
+  border-style: dashed;
+  border-color: var(--nb-border-strong);
 }
 
 /* copy all: quiet ghost affordance in the header, hover brightens like the
@@ -554,8 +556,8 @@ onUnmounted(() => {
   flex-wrap: wrap;
 }
 
-/* R3: right-side header tool group — search + live counter + density switch
-   + copy-all; wraps under the kind chips on narrow widths */
+/* R3: right-side header tool group — search + density switch + copy-all
+   (R4: counter merged into the title); wraps under the kind chips on narrow widths */
 .nb-log-tools {
   display: inline-flex;
   align-items: center;
@@ -565,8 +567,9 @@ onUnmounted(() => {
 }
 
 .nb-log-search {
-  width: 150px;
+  flex: 1 1 130px;
   min-width: 110px;
+  max-width: 180px;
   padding: 3px var(--nb-space-2);
   border: 1px solid var(--nb-border-default);
   border-radius: var(--nb-radius-sm);
@@ -581,13 +584,6 @@ onUnmounted(() => {
 }
 .nb-log-search:focus {
   border-color: var(--nb-info);
-}
-
-/* live "n of m lines" counter beside the search input */
-.nb-log-count {
-  font-size: var(--nb-fs-micro);
-  color: var(--nb-text-muted);
-  white-space: nowrap;
 }
 
 /* density switch: same tinted-chip DNA as the shared kind chips */
@@ -632,8 +628,8 @@ onUnmounted(() => {
   min-width: 3.5ch;
   text-align: right;
   font-family: var(--nb-mono);
-  font-size: 10px;
-  line-height: 1.5;
+  font-size: var(--nb-fs-micro);
+  line-height: 1.35;
   padding: var(--nb-space-1) 0;
   color: var(--nb-text-muted);
   user-select: none;
@@ -651,7 +647,7 @@ onUnmounted(() => {
 }
 
 .nb-line-bad .nb-raw {
-  opacity: 0.38;
+  opacity: 0.55;
   font-style: italic;
 }
 
@@ -674,36 +670,38 @@ onUnmounted(() => {
   padding: var(--nb-space-1) var(--nb-space-1) var(--nb-space-1) var(--nb-space-2);
   font-family: var(--nb-mono);
   font-size: var(--nb-fs-micro);
-  /* L2: relaxed line height (was fs 11/1.3-1.45 wall) */
-  line-height: 1.5;
+  /* L2→R4: relaxed line height; base mirrors compact metrics (fs 11/lh 1.35) */
+  line-height: 1.35;
   white-space: pre-wrap;
-  word-break: break-all;
+  overflow-wrap: anywhere;
   color: var(--nb-text-primary);
 }
 
-/* R3 density: compact = fs 11/lh 1.35 tight rows, comfortable = fs 12/lh 1.65
+/* R4 density: compact = fs 11/lh 1.35 tight rows, comfortable = fs 13/lh 1.55
    relaxed rows; row padding shifts with the density (the base above only
    covers an unset attribute edge case) */
 .nb-log-scroller[data-density='compact'] .nb-raw {
-  font-size: 11px;
+  font-size: var(--nb-fs-micro);
   line-height: 1.35;
-  padding: 2px 3px 2px var(--nb-space-2);
+  padding: 4px;
 }
 .nb-log-scroller[data-density='comfortable'] .nb-raw {
-  font-size: 12px;
-  line-height: 1.65;
-  padding: 5px 6px 5px var(--nb-space-2);
+  font-size: var(--nb-fs-secondary);
+  line-height: 1.55;
+  padding: 16px 4px 16px var(--nb-space-2);
 }
 /* R7: the gutter tracks the density so first text lines stay aligned */
+/* R4 probe-tuned: mirrors .nb-raw compact box (fs 11 · lh 1.35 · pad 4px) to lock baselines */
 .nb-log-scroller[data-density='compact'] .nb-line-no {
-  font-size: 9.5px;
+  font-size: var(--nb-fs-micro);
   line-height: 1.35;
-  padding: 2px 0;
+  padding: 4px 0;
 }
+/* R4 probe-tuned: lh 1.65 keeps the first-line baseline on .nb-raw comfortable (fs 13/lh 1.55, pad 16px); pt 16 matches raw */
 .nb-log-scroller[data-density='comfortable'] .nb-line-no {
-  font-size: 11px;
+  font-size: var(--nb-fs-micro);
   line-height: 1.65;
-  padding: 5px 0;
+  padding: 16px 0;
 }
 
 /* R3 token dimming: JSON keys muted, numeric/bool scalars teal — teal-dark
@@ -743,17 +741,24 @@ onUnmounted(() => {
   opacity: 1;
 }
 
+/* R4: absolute overlay — the "Copied" feedback must never reflow the row */
 .nb-copied {
-  position: relative;
-  right: 0;
+  position: absolute;
+  right: var(--nb-space-2);
   top: 3px;
+  background: var(--nb-bg-elevated);
+  border-radius: var(--nb-radius-sm);
   font-size: var(--nb-fs-micro);
   color: var(--ion-color-success);
 }
 
+/* R4: absolute overlay pinned to the layout's bottom-right — appearing must not reflow the scroller */
 .nb-copy-note {
-  margin-top: var(--nb-space-2);
+  position: absolute;
+  right: var(--nb-space-2);
+  bottom: var(--nb-space-2);
+  background: var(--nb-bg-elevated);
+  border-radius: var(--nb-radius-sm);
   font-size: var(--nb-fs-secondary);
-  flex-shrink: 0;
 }
 </style>

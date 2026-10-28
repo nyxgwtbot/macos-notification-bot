@@ -62,7 +62,7 @@ export function payloadPreview(event: BotEvent, maxChars = PAYLOAD_PREVIEW_MAX_C
 }
 
 const LAYER_LABELS: Record<string, string> = {
-  rule: 'Regra',
+  rule: 'Rule',
   llm_router: 'Router LLM',
   fallback_in_fallback: 'Fallback'
 };
