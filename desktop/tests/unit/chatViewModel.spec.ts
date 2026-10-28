@@ -241,6 +241,39 @@ describe('per-turn tool chips interleave', () => {
     expect(items[0].kind === 'bubble' && items[0].ts).toBe('2026-10-27T12:34:00+00:00');
     expect(items[1].kind === 'bubble' && items[1].ts).toBe('2026-10-27T09:05:00-05:00');
   });
+
+  test('transcriptFromRecords keeps one group per turn across loop-internal assistant_raw rows', () => {
+    // Real persisted sequence (agent.py): every parsed record is preceded by a
+    // loop-internal assistant_raw row; the auto server.serve step is not.
+    const rawRow = { role: 'assistant_raw', phase: 'attempt', raw_model_output: '{"tool":"app.data"}', ts: 'raw' } as AgentRecord;
+    const records: AgentRecord[] = [
+      { role: 'user', content: 'dashboard, por favor', ts: 'r1' },
+      { ...rawRow, ts: 'raw-a' },
+      { role: 'assistant', tool: 'app.data', args: {}, result: { ok: true }, ts: 'a1' },
+      { ...rawRow, ts: 'raw-b' },
+      { role: 'assistant', tool: 'app.data', args: {}, result: { ok: true }, ts: 'a2' },
+      { ...rawRow, ts: 'raw-c' },
+      { role: 'assistant', tool: 'dashboard.create', args: { title: 'Gastos' }, result: { artifact_id: HEX32 }, ts: 'a3' },
+      { role: 'assistant', tool: 'server.serve', args: { artifact_id: HEX32 }, result: { url: ARTIFACT_URL }, ts: 'a4' },
+      { ...rawRow, ts: 'raw-d' },
+      { role: 'assistant', answer: 'Aqui está o dashboard!', urls: [ARTIFACT_URL], ts: 'a5' }
+    ];
+    const { items, artifactUrl } = transcriptFromRecords(records);
+    // [user bubble, ONE tools group (4 chips), assistant bubble] — raw rows never flush
+    expect(outline(items)).toEqual(['user', 4, 'assistant']);
+    const group = items[1];
+    expect(group.kind === 'tools' && group.chips.map((c) => [c.tool, c.ok])).toEqual([
+      ['app.data', true],
+      ['app.data', true],
+      ['dashboard.create', true],
+      ['server.serve', true]
+    ]);
+    expect(items[2].kind === 'bubble' && [items[2].role, items[2].text]).toEqual(['assistant', 'Aqui está o dashboard!']);
+    expect(artifactUrl).toBe(ARTIFACT_URL);
+    // raw rows must not contribute items or chip ids of their own
+    const ids = items.map((item) => item.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
 });
 
 // ---- timestamps -----------------------------------------------------------
