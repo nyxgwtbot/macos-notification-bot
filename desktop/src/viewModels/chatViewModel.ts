@@ -29,6 +29,8 @@ export interface ChatToolChip {
   ok: boolean;
   /** Pretty-printed result (ok) or error text, truncated to the cap. */
   preview: string;
+  /** First string value of step.args truncated to 24 chars, '' when absent (skips 'html' key). */
+  target: string;
 }
 
 /** One transcript entry in display order. A turn's tool steps are interleaved
@@ -140,7 +142,39 @@ export function toToolChip(step: AgentTurnStep, index: number): ChatToolChip {
   if (preview.length > TOOL_CHIP_PREVIEW_MAX_CHARS) {
     preview = `${preview.slice(0, TOOL_CHIP_PREVIEW_MAX_CHARS)}\n…[truncated]`;
   }
-  return { id: `chip-${step.ts}-${index}`, tool: step.tool, ok, preview };
+  let target = '';
+  if (step.args && typeof step.args === 'object') {
+    for (const [key, val] of Object.entries(step.args as Record<string, unknown>)) {
+      if (key === 'html') continue;
+      if (typeof val === 'string') {
+        target = val.slice(0, 24);
+        break;
+      }
+    }
+  }
+  return { id: `chip-${step.ts}-${index}`, tool: step.tool, ok, preview, target };
+}
+
+/** Deduped tool names in first-seen order with " ×N" for repeats joined by " · ". */
+export function toolSummaryFromChips(chips: ChatToolChip[]): string {
+  if (!chips || chips.length === 0) return '';
+  const counts = new Map<string, number>();
+  const order: string[] = [];
+  for (const chip of chips) {
+    const tool = chip.tool;
+    if (!counts.has(tool)) {
+      order.push(tool);
+      counts.set(tool, 1);
+    } else {
+      counts.set(tool, (counts.get(tool) ?? 0) + 1);
+    }
+  }
+  return order
+    .map((tool) => {
+      const count = counts.get(tool) ?? 1;
+      return count > 1 ? `${tool} \u00d7${count}` : tool;
+    })
+    .join(' \u00b7 ');
 }
 
 /** One collapsible tool-activity group for a turn's steps, ids scoped to the
@@ -157,7 +191,8 @@ function toolsItemFromSteps(steps: AgentTurnStep[]): ChatTranscriptItem {
 /** Rebuild the interleaved transcript (bubbles + per-turn tool groups) and
  * artifact URL from a persisted session transcript. Consecutive tool rows
  * form the group of the turn whose user message precedes them; any answer /
- * content row closes the group. */
+ * content row closes the group. Loop-internal rows (assistant_raw / phase
+ * attempts) are ignored. */
 export function transcriptFromRecords(records: AgentRecord[]): { items: ChatTranscriptItem[]; artifactUrl: string | null } {
   const items: ChatTranscriptItem[] = [];
   let artifactUrl: string | null = null;
@@ -192,7 +227,8 @@ export function transcriptFromRecords(records: AgentRecord[]): { items: ChatTran
       flushTools();
       items.push({ kind: 'bubble', ...toBubble('assistant', record.content, record.ts) });
     } else {
-      flushTools();
+      // Loop-internal rows (assistant_raw / phase attempts) NEVER flush;
+      // flushes happen only at real boundaries (user / answer / content) and at transcript end.
     }
   });
   flushTools();

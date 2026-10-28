@@ -133,7 +133,9 @@ SERVE_CONTINUATION_TEMPLATE = (
     '{"tool": "server.serve", "args": {"action": "ensure", "artifact_id": "{artifact_id}"}}\n'
     "After the server.serve result arrives, reply with the final answer shape:\n"
     '{"answer": "<short pt-br text>", "urls": ["<the url from the server.serve result>"]}. '
-    "Never repeat dashboard.create and never call other tools before server.serve."
+    "Never repeat dashboard.create and never call other tools before server.serve. "
+    "Dashboards must be responsive (grid repeat(auto-fit, minmax(220px, 1fr)) or fluid columns; "
+    "never fixed px column totals; usable at ~440px pane width)."
 )
 
 # Finalize recipe (recipe completion, post-2): after the LOOP has executed the

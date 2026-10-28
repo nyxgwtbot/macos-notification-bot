@@ -7,6 +7,7 @@ import {
   isIpcTimeout,
   reduceChat,
   toToolChip,
+  toolSummaryFromChips,
   transcriptFromRecords,
   type ChatState,
   type ChatTranscriptItem
@@ -113,6 +114,43 @@ describe('tool chips mapping', () => {
     );
     expect(chip.preview.length).toBeLessThanOrEqual(2000 + '\n…[truncated]'.length);
     expect(chip.preview).toContain('…[truncated]');
+  });
+
+  test('extracts and truncates target to 24 chars, skipping html key', () => {
+    const chipWithDataset = toToolChip(
+      { role: 'assistant', tool: 'app.data', args: { dataset: 'health' }, result: { ok: true }, ts: 't1' },
+      0
+    );
+    expect(chipWithDataset.target).toBe('health');
+
+    const longTitle = 'Financial spending and summary for October 2026';
+    const chipWithLongTitle = toToolChip(
+      { role: 'assistant', tool: 'dashboard.create', args: { html: '<html>...</html>', title: longTitle }, result: { ok: true }, ts: 't2' },
+      1
+    );
+    expect(chipWithLongTitle.target).toBe(longTitle.slice(0, 24));
+    expect(chipWithLongTitle.target.length).toBe(24);
+
+    const chipNoString = toToolChip(
+      { role: 'assistant', tool: 'notify.test', args: {}, result: { ok: true }, ts: 't3' },
+      2
+    );
+    expect(chipNoString.target).toBe('');
+  });
+
+  test('toolSummaryFromChips formats unique tools and repeat counts in first-seen order', () => {
+    expect(toolSummaryFromChips([])).toBe('');
+
+    const chips = [
+      { id: '1', tool: 'app.data', ok: true, preview: '', target: '' },
+      { id: '2', tool: 'app.data', ok: true, preview: '', target: '' },
+      { id: '3', tool: 'dashboard.create', ok: true, preview: '', target: '' },
+      { id: '4', tool: 'server.serve', ok: true, preview: '', target: '' }
+    ];
+    expect(toolSummaryFromChips(chips)).toBe('app.data ×2 · dashboard.create · server.serve');
+
+    const singleChip = [{ id: '1', tool: 'notify.test', ok: true, preview: '', target: '' }];
+    expect(toolSummaryFromChips(singleChip)).toBe('notify.test');
   });
 });
 

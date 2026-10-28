@@ -78,7 +78,7 @@
                 <!-- F2: right-aligned micro timestamp + hover copy affordance
                      (copy the plain bubble TEXT, not the markdown markup) -->
                 <div class="nb-bubble-meta">
-                  <time class="nb-bubble-time" :datetime="item.ts ?? undefined">{{ formatBubbleTime(item.ts) }}</time>
+                  <time v-if="formatBubbleTime(item.ts)" class="nb-bubble-time" :datetime="item.ts ?? undefined">{{ formatBubbleTime(item.ts) }}</time>
                   <button
                     type="button"
                     class="nb-bubble-copy"
@@ -100,8 +100,14 @@
                   :aria-controls="`nb-tools-${item.id}`"
                   @click="toggleGroup(item.id)"
                 >
-                  <span class="nb-turn-tools-label">Tool activity · {{ item.chips.length }}</span>
                   <ion-icon aria-hidden="true" :icon="expandedGroups.has(item.id) ? chevronUpOutline : chevronDownOutline" />
+                  <span
+                    class="nb-turn-tools-count"
+                    :class="{ 'nb-turn-tools-error': item.chips.some((c) => !c.ok) }"
+                  >
+                    {{ item.chips.length }} tool call(s)
+                  </span>
+                  <span class="nb-turn-tools-names">{{ toolSummaryFromChips(item.chips) }}</span>
                 </button>
                 <div v-show="expandedGroups.has(item.id)" :id="`nb-tools-${item.id}`" class="nb-tool-activity">
                   <div v-for="chip in item.chips" :key="chip.id" class="nb-tool-chip" :class="{ 'nb-tool-chip-error': !chip.ok }">
@@ -112,7 +118,10 @@
                       @click="toggleChip(chip.id)"
                     >
                       <span class="nb-tool-tool">{{ chip.tool }}</span>
-                      <ion-badge :color="chip.ok ? 'success' : 'danger'">{{ chip.ok ? 'ok' : 'error' }}</ion-badge>
+                      <span v-if="chip.target" class="nb-tool-target">{{ chip.target }}</span>
+                      <span class="nb-tool-status" :class="chip.ok ? 'nb-tool-status-ok' : 'nb-tool-status-error'">
+                        {{ chip.ok ? 'ok' : 'error' }}
+                      </span>
                     </button>
                     <pre v-if="expandedChips.has(chip.id)" class="nb-tool-preview">{{ chip.preview }}</pre>
                   </div>
@@ -194,8 +203,8 @@
         <!-- Right Rail: Artifact Canvas (Dashboard iframe) -->
         <div v-if="state.artifactUrl && railOpen" class="nb-chat-rail">
           <ion-card class="nb-artifact">
-            <ion-card-header class="nb-artifact-header">
-              <ion-card-title class="nb-artifact-title">Dashboard</ion-card-title>
+            <div class="nb-artifact-header">
+              <span class="nb-artifact-title">Dashboard</span>
               <div class="nb-artifact-actions">
                 <ion-button size="small" fill="clear" aria-label="Reload dashboard" @click="reloadArtifact">
                   <ion-icon slot="icon-only" aria-hidden="true" :icon="refreshOutline" />
@@ -207,7 +216,7 @@
                   <ion-icon slot="icon-only" aria-hidden="true" :icon="closeOutline" />
                 </ion-button>
               </div>
-            </ion-card-header>
+            </div>
             <ion-card-content class="nb-artifact-content">
               <!-- sandbox="" strictly preserved: no script execution within the dashboard frame -->
               <iframe
@@ -229,13 +238,10 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import {
-  IonBadge,
   IonButton,
   IonButtons,
   IonCard,
   IonCardContent,
-  IonCardHeader,
-  IonCardTitle,
   IonContent,
   IonHeader,
   IonIcon,
@@ -268,6 +274,7 @@ import {
   initialChatState,
   isIpcTimeout,
   reduceChat,
+  toolSummaryFromChips,
   type ChatBubble,
   type ChatEvent,
   type ChatState
@@ -632,6 +639,11 @@ onUnmounted(() => {
   border: 1px solid var(--nb-border-default);
   padding: 0 var(--nb-space-3);
   font-size: var(--nb-fs-secondary);
+  --highlight-color-focused: transparent;
+}
+
+.nb-session-select:focus:not(:focus-visible) {
+  outline: none;
 }
 
 .nb-chat-layout {
@@ -688,7 +700,11 @@ onUnmounted(() => {
 .nb-bubble-user {
   align-self: flex-end;
   background: var(--nb-teal-muted);
-  border: 1px solid var(--nb-teal-light);
+  border: 1px solid transparent;
+}
+
+.nb-bubble-user:not(:first-child) {
+  margin-top: var(--nb-space-3);
 }
 
 .nb-bubble-assistant {
@@ -794,8 +810,9 @@ onUnmounted(() => {
 .nb-turn-tools-head {
   display: inline-flex;
   align-items: center;
-  gap: var(--nb-space-1);
+  gap: var(--nb-space-2);
   width: max-content;
+  max-width: 100%;
   margin: 0;
   padding: 0;
   background: transparent;
@@ -804,13 +821,34 @@ onUnmounted(() => {
   color: var(--nb-text-muted);
 }
 
-.nb-turn-tools-label {
-  font-size: var(--nb-fs-micro);
+.nb-turn-tools-head:hover .nb-turn-tools-count:not(.nb-turn-tools-error) {
+  color: var(--nb-text-primary);
 }
 
 .nb-turn-tools-head ion-icon {
   font-size: 12px;
   color: var(--nb-text-muted);
+  flex-shrink: 0;
+}
+
+.nb-turn-tools-count {
+  font-size: var(--nb-fs-secondary);
+  font-weight: 600;
+  white-space: nowrap;
+  color: var(--nb-text-secondary);
+}
+
+.nb-turn-tools-count.nb-turn-tools-error {
+  color: var(--nb-danger);
+}
+
+.nb-turn-tools-names {
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* F6: CSS-only typing dots for the pending bubble */
@@ -1015,6 +1053,30 @@ onUnmounted(() => {
   font-size: var(--nb-fs-secondary);
 }
 
+.nb-tool-target {
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-muted);
+}
+
+.nb-tool-status {
+  font-size: var(--nb-fs-micro);
+  font-weight: 600;
+  padding: 1px var(--nb-space-2);
+  border-radius: var(--nb-radius-full);
+  line-height: 1.45;
+}
+
+.nb-tool-status-ok {
+  background: var(--nb-chip-ok-bg);
+  color: var(--nb-chip-ok-fg);
+}
+
+.nb-tool-status-error {
+  background: var(--nb-chip-danger-bg);
+  color: var(--nb-chip-danger-fg);
+}
+
 .nb-tool-preview {
   margin: 0;
   width: max-content;
@@ -1032,7 +1094,7 @@ onUnmounted(() => {
 /* C3: one bordered composer group — textarea + hint/send foot inside it */
 .nb-composer {
   flex-shrink: 0;
-  margin-top: var(--nb-space-2);
+  margin-top: var(--nb-space-3);
 }
 
 .nb-composer-surface {
@@ -1103,15 +1165,18 @@ onUnmounted(() => {
 
 .nb-artifact-header {
   display: flex;
+  flex-direction: row;
   align-items: center;
   justify-content: space-between;
-  padding: var(--nb-space-2) var(--nb-space-3);
+  gap: var(--nb-space-2);
+  min-height: 40px;
+  padding: var(--nb-space-1) var(--nb-space-2) var(--nb-space-1) var(--nb-space-3);
   border-bottom: 1px solid var(--nb-border-default);
   flex-shrink: 0;
 }
 
 .nb-artifact-title {
-  font-size: var(--nb-fs-title);
+  font-size: var(--nb-fs-secondary);
   font-weight: 600;
   line-height: 1.3;
 }
@@ -1120,6 +1185,12 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: var(--nb-space-1);
+}
+
+.nb-artifact-actions ion-button {
+  --color: var(--nb-text-secondary);
+  --color-hover: var(--nb-text-primary);
+  min-height: 28px;
 }
 
 .nb-artifact-content {
