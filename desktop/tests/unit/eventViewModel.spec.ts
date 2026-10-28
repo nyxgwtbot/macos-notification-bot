@@ -7,7 +7,9 @@ import {
   eventToRow,
   expandedRowCaption,
   feedIsAllStartup,
+  foldStartupDigests,
   isErrorStatus,
+  isStartupDigest,
   newEventsAnnouncement,
   payloadPreview,
   relativeTimeLabel,
@@ -263,9 +265,9 @@ describe('expandedRowCaption', () => {
     expect(expandedRowCaption(eventToRow(notifEvent()))).toBe('com.apple.mail · Fatura');
   });
 
-  test('startup rows keep the bot source tag (no title to append)', () => {
+  test('startup rows keep the bot source tag prefixed with kind (startup · <source>)', () => {
     const startup = eventToRow({ event: 'startup', timestamp: '2026-10-26T12:00:00Z' });
-    expect(expandedRowCaption(startup)).toBe('bot');
+    expect(expandedRowCaption(startup)).toBe('startup · bot');
   });
 
   test('unknown app ("—") degrades to the title alone; empty title drops out', () => {
@@ -295,5 +297,115 @@ describe('newEventsAnnouncement (R6 SR feed-activity delta)', () => {
     expect(newEventsAnnouncement(Number.NaN, 5)).toBe('');
     expect(newEventsAnnouncement(0, Number.NaN)).toBe('');
     expect(newEventsAnnouncement(Number.POSITIVE_INFINITY, 0)).toBe('');
+  });
+});
+
+describe('foldStartupDigests (S5 feed digest)', () => {
+  const NOW = Date.parse('2026-10-26T12:10:00.000Z');
+
+  function makeStartup(id: number, minute: number): ReturnType<typeof eventToRow> {
+    return eventToRow({
+      event: 'startup',
+      timestamp: `2026-10-26T12:0${minute}:00.000Z`,
+      mode: 'daemon',
+      watermark: id
+    });
+  }
+
+  test('runs of 3 collapsed to digest', () => {
+    const s1 = makeStartup(1, 1);
+    const s2 = makeStartup(2, 2);
+    const s3 = makeStartup(3, 3);
+    const result = foldStartupDigests([s1, s2, s3], NOW);
+
+    expect(result).toHaveLength(1);
+    expect(isStartupDigest(result[0])).toBe(true);
+    if (!isStartupDigest(result[0])) return;
+    expect(result[0].kind).toBe('startup-digest');
+    expect(result[0].count).toBe(3);
+    expect(result[0].key).toBe(s1.key); // oldest key
+    expect(result[0].latestAbs).toBe(s3.timestamp);
+    expect(result[0].latestRel).toBe('7 min ago');
+    expect(result[0].rows).toEqual([s1, s2, s3]);
+  });
+
+  test('runs of 1-2 stay rows', () => {
+    const s1 = makeStartup(1, 1);
+    const s2 = makeStartup(2, 2);
+
+    const one = foldStartupDigests([s1], NOW);
+    expect(one).toHaveLength(1);
+    expect(one[0]).toBe(s1);
+
+    const two = foldStartupDigests([s1, s2], NOW);
+    expect(two).toHaveLength(2);
+    expect(two[0]).toBe(s1);
+    expect(two[1]).toBe(s2);
+  });
+
+  test('a notification row between two startup runs splits them (two digests, chronological)', () => {
+    const s1 = makeStartup(1, 1);
+    const s2 = makeStartup(2, 2);
+    const s3 = makeStartup(3, 3);
+    const notif = eventToRow(notifEvent({ rec_id: 99, timestamp: '2026-10-26T12:04:00.000Z' }));
+    const s4 = makeStartup(4, 5);
+    const s5 = makeStartup(5, 6);
+    const s6 = makeStartup(6, 7);
+
+    const result = foldStartupDigests([s1, s2, s3, notif, s4, s5, s6], NOW);
+    expect(result).toHaveLength(3);
+
+    expect(isStartupDigest(result[0])).toBe(true);
+    if (isStartupDigest(result[0])) {
+      expect(result[0].count).toBe(3);
+      expect(result[0].key).toBe(s1.key);
+      expect(result[0].latestAbs).toBe(s3.timestamp);
+    }
+
+    expect(result[1]).toBe(notif);
+
+    expect(isStartupDigest(result[2])).toBe(true);
+    if (isStartupDigest(result[2])) {
+      expect(result[2].count).toBe(3);
+      expect(result[2].key).toBe(s4.key);
+      expect(result[2].latestAbs).toBe(s6.timestamp);
+    }
+  });
+
+  test('appended row keeps digest key stable', () => {
+    const s1 = makeStartup(1, 1);
+    const s2 = makeStartup(2, 2);
+    const s3 = makeStartup(3, 3);
+
+    const initial = foldStartupDigests([s1, s2, s3], NOW);
+    expect(isStartupDigest(initial[0])).toBe(true);
+    const stableKey = initial[0].key;
+    expect(stableKey).toBe(s1.key);
+
+    // Append a 4th startup event
+    const s4 = makeStartup(4, 4);
+    const updated = foldStartupDigests([s1, s2, s3, s4], NOW);
+    expect(updated).toHaveLength(1);
+    expect(isStartupDigest(updated[0])).toBe(true);
+    if (isStartupDigest(updated[0])) {
+      expect(updated[0].key).toBe(stableKey);
+      expect(updated[0].count).toBe(4);
+      expect(updated[0].latestAbs).toBe(s4.timestamp);
+    }
+  });
+
+  test('startup events with custom body or summary do not fold into the bare digest', () => {
+    const s1 = makeStartup(1, 1);
+    const s2 = makeStartup(2, 2);
+    const sWithBody = eventToRow({
+      event: 'startup',
+      timestamp: '2026-10-26T12:03:00.000Z',
+      body: 'Detailed startup report'
+    });
+    const s3 = makeStartup(3, 4);
+
+    const result = foldStartupDigests([s1, s2, sWithBody, s3], NOW);
+    expect(result).toHaveLength(4);
+    expect(result.every((item) => !isStartupDigest(item))).toBe(true);
   });
 });

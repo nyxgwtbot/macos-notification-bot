@@ -238,3 +238,74 @@ describe('DashboardView R8 — Live badge + visibility pause', () => {
     mounted = null;
   });
 });
+
+describe('DashboardView feed digest + caption + machine mono (S3, S4, S5)', () => {
+  function startupEvent(minute: number): BotEvent {
+    return {
+      event: 'startup',
+      timestamp: `2026-10-27T12:0${minute}:00.000Z`,
+      mode: 'daemon',
+      watermark: minute
+    };
+  }
+
+  test('3 startup rows collapse into a single digest row with row DNA; expand reveals inline rows with expanded caption', async () => {
+    const s1 = startupEvent(1);
+    const s2 = startupEvent(2);
+    const s3 = startupEvent(3);
+    const wrapper = await mountStatus([s1, s2, s3]);
+
+    // Top-level feed should have 1 digest item, not 3 raw rows
+    const digests = wrapper.findAll('.nb-feed > .nb-event-digest');
+    expect(digests).toHaveLength(1);
+
+    const digest = digests[0];
+    expect(digest.attributes('role')).toBe('button');
+    expect(digest.attributes('aria-expanded')).toBe('false');
+    expect(digest.find('.nb-digest-label strong').text()).toBe('3');
+    expect(digest.find('.nb-digest-label').text()).toContain('3 daemon starts');
+
+    // No collapsed kind caption (.nb-kind-caption) anywhere
+    expect(wrapper.find('.nb-kind-caption').exists()).toBe(false);
+
+    // Expand via click
+    await digest.trigger('click');
+    expect(digest.attributes('aria-expanded')).toBe('true');
+
+    // Inside the digest, 3 rows are rendered inline
+    const inlineRows = digest.findAll('.nb-digest-rows .nb-event-startup');
+    expect(inlineRows).toHaveLength(3);
+
+    // Expand first inline startup row to check expandedRowCaption
+    await inlineRows[0].trigger('click');
+    const caption = inlineRows[0].find('.nb-event-raw-source');
+    expect(caption.exists()).toBe(true);
+    expect(caption.text()).toBe('startup · bot');
+  });
+
+  test('machine values mono (S3): Ollama and Model rows carry nb-kv-tech and title attrs', async () => {
+    const wrapper = await mountStatus([]);
+    const store = useBotStore();
+    store.health = {
+      status: 'ok',
+      bot_version: '1.0.0',
+      api_version: '1.0.0',
+      watermark: { last_rec_id: 10, updated_at: '2026-10-27T12:00:00Z' },
+      log: { bytes: 1024 },
+      finance: { enabled: false, db_exists: false },
+      ollama: { url: 'http://127.0.0.1:11434', model: 'llama3:8b' }
+    } as any;
+    await wrapper.vm.$nextTick();
+
+    const techRows = wrapper.findAll('.nb-kv-tech');
+    expect(techRows.length).toBeGreaterThanOrEqual(2);
+
+    const ollamaStrong = techRows[0].find('strong');
+    expect(ollamaStrong.attributes('title')).toBe('http://127.0.0.1:11434');
+    expect(ollamaStrong.text()).toBe('http://127.0.0.1:11434');
+
+    const modelStrong = techRows[1].find('strong');
+    expect(modelStrong.attributes('title')).toBe('llama3:8b');
+    expect(modelStrong.text()).toBe('llama3:8b');
+  });
+});

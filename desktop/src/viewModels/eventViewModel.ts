@@ -182,14 +182,135 @@ export function feedIsAllStartup(rows: ReadonlyArray<EventRow>): boolean {
   return rows.length > 0 && !rows.some((row) => row.kind === 'notification');
 }
 
-/** Expanded-row micro caption: the source app plus the notification title —
- * the row label/bold title line now lives ONLY in the expanded view (R2
- * finding 1); collapsed rows show the summary (notifications) or the muted
- * kind tag next to the icon (startup). Startup rows carry no title, so
- * their caption stays just "bot" (tests: eventViewModel.spec.ts). */
+/** Expanded-row micro caption: for startup rows, "startup · <source>" (e.g.
+ * "startup · bot"); for notification rows, "app · Title" (the source app
+ * plus the notification title). */
 export function expandedRowCaption(row: EventRow): string {
+  if (row.kind === 'startup') {
+    const source = row.app && row.app !== '—' ? row.app : 'bot';
+    return `startup · ${source}`;
+  }
   const parts: string[] = [];
   if (row.app && row.app !== '—') parts.push(row.app);
   if (row.kind === 'notification' && row.title) parts.push(row.title);
   return parts.join(' · ');
 }
+
+/** One collapsed digest of >= 3 consecutive bare startup rows. */
+export interface StartupDigestItem<T extends EventRow = EventRow> {
+  key: string;
+  kind: 'startup-digest';
+  rows: T[];
+  count: number;
+  latestAbs: string;
+  latestRel: string;
+}
+
+export type FeedItem<T extends EventRow = EventRow> = T | StartupDigestItem<T>;
+export type FeedDigestItem = StartupDigestItem;
+export type StartupDigestRow = StartupDigestItem;
+
+export function isStartupDigest<T extends EventRow = EventRow>(
+  item: T | StartupDigestItem<T>
+): item is StartupDigestItem<T> {
+  return item.kind === 'startup-digest';
+}
+
+function isDigestibleStartupRow(row: EventRow): boolean {
+  if (row.kind !== 'startup') return false;
+  if (row.raw) {
+    if (typeof row.raw.body === 'string' && row.raw.body.trim() !== '') return false;
+    const clsSummary = row.raw.classification?.summary;
+    if (typeof clsSummary === 'string' && clsSummary.trim() !== '') return false;
+    const directSummary = (row.raw as { summary?: unknown }).summary;
+    if (typeof directSummary === 'string' && directSummary.trim() !== '') return false;
+  }
+  return true;
+}
+
+/**
+ * Fold consecutive runs of >= 3 bare startup rows into a single digest item.
+ * Runs of 1-2 remain individual rows.
+ * Key is the OLDEST row's key for stability across stream appends.
+ * Non-startup rows (or startup rows with custom body/summary) split runs.
+ */
+export function foldStartupDigests<T extends EventRow>(
+  rows: ReadonlyArray<T>,
+  nowMs?: number
+): Array<T | StartupDigestItem<T>> {
+  const result: Array<T | StartupDigestItem<T>> = [];
+  let currentRun: T[] = [];
+
+  const flushRun = () => {
+    if (currentRun.length === 0) return;
+
+    if (currentRun.length >= 3) {
+      let oldest = currentRun[0];
+      let latest = currentRun[0];
+      let oldestTime = Date.parse(currentRun[0].timestamp);
+      let latestTime = oldestTime;
+
+      for (let i = 1; i < currentRun.length; i++) {
+        const item = currentRun[i];
+        const t = Date.parse(item.timestamp);
+        if (!Number.isNaN(t)) {
+          if (Number.isNaN(oldestTime) || t < oldestTime) {
+            oldestTime = t;
+            oldest = item;
+          }
+          if (Number.isNaN(latestTime) || t > latestTime) {
+            latestTime = t;
+            latest = item;
+          }
+        }
+      }
+
+      if (oldest === latest && currentRun.length > 1) {
+        const tFirst = Date.parse(currentRun[0].timestamp);
+        const tLast = Date.parse(currentRun[currentRun.length - 1].timestamp);
+        if (!Number.isNaN(tFirst) && !Number.isNaN(tLast) && tFirst > tLast) {
+          latest = currentRun[0];
+          oldest = currentRun[currentRun.length - 1];
+        } else {
+          oldest = currentRun[0];
+          latest = currentRun[currentRun.length - 1];
+        }
+      }
+
+      const relFromRow = (latest as unknown as { relText?: string }).relText;
+      const latestRel =
+        typeof relFromRow === 'string' && relFromRow !== ''
+          ? relFromRow
+          : relativeTimeLabel(latest.timestamp, nowMs ?? Date.now());
+
+      result.push({
+        key: oldest.key,
+        kind: 'startup-digest',
+        rows: [...currentRun],
+        count: currentRun.length,
+        latestAbs: latest.timestamp,
+        latestRel
+      });
+    } else {
+      for (const item of currentRun) {
+        result.push(item);
+      }
+    }
+    currentRun = [];
+  };
+
+  for (const row of rows) {
+    if (isDigestibleStartupRow(row)) {
+      currentRun.push(row);
+    } else {
+      flushRun();
+      result.push(row);
+    }
+  }
+  flushRun();
+
+  return result;
+}
+
+export const foldFeedDigests = foldStartupDigests;
+export const collapseStartupRuns = foldStartupDigests;

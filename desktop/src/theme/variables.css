@@ -6,7 +6,9 @@
  * http://ionicframework.com/docs/theming/
  */
 
-:root {
+:root,
+:root.md,
+:root.ios {
   /* ========================================
      BASE BACKGROUNDS
      ======================================== */
@@ -101,7 +103,9 @@
      IONIC OVERRIDES
      ======================================== */
   --ion-background-color: var(--nb-bg-deepest);
+  --ion-background-color-rgb: 18, 23, 29;
   --ion-text-color: var(--nb-text-primary);
+  --ion-text-color-rgb: 232, 238, 245;
 
   --ion-color-primary: var(--nb-teal);
   --ion-color-primary-rgb: 62, 184, 160;
@@ -161,9 +165,13 @@
 
 /* Neutral-scheme step grid so chips/toasts look right in system light mode too. */
 @media (prefers-color-scheme: light) {
-  :root {
+  :root,
+  :root.md,
+  :root.ios {
     --ion-background-color: #f6f7f9;
+    --ion-background-color-rgb: 246, 247, 249;
     --ion-text-color: #1b2430;
+    --ion-text-color-rgb: 27, 36, 48;
 
     --ion-toolbar-background: #ffffff;
     --ion-toolbar-color: #1b2430;

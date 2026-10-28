@@ -157,6 +157,10 @@
   background: var(--nb-chip-danger-bg);
   color: var(--nb-chip-danger-fg);
 }
+.nb-status-live {
+  background: var(--nb-teal-muted);
+  color: var(--nb-teal-light);
+}
 
 /* ========================================
    FILTER CHIPS — the shared 3-chip kind filter row (Status feed + Logs

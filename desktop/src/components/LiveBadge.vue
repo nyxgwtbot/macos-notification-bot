@@ -5,16 +5,19 @@
        badge can never drift from the actual usePolling interval. The poll's
        error state flips the tint to danger (wording stays "Live"; the
        consumers' own error banners carry the failure text + retry). -->
-  <ion-badge class="nb-live-badge" :data-state="error ? 'error' : 'live'" :color="tone" :title="tooltip">
-    <ion-icon aria-hidden="true" :icon="pulseOutline" />
+  <span
+    class="nb-live-badge nb-status-chip"
+    :class="toneClass"
+    :data-state="dataState"
+    :title="tooltip"
+  >
+    <i class="nb-dot" aria-hidden="true" />
     Live
-  </ion-badge>
+  </span>
 </template>
 
 <script setup lang="ts">
 import { computed } from 'vue';
-import { IonBadge, IonIcon } from '@ionic/vue';
-import { pulseOutline } from 'ionicons/icons';
 
 const props = defineProps<{
   /** Poll cadence from the consumer's usePolling config (ms) — the tooltip
@@ -22,9 +25,21 @@ const props = defineProps<{
   intervalMs: number;
   /** Current poll error text; a non-null value shows the danger tint. */
   error?: string | null;
+  /** Degraded poll state (e.g. slow/reconnecting); shows the warning tint. */
+  degraded?: boolean | string | null;
 }>();
 
-const tone = computed(() => (props.error ? 'danger' : 'primary'));
+const dataState = computed(() => {
+  if (props.error) return 'error';
+  if (props.degraded) return 'degraded';
+  return 'live';
+});
+
+const toneClass = computed(() => {
+  if (props.error) return 'nb-status-bad';
+  if (props.degraded) return 'nb-status-warn';
+  return 'nb-status-live';
+});
 
 const seconds = computed(() => props.intervalMs / 1000);
 const tooltip = computed(() => `Refreshes every ${seconds.value} s`);

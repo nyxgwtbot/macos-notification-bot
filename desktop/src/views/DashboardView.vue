@@ -104,8 +104,8 @@
                 <span title="state.updated_at">Last cycle</span>
                 <strong :title="formatIsoShort(store.health.watermark.updated_at) || undefined">{{ lastCycleAge || '—' }}</strong>
               </div>
-              <div class="nb-kv"><span>Ollama</span><strong>{{ store.health.ollama.url }}</strong></div>
-              <div class="nb-kv"><span>Model</span><strong>{{ store.health.ollama.model }}</strong></div>
+              <div class="nb-kv nb-kv-tech"><span>Ollama</span><strong :title="store.health.ollama.url">{{ store.health.ollama.url }}</strong></div>
+              <div class="nb-kv nb-kv-tech"><span>Model</span><strong :title="store.health.ollama.model">{{ store.health.ollama.model }}</strong></div>
               <!-- R2 split: the log size is one row (value only), versions
                    read as their own row instead of a cryptic cram suffix -->
               <div class="nb-kv"><span>Log</span><strong>{{ formatBytes(store.health.log.bytes) }}</strong></div>
@@ -173,75 +173,142 @@
         class="nb-feed"
         :aria-busy="store.feedLoading"
       >
-        <div
-          v-for="row in feedRows"
-          :key="row.key"
-          class="nb-event"
-          :class="{ 'nb-event-startup': row.kind === 'startup', 'nb-event-open': expandedRows.has(row.key) }"
-          role="button"
-          tabindex="0"
-          :aria-expanded="expandedRows.has(row.key)"
-          :aria-label="'Expand raw payload for ' + (row.app || row.kind)"
-          @click="toggleExpand(row.key)"
-          @keydown.enter.prevent="toggleExpand(row.key)"
-          @keydown.space.prevent="toggleExpand(row.key)"
-        >
-          <div class="nb-event-top">
-            <ion-icon class="nb-event-chev" aria-hidden="true" :icon="chevronForwardOutline" />
-            <!-- kind identity: leading tinted icon chip; R2 finding 1 — the
-                 collapsed row reads as chevron + icon + tag + timestamps and
-                 the per-row source label lives ONLY in the expanded inset -->
-            <span class="nb-kind" :class="'nb-kind-' + eventKindIdentity(row)" aria-hidden="true">
-              <ion-icon :icon="KIND_ICONS[eventKindIdentity(row)]" />
-            </span>
-            <!-- startup rows: muted kind tag next to the icon is the whole
-                 "summary" (startup events carry no body/summary fields) -->
-            <span v-if="row.kind === 'startup'" class="nb-kind-caption">startup</span>
-            <span class="nb-when">{{ formatIsoShort(row.timestamp) }}</span>
-            <!-- relative age recomputed on every 2s feed poll tick -->
-            <span v-if="row.relText" class="nb-when nb-when-rel">{{ row.relText }}</span>
-            <span v-if="row.recId !== null" class="nb-recid">rec_id {{ row.recId }}</span>
-          </div>
-          <!-- R2 finding 1: the repeated bold kind/title line is gone from the
-               collapsed row — notifications speak with their classifier
-               summary (better signal); the label survives as the micro
-               caption in the expanded raw inset -->
-          <template v-if="row.kind === 'notification'">
-            <div class="nb-event-summary">{{ row.summary }}</div>
-            <div class="nb-chips">
-              <ion-chip :color="categoryColor">{{ row.category }}</ion-chip>
-              <ion-chip :color="urgencyColor(row.urgency)">{{ row.urgency }}</ion-chip>
-              <ion-badge v-if="row.layer" :color="layerBadgeColor(row.layer)" class="nb-badge">{{ row.layerLabel }}</ion-badge>
-              <ion-badge v-if="row.ruleMatched" color="secondary" class="nb-badge">rule: {{ row.ruleMatched }}</ion-badge>
-              <ion-badge v-if="row.confidencePct" color="tertiary" class="nb-badge">confidence {{ row.confidencePct }}</ion-badge>
-              <ion-badge v-if="row.telegramStatus" :color="telegramBadgeColor(row.telegramStatus)" class="nb-badge">telegram {{ row.telegramStatus }}</ion-badge>
-              <ion-badge v-if="row.financeStatus" :color="financeBadgeColor(row.financeStatus)" class="nb-badge">finance {{ row.financeStatus }}</ion-badge>
-            </div>
-            <div v-if="row.actions.length > 0" class="nb-actions">
-              <span v-for="action in row.actions" :key="action" class="nb-action">{{ action }}</span>
-            </div>
-          </template>
-          <!-- expand: raw event payload, pretty-printed, 2 KB tail-trim, full copy on hover -->
+        <template v-for="item in feedItems" :key="item.key">
+          <!-- S5: digest summary row for consecutive runs of >= 3 bare startup rows -->
           <div
-            v-if="expandedRows.has(row.key)"
-            class="nb-event-raw"
-            role="region"
-            :aria-label="'Raw payload for ' + (row.app || row.kind)"
-            @click.stop
+            v-if="item.kind === 'startup-digest'"
+            class="nb-event nb-event-digest"
+            :class="{ 'nb-event-open': expandedRows.has(item.key) }"
+            role="button"
+            tabindex="0"
+            :aria-expanded="expandedRows.has(item.key)"
+            :aria-label="item.count + ' daemon starts, latest ' + item.latestRel"
+            @click="toggleExpand(item.key)"
+            @keydown.enter.prevent="toggleExpand(item.key)"
+            @keydown.space.prevent="toggleExpand(item.key)"
           >
-            <button class="nb-raw-copy" aria-label="Copy raw payload" @click="copyRaw(row)">
-              <ion-icon aria-hidden="true" :icon="copyOutline" />
-              <span v-if="copiedKey === row.key" class="nb-raw-copied">Copied</span>
-            </button>
-            <!-- the row label (source app + notification title) lives only in
-                 the expanded view now, as a micro caption above the raw JSON -->
-            <span v-if="expandedRowCaption(row)" class="nb-event-raw-source">{{ expandedRowCaption(row) }}</span>
-            <pre class="nb-event-raw-text">{{ rawPreview(row).text }}</pre>
-            <span v-if="rawPreview(row).truncatedChars > 0" class="nb-event-raw-note">
-              … {{ rawPreview(row).truncatedChars }} chars trimmed (2 KB display cap) — copy takes the full payload
-            </span>
+            <div class="nb-event-top">
+              <ion-icon class="nb-event-chev" aria-hidden="true" :icon="chevronForwardOutline" />
+              <span class="nb-kind nb-kind-startup" aria-hidden="true">
+                <ion-icon :icon="timeOutline" />
+              </span>
+              <span class="nb-digest-label">
+                <strong>{{ item.count }}</strong> daemon starts · latest {{ item.latestRel }}
+              </span>
+            </div>
+            <!-- Expand: inline run of existing nb-event rows -->
+            <div v-if="expandedRows.has(item.key)" class="nb-digest-rows" @click.stop>
+              <div
+                v-for="row in item.rows"
+                :key="row.key"
+                class="nb-event nb-event-startup"
+                :class="{ 'nb-event-open': expandedRows.has(row.key) }"
+                role="button"
+                tabindex="0"
+                :aria-expanded="expandedRows.has(row.key)"
+                :aria-label="'Expand raw payload for ' + (row.app || row.kind)"
+                @click="toggleExpand(row.key)"
+                @keydown.enter.prevent="toggleExpand(row.key)"
+                @keydown.space.prevent="toggleExpand(row.key)"
+              >
+                <div class="nb-event-top">
+                  <ion-icon class="nb-event-chev" aria-hidden="true" :icon="chevronForwardOutline" />
+                  <span class="nb-kind nb-kind-startup" aria-hidden="true">
+                    <ion-icon :icon="timeOutline" />
+                  </span>
+                  <span class="nb-when">{{ formatIsoShort(row.timestamp) }}</span>
+                  <span v-if="row.relText" class="nb-when nb-when-rel">{{ row.relText }}</span>
+                  <span v-if="row.recId !== null" class="nb-recid">rec_id {{ row.recId }}</span>
+                </div>
+                <!-- expand: raw event payload -->
+                <div
+                  v-if="expandedRows.has(row.key)"
+                  class="nb-event-raw"
+                  role="region"
+                  :aria-label="'Raw payload for ' + (row.app || row.kind)"
+                  @click.stop
+                >
+                  <button class="nb-raw-copy" aria-label="Copy raw payload" @click="copyRaw(row)">
+                    <ion-icon aria-hidden="true" :icon="copyOutline" />
+                    <span v-if="copiedKey === row.key" class="nb-raw-copied">Copied</span>
+                  </button>
+                  <span v-if="expandedRowCaption(row)" class="nb-event-raw-source">{{ expandedRowCaption(row) }}</span>
+                  <pre class="nb-event-raw-text">{{ rawPreview(row).text }}</pre>
+                  <span v-if="rawPreview(row).truncatedChars > 0" class="nb-event-raw-note">
+                    … {{ rawPreview(row).truncatedChars }} chars trimmed (2 KB display cap) — copy takes the full payload
+                  </span>
+                </div>
+              </div>
+            </div>
           </div>
-        </div>
+
+          <!-- Normal Event Row (notifications or 1-2 startup rows) -->
+          <div
+            v-else
+            class="nb-event"
+            :class="{ 'nb-event-startup': item.kind === 'startup', 'nb-event-open': expandedRows.has(item.key) }"
+            role="button"
+            tabindex="0"
+            :aria-expanded="expandedRows.has(item.key)"
+            :aria-label="'Expand raw payload for ' + (item.app || item.kind)"
+            @click="toggleExpand(item.key)"
+            @keydown.enter.prevent="toggleExpand(item.key)"
+            @keydown.space.prevent="toggleExpand(item.key)"
+          >
+            <div class="nb-event-top">
+              <ion-icon class="nb-event-chev" aria-hidden="true" :icon="chevronForwardOutline" />
+              <!-- kind identity: leading tinted icon chip; R2 finding 1 — the
+                   collapsed row reads as chevron + icon + tag + timestamps and
+                   the per-row source label lives ONLY in the expanded inset -->
+              <span class="nb-kind" :class="'nb-kind-' + eventKindIdentity(item)" aria-hidden="true">
+                <ion-icon :icon="KIND_ICONS[eventKindIdentity(item)]" />
+              </span>
+              <span class="nb-when">{{ formatIsoShort(item.timestamp) }}</span>
+              <!-- relative age recomputed on every 2s feed poll tick -->
+              <span v-if="item.relText" class="nb-when nb-when-rel">{{ item.relText }}</span>
+              <span v-if="item.recId !== null" class="nb-recid">rec_id {{ item.recId }}</span>
+            </div>
+            <!-- R2 finding 1: the repeated bold kind/title line is gone from the
+                 collapsed row — notifications speak with their classifier
+                 summary (better signal); the label survives as the micro
+                 caption in the expanded raw inset -->
+            <template v-if="item.kind === 'notification'">
+              <div class="nb-event-summary">{{ item.summary }}</div>
+              <div class="nb-chips">
+                <ion-chip :color="categoryColor">{{ item.category }}</ion-chip>
+                <ion-chip :color="urgencyColor(item.urgency)">{{ item.urgency }}</ion-chip>
+                <ion-badge v-if="item.layer" :color="layerBadgeColor(item.layer)" class="nb-badge">{{ item.layerLabel }}</ion-badge>
+                <ion-badge v-if="item.ruleMatched" color="secondary" class="nb-badge">rule: {{ item.ruleMatched }}</ion-badge>
+                <ion-badge v-if="item.confidencePct" color="tertiary" class="nb-badge">confidence {{ item.confidencePct }}</ion-badge>
+                <ion-badge v-if="item.telegramStatus" :color="telegramBadgeColor(item.telegramStatus)" class="nb-badge">telegram {{ item.telegramStatus }}</ion-badge>
+                <ion-badge v-if="item.financeStatus" :color="financeBadgeColor(item.financeStatus)" class="nb-badge">finance {{ item.financeStatus }}</ion-badge>
+              </div>
+              <div v-if="item.actions.length > 0" class="nb-actions">
+                <span v-for="action in item.actions" :key="action" class="nb-action">{{ action }}</span>
+              </div>
+            </template>
+            <!-- expand: raw event payload, pretty-printed, 2 KB tail-trim, full copy on hover -->
+            <div
+              v-if="expandedRows.has(item.key)"
+              class="nb-event-raw"
+              role="region"
+              :aria-label="'Raw payload for ' + (item.app || item.kind)"
+              @click.stop
+            >
+              <button class="nb-raw-copy" aria-label="Copy raw payload" @click="copyRaw(item)">
+                <ion-icon aria-hidden="true" :icon="copyOutline" />
+                <span v-if="copiedKey === item.key" class="nb-raw-copied">Copied</span>
+              </button>
+              <!-- the row label (source app + notification title) lives only in
+                   the expanded view now, as a micro caption above the raw JSON -->
+              <span v-if="expandedRowCaption(item)" class="nb-event-raw-source">{{ expandedRowCaption(item) }}</span>
+              <pre class="nb-event-raw-text">{{ rawPreview(item).text }}</pre>
+              <span v-if="rawPreview(item).truncatedChars > 0" class="nb-event-raw-note">
+                … {{ rawPreview(item).truncatedChars }} chars trimmed (2 KB display cap) — copy takes the full payload
+              </span>
+            </div>
+          </div>
+        </template>
       </TransitionGroup>
     </ion-content>
   </ion-page>
@@ -278,12 +345,14 @@ import {
   eventKindIdentity,
   expandedRowCaption,
   feedIsAllStartup,
+  foldStartupDigests,
   newEventsAnnouncement,
   payloadPreview,
   relativeTimeLabel,
   type EventKindIdentity,
   type EventKindValue,
-  type EventRow
+  type EventRow,
+  type FeedItem
 } from '@/viewModels/eventViewModel';
 
 const store = useBotStore();
@@ -306,6 +375,10 @@ const feedRows = computed<FeedRow[]>(() =>
   [...store.events]
     .reverse()
     .map((row) => ({ ...row, relText: relativeTimeLabel(row.timestamp, nowMs.value) }))
+);
+
+const feedItems = computed<Array<FeedItem<FeedRow>>>(() =>
+  foldStartupDigests(feedRows.value, nowMs.value)
 );
 
 /** R2 finding 2: realtime card ages — recomputed on every 2s feed tick
@@ -538,12 +611,19 @@ onUnmounted(() => {
 /* S5: normalized kv label column so PID/watermark rows align across cards */
 .nb-kv span {
   min-width: 160px;
-}
-.nb-kv span {
   color: var(--nb-text-secondary);
 }
 .nb-kv strong {
   font-weight: 600;
+}
+.nb-kv-tech strong {
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-secondary);
+  color: var(--nb-text-secondary);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 /* R2: value column that stacks the live age under the absolute stamp */
 .nb-kv-stack {
@@ -702,11 +782,18 @@ onUnmounted(() => {
 .nb-kind ion-icon {
   font-size: 14px;
 }
-/* R2: the muted kind tag next to the icon ("startup") — one step quieter
-   than the meta row's secondary copy; replaces the redundant bold label */
-.nb-kind-caption {
-  flex: none;
+.nb-digest-label {
   color: var(--nb-text-muted);
+}
+.nb-digest-label strong {
+  font-weight: 600;
+  color: var(--nb-text-primary);
+}
+.nb-digest-rows {
+  margin-top: var(--nb-space-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-space-2);
 }
 .nb-kind-notification {
   background: var(--nb-teal-muted);
