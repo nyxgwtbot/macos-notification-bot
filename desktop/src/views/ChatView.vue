@@ -23,7 +23,8 @@
           <ion-button
             v-if="state.artifactUrl && !railOpen"
             size="small"
-            fill="outline"
+            fill="clear"
+            class="nb-btn-quiet"
             @click="railOpen = true"
           >
             Show dashboard
@@ -40,7 +41,7 @@
               {{ session.preview }} ({{ session.turns }} turns)
             </ion-select-option>
           </ion-select>
-          <ion-button size="small" fill="outline" class="nb-btn-quiet" @click="newSession">New chat</ion-button>
+          <ion-button size="small" fill="clear" class="nb-btn-quiet" @click="newSession">New chat</ion-button>
         </ion-buttons>
       </ion-toolbar>
     </ion-header>
@@ -140,7 +141,14 @@
                   </span>
                 </button>
               </div>
-              <p class="nb-onboarding-tags">Dashboards · Test notifications · Event summaries · Reminders · Notes · System controls</p>
+              <p class="nb-onboarding-tags">
+                <span class="nb-tag">Dashboards</span>
+                <span class="nb-tag">Test notifications</span>
+                <span class="nb-tag">Event summaries</span>
+                <span class="nb-tag">Reminders</span>
+                <span class="nb-tag">Notes</span>
+                <span class="nb-tag">System controls</span>
+              </p>
             </div>
 
             <!-- F6: pending bubble with a CSS-only animated dot pattern -->
@@ -312,11 +320,11 @@ function dispatch(event: ChatEvent): void {
   state.value = reduceChat(state.value, event);
 }
 
-// Watch state.artifactUrl and force railOpen = true on arrival so a new dashboard is never missed
+// Watch state.artifactUrl and auto-open the rail only when innerWidth >= 900
 watch(
   () => state.value.artifactUrl,
   (newUrl) => {
-    if (newUrl) {
+    if (newUrl && typeof window !== 'undefined' && window.innerWidth >= 900) {
       railOpen.value = true;
     }
   }
@@ -633,8 +641,13 @@ onUnmounted(() => {
   min-height: 0;
 }
 
+.nb-chat-layout:not(.has-artifact) {
+  max-width: 1000px;
+  margin-inline: auto;
+}
+
 .nb-chat-layout.has-artifact {
-  grid-template-columns: minmax(360px, 440px) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 440px);
   gap: var(--nb-space-4);
 }
 
@@ -659,7 +672,7 @@ onUnmounted(() => {
   flex-direction: column;
   gap: var(--nb-space-2);
   /* C5: top breathing under the header — first bubble never sits flush */
-  padding-top: var(--nb-space-3);
+  padding: var(--nb-space-3) var(--nb-space-2) 0;
 }
 
 .nb-bubble {
@@ -851,7 +864,7 @@ onUnmounted(() => {
   justify-content: center;
   text-align: center;
   margin: auto 0;
-  padding: var(--nb-space-6) var(--nb-space-4);
+  padding: var(--nb-space-3) var(--nb-space-4) var(--nb-space-6);
   max-width: 520px;
   align-self: center;
 }
@@ -881,7 +894,8 @@ onUnmounted(() => {
 /* F3: card-like suggestions — icon left, title + one-line hint right */
 .nb-suggestion-card {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
+  min-height: 64px;
   gap: var(--nb-space-3);
   width: 100%;
   text-align: left;
@@ -906,10 +920,17 @@ onUnmounted(() => {
 }
 
 .nb-suggestion-card ion-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
   flex: none;
+  margin-top: 0;
   font-size: 20px;
-  margin-top: 1px;
   color: var(--nb-teal-light);
+  background: var(--nb-teal-muted);
+  border-radius: var(--nb-radius-full);
 }
 
 .nb-suggestion-copy {
@@ -920,7 +941,7 @@ onUnmounted(() => {
 }
 
 .nb-suggestion-title {
-  font-size: var(--nb-fs-secondary);
+  font-size: var(--nb-fs-body);
   font-weight: 600;
 }
 
@@ -931,9 +952,22 @@ onUnmounted(() => {
 }
 
 .nb-onboarding-tags {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--nb-space-1);
   margin: var(--nb-space-3) 0 0;
+}
+
+.nb-tag {
+  display: inline-flex;
+  padding: 2px var(--nb-space-2);
+  border-radius: var(--nb-radius-sm);
   font-size: var(--nb-fs-micro);
-  color: var(--nb-text-muted);
+  font-weight: 600;
+  line-height: 1.45;
+  background: var(--nb-bg-elevated);
+  color: var(--nb-text-secondary);
 }
 
 /* compact inline chips (C2) — one wrapping flex row, tight gap */
@@ -1007,7 +1041,7 @@ onUnmounted(() => {
   border: 1px solid var(--nb-border-strong);
   border-radius: var(--nb-radius-md);
   background: var(--nb-bg-elevated);
-  padding: var(--nb-space-2) var(--nb-space-2) var(--nb-space-1);
+  padding: var(--nb-space-2);
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 
@@ -1043,6 +1077,10 @@ onUnmounted(() => {
 /* F4c: Send brightness — 40% until the draft is non-empty */
 .nb-composer-foot ion-button[disabled] {
   opacity: 0.4;
+}
+
+.nb-send-btn {
+  min-width: 72px;
 }
 
 .nb-chat-rail {
