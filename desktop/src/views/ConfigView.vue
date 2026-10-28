@@ -47,7 +47,7 @@
             Provider the in-app agent uses for chat, classification and finance insights.
           </p>
           <div class="nb-field">
-            <div class="nb-field-slot nb-span-2">
+            <div class="nb-field-slot">
               <ion-input
                 label="Ollama URL"
                 label-placement="stacked"
@@ -87,7 +87,7 @@
             </div>
             <div class="nb-field-slot">
               <ion-input
-                label="router.min_confidence (0–1)"
+                label="Min confidence (0–1)"
                 label-placement="stacked"
                 type="number"
                 inputmode="decimal"
@@ -97,11 +97,11 @@
                 @ionInput="onMinConfidenceInput"
               />
               <p v-if="fieldErrors.minConfidence" class="nb-field-error">{{ fieldErrors.minConfidence }}</p>
-              <p class="nb-field-help">Confidence floor for LLM-routed actions.</p>
+              <p class="nb-field-help">router.min_confidence — confidence floor for LLM-routed actions.</p>
             </div>
             <div class="nb-field-slot">
               <ion-input
-                label="poll_interval (s)"
+                label="Poll interval (s)"
                 label-placement="stacked"
                 type="number"
                 inputmode="decimal"
@@ -111,7 +111,7 @@
                 @ionInput="onPollIntervalInput"
               />
               <p v-if="fieldErrors.pollInterval" class="nb-field-error">{{ fieldErrors.pollInterval }}</p>
-              <p class="nb-field-help">Seconds between daemon polls.</p>
+              <p class="nb-field-help">poll_interval — seconds between daemon polls.</p>
             </div>
           </div>
           <!-- iterC: unmapped server 400 details never surface verbatim
@@ -181,8 +181,10 @@
                   <i class="nb-dot" aria-hidden="true"></i>{{ statusChipLabel(row.status) }}
                 </span>
                 <ion-button
+                  class="nb-connector-btn"
                   size="small"
-                  fill="outline"
+                  :fill="row.granted ? 'clear' : 'outline'"
+                  :class="{ 'nb-connector-quiet': row.granted }"
                   :disabled="isProbingConnectors(row.domain)"
                   :aria-label="(row.granted ? 'Re-check ' : 'Connect ') + row.domain"
                   @click="probeConnector(row.domain)"
@@ -209,6 +211,7 @@
         <ion-card>
           <ion-card-header><ion-card-title>Actions</ion-card-title></ion-card-header>
           <ion-card-content>
+            <p class="nb-muted nb-actions-intro">Actions the router can invoke. Expand a row to edit its match hint.</p>
             <div v-for="(entry, index) in draft.actions" :key="entry.id || index" class="nb-action-row">
               <div class="nb-action-head">
                 <strong>{{ entry.id }}</strong>
@@ -218,12 +221,24 @@
                   :aria-label="'Enable action ' + entry.id"
                   @ionChange="onActionToggle($event as CustomEvent<{ checked: boolean }>, index)"
                 />
+                <ion-button
+                  class="nb-action-expand"
+                  fill="clear"
+                  size="small"
+                  :aria-expanded="expandedHints[index] ? 'true' : 'false'"
+                  :aria-label="(expandedHints[index] ? 'Hide' : 'Edit') + ' match hint for ' + entry.id"
+                  @click="toggleHint(index)"
+                >
+                  <ion-icon :icon="chevronDownOutline" class="nb-action-chev" :class="{ 'nb-action-chev-open': expandedHints[index] }" aria-hidden="true" />
+                </ion-button>
               </div>
               <!-- R8: the action rows join the boxed input treatment of the
                    config fields (elevated box + focus ring); the empty-command
                    field error wears the standard pair (.nb-input-bad +
                    aria-invalid + inline message) and blocks the save -->
+              <p class="nb-action-hint-preview">{{ entry.match_hint.trim() || 'No match hint set' }}</p>
               <ion-textarea
+                v-show="expandedHints[index]"
                 class="nb-action-box"
                 label="match_hint"
                 label-placement="stacked"
@@ -342,7 +357,7 @@ import {
   IonToggle,
   IonToolbar
 } from '@ionic/vue';
-import { refreshOutline } from 'ionicons/icons';
+import { chevronDownOutline, refreshOutline } from 'ionicons/icons';
 
 import { useBotStore } from '@/stores/bot';
 import { notifyClient, errorText } from '@/services/notifyClient';
@@ -498,6 +513,9 @@ const loadedFields = ref<ConfigDraftFields>({
 const dirtyGuard = ref<DirtyGuardState>({ ...DIRTY_GUARD_CLEAN });
 const DISCARD_ARM_MS = 3000;
 const draftSnapshot = ref<string | null>(null);
+
+// L5-R1: match-hint editors start collapsed; a rebuilt draft resets rows to collapsed
+const expandedHints = ref<Record<number, boolean>>({});
 
 function markDraftSnapshot(): void {
   draftSnapshot.value = configDraftSnapshot(draft);
@@ -664,6 +682,7 @@ function buildDraft(config: BotConfig): void {
   validationErrors.value = [];
   fieldErrors.value = {};
   actionErrors.value = {};
+  expandedHints.value = {};
   // R7: a rebuilt draft IS the reference — pristine until the next edit
   markDraftSnapshot();
 }
@@ -725,6 +744,10 @@ const onPollIntervalInput = (event: IonValueEvent) => {
 
 function onActionToggle(event: CustomEvent<{ checked: boolean }>, index: number): void {
   if (draft.actions[index]) draft.actions[index].enabled = event.detail.checked;
+}
+
+function toggleHint(index: number): void {
+  expandedHints.value[index] = !expandedHints.value[index];
 }
 
 function onActionHintInput(event: IonValueEvent, index: number): void {
@@ -960,23 +983,39 @@ onUnmounted(() => {
   width: var(--nb-space-6);
   height: var(--nb-space-6);
 }
+/* L5-R1: one button per connector row, pinned right; granted rows go quiet
+   (var grammar mirrors ChatView .nb-btn-quiet — !important is the proven
+   channel past Ionic md :host() specificity) */
+.nb-connector-head .nb-connector-btn {
+  margin-left: auto;
+}
+.nb-connector-quiet {
+  --background: transparent !important;
+  --background-hover: var(--nb-bg-hover) !important;
+  --background-activated: var(--nb-bg-hover) !important;
+  --background-focused: var(--nb-bg-hover) !important;
+  --background-focused-opacity: 1 !important;
+  --color: var(--nb-text-secondary) !important;
+  --color-hover: var(--nb-text-primary) !important;
+  --color-activated: var(--nb-text-primary) !important;
+  --color-focused: var(--nb-text-primary) !important;
+  --border-radius: var(--nb-radius-sm) !important;
+  --box-shadow: none !important;
+}
 /* ST2: Bot & Ollama fields read as editable inputs — elevated surface,
    strong hairline, radius, focus ring; labels stay small/muted (Ion stacked).
-   R4: 2-column grid — Ollama URL spans both columns (row 1); model + timeout
-   pair on row 2, router.min_confidence + poll_interval on row 3 (R4: the old
-   1-col 520px stack inside a ~1100px card is gone). */
+   R4: 2-column grid, auto placement (L5-R1: the URL slot no longer spans —
+   [URL | model] row 1, [timeout | confidence] row 2, [poll_interval | —] row 3). */
 .nb-field {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: var(--nb-space-2) var(--nb-space-4);
 }
-.nb-field .nb-span-2 {
-  grid-column: 1 / -1;
-}
 /* R4: one-line muted help under each config field */
 .nb-field-help {
   margin: var(--nb-space-1) 0 0;
   font-size: var(--nb-fs-micro);
+  line-height: 1.45;
   color: var(--nb-text-secondary);
 }
 .nb-field ion-input {
@@ -1001,6 +1040,13 @@ onUnmounted(() => {
   border-bottom: 1px solid var(--nb-border-default);
   padding-bottom: var(--nb-space-2);
   margin-bottom: var(--nb-space-3);
+}
+/* L5-R1: compact action toggles */
+.nb-action-row ion-toggle {
+  --track-width: 40px;
+  --track-height: 24px;
+  --handle-width: 20px;
+  --handle-height: 20px;
 }
 /* R8: action rows join the boxed input treatment of the config fields —
    elevated surface, hairline, radius, focus ring (same pair as
@@ -1039,6 +1085,28 @@ onUnmounted(() => {
 .nb-action-row .nb-field-error {
   margin: var(--nb-space-1) 0 0;
   padding-left: var(--nb-space-1);
+}
+/* L5-R1: match hint collapsed by default — one-line ellipsis preview + labeled expand */
+.nb-action-hint-preview {
+  margin: var(--nb-space-1) 0 0;
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nb-action-expand {
+  margin-left: auto;
+}
+.nb-action-chev {
+  transition: transform 120ms ease; /* reduced-motion is gated globally by nb-shared.css */
+}
+.nb-action-chev-open {
+  transform: rotate(180deg);
+}
+.nb-actions-intro {
+  margin: 0 0 var(--nb-space-2);
+  font-size: var(--nb-fs-secondary); /* .nb-muted supplies the muted color */
 }
 .nb-action-head {
   display: flex;

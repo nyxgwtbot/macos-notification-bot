@@ -294,6 +294,73 @@ describe('ConfigView banner flow + actions validation (R8)', () => {
     });
   });
 
+  describe('L5-R1 settings UX', () => {
+    test('field labels read as plain names with dotted help text', async () => {
+      const { wrapper } = await mountConfig(baseConfig());
+
+      // `label` is a declared IonInput prop (set as a DOM property on the
+      // upgraded custom element, not reflected to an attribute) — read it off
+      // the element itself.
+      const labels = wrapper.findAll('ion-input').map((i) => (i.element as any).label as string | undefined);
+      expect(labels).toContain('Min confidence (0–1)');
+      expect(labels).toContain('Poll interval (s)');
+      expect(wrapper.text()).not.toContain('router.min_confidence (0–1)');
+      expect(wrapper.text()).not.toContain('poll_interval (s)');
+
+      const help = wrapper.findAll('.nb-field-help').map((p) => p.text());
+      expect(help).toContain('router.min_confidence — confidence floor for LLM-routed actions.');
+      expect(help).toContain('poll_interval — seconds between daemon polls.');
+
+      wrapper.unmount();
+      mounted = null;
+    });
+
+    test('the Ollama URL slot no longer spans both grid columns', async () => {
+      const { wrapper } = await mountConfig(baseConfig());
+      expect(wrapper.find('.nb-span-2').exists()).toBe(false);
+      wrapper.unmount();
+      mounted = null;
+    });
+
+    test('match hint is collapsed by default and expands with a labeled button', async () => {
+      const { wrapper } = await mountConfig(baseConfig());
+      const id = 'clipboard-copy';
+
+      let expand = wrapper.find('.nb-action-expand');
+      expect(expand.attributes('aria-expanded')).toBe('false');
+      expect(expand.attributes('aria-label')).toBe(`Edit match hint for ${id}`);
+      let box = wrapper.find('.nb-action-box:not(.nb-action-command)');
+      expect((box.element as HTMLElement).style.display).toBe('none');
+
+      await expand.trigger('click');
+      await flushPromises();
+      await wrapper.vm.$nextTick();
+
+      expand = wrapper.find('.nb-action-expand');
+      expect(expand.attributes('aria-expanded')).toBe('true');
+      expect(expand.attributes('aria-label')).toBe(`Hide match hint for ${id}`);
+      box = wrapper.find('.nb-action-box:not(.nb-action-command)');
+      expect((box.element as HTMLElement).style.display).not.toBe('none');
+
+      wrapper.unmount();
+      mounted = null;
+    });
+
+    test('granted connector rows use a quiet right-aligned button', async () => {
+      const { wrapper } = await mountConfig(baseConfig());
+      const rows = wrapper.findAll('.nb-connector-row');
+      expect(rows.length).toBe(3);
+
+      const buttons = rows.map((row) => row.find('.nb-connector-btn'));
+      buttons.forEach((button) => expect(button.exists()).toBe(true));
+      expect(buttons[0].classes()).toContain('nb-connector-quiet');
+      expect(buttons[1].classes()).not.toContain('nb-connector-quiet');
+
+      wrapper.unmount();
+      mounted = null;
+    });
+  });
+
   test('page titles render as real headings (role=heading, aria-level=1)', async () => {
     const { wrapper } = await mountConfig(baseConfig());
     const title = wrapper.find('ion-title');
