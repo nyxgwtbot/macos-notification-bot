@@ -283,6 +283,36 @@ describe('DashboardView feed digest + caption + machine mono (S3, S4, S5)', () =
     expect(caption.text()).toBe('startup · bot');
   });
 
+  test('digest and every child expand independently with click, Enter and Space', async () => {
+    const wrapper = await mountStatus([startupEvent(1), startupEvent(2), startupEvent(3)]);
+    const digest = wrapper.get('.nb-event-digest');
+    await digest.trigger('keydown', { key: 'Enter' });
+    const rows = digest.findAll('.nb-digest-rows .nb-event-startup');
+    expect(rows).toHaveLength(3);
+    for (const row of rows) {
+      expect(row.attributes('aria-expanded')).toBe('false');
+      await row.trigger('click');
+      expect(row.attributes('aria-expanded')).toBe('true');
+      expect(digest.attributes('aria-expanded')).toBe('true');
+      await row.get('.nb-raw-copy').trigger('keydown', { key: 'Enter' });
+      expect(row.attributes('aria-expanded')).toBe('true');
+      expect(digest.attributes('aria-expanded')).toBe('true');
+      await row.trigger('keydown', { key: ' ' });
+      expect(row.attributes('aria-expanded')).toBe('false');
+      expect(digest.attributes('aria-expanded')).toBe('true');
+      await row.trigger('keydown', { key: 'Enter' });
+      expect(row.find('.nb-event-raw').exists()).toBe(true);
+      expect(digest.attributes('aria-expanded')).toBe('true');
+    }
+    useBotStore().appendToFeed(startupEvent(4));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.findAll('.nb-event-digest')).toHaveLength(1);
+    expect(digest.attributes('aria-expanded')).toBe('true');
+    expect(digest.findAll('.nb-digest-rows .nb-event-startup')).toHaveLength(4);
+    await digest.trigger('keydown', { key: ' ' });
+    expect(digest.attributes('aria-expanded')).toBe('false');
+  });
+
   test('machine values mono (S3): Ollama and Model rows carry nb-kv-tech and title attrs', async () => {
     const wrapper = await mountStatus([]);
     const store = useBotStore();

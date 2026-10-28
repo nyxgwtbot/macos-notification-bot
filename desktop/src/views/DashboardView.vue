@@ -178,14 +178,14 @@
           <div
             v-if="item.kind === 'startup-digest'"
             class="nb-event nb-event-digest"
-            :class="{ 'nb-event-open': expandedRows.has(item.key) }"
+            :class="{ 'nb-event-open': expandedRows.has('digest:' + item.key) }"
             role="button"
             tabindex="0"
-            :aria-expanded="expandedRows.has(item.key)"
+            :aria-expanded="expandedRows.has('digest:' + item.key)"
             :aria-label="item.count + ' daemon starts, latest ' + item.latestRel"
-            @click="toggleExpand(item.key)"
-            @keydown.enter.prevent="toggleExpand(item.key)"
-            @keydown.space.prevent="toggleExpand(item.key)"
+            @click="toggleExpand('digest:' + item.key)"
+            @keydown.enter.prevent="toggleExpand('digest:' + item.key)"
+            @keydown.space.prevent="toggleExpand('digest:' + item.key)"
           >
             <div class="nb-event-top">
               <ion-icon class="nb-event-chev" aria-hidden="true" :icon="chevronForwardOutline" />
@@ -197,7 +197,7 @@
               </span>
             </div>
             <!-- Expand: inline run of existing nb-event rows -->
-            <div v-if="expandedRows.has(item.key)" class="nb-digest-rows" @click.stop>
+            <div v-if="expandedRows.has('digest:' + item.key)" class="nb-digest-rows" @click.stop @keydown.stop>
               <div
                 v-for="row in item.rows"
                 :key="row.key"
@@ -227,6 +227,7 @@
                   role="region"
                   :aria-label="'Raw payload for ' + (row.app || row.kind)"
                   @click.stop
+                  @keydown.stop
                 >
                   <button class="nb-raw-copy" aria-label="Copy raw payload" @click="copyRaw(row)">
                     <ion-icon aria-hidden="true" :icon="copyOutline" />
