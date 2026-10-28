@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest';
 
 import {
+  categoryLabelEn,
   currentMonth,
   formatBrl,
   formatMonth,
@@ -78,5 +79,22 @@ describe('labels', () => {
     expect(formatMomDelta(0)).toBe('+0%');
     expect(formatMomDelta(null)).toBe(null);
     expect(formatMomDelta(undefined)).toBe(null);
+  });
+});
+
+describe('categoryLabelEn', () => {
+  test('maps known categories to English labels', () => {
+    expect(categoryLabelEn('alimentacao')).toBe('Food');
+    expect(categoryLabelEn('transporte')).toBe('Transport');
+    expect(categoryLabelEn('moradia')).toBe('Housing');
+    expect(categoryLabelEn('saude')).toBe('Health');
+    expect(categoryLabelEn('lazer')).toBe('Leisure');
+    expect(categoryLabelEn('educacao')).toBe('Education');
+    expect(categoryLabelEn('outros')).toBe('Other');
+  });
+
+  test('falls back to the raw key for unknown categories', () => {
+    expect(categoryLabelEn('viagem')).toBe('viagem');
+    expect(categoryLabelEn('desconhecida')).toBe('desconhecida');
   });
 });

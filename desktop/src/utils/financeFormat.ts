@@ -71,3 +71,17 @@ export function formatMomDelta(delta: number | null | undefined): string | null 
   const text = `${magnitude.toLocaleString('pt-BR', { maximumFractionDigits: 1 })}%`;
   return `${delta >= 0 ? '+' : '-'}${text}`;
 }
+
+const CATEGORY_LABELS_EN: Record<string, string> = {
+  alimentacao: 'Food',
+  transporte: 'Transport',
+  moradia: 'Housing',
+  saude: 'Health',
+  lazer: 'Leisure',
+  educacao: 'Education',
+  outros: 'Other',
+};
+
+export function categoryLabelEn(category: string): string {
+  return CATEGORY_LABELS_EN[category] ?? category;
+}

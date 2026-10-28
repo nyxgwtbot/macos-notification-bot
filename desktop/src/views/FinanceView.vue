@@ -19,6 +19,7 @@
         <ion-icon aria-hidden="true" :icon="lockClosedOutline" />
         <span>Finance plugin is disabled (config.finance.enabled = false). Enable it in Settings.</span>
       </div>
+      <p v-if="financeDisabled && !store.financeSummary" class="nb-empty">Finance data appears here once the plugin is enabled.</p>
 
       <!-- error banner -->
       <div v-if="store.financeError" class="nb-banner nb-banner-err">
@@ -47,7 +48,7 @@
           <ion-card>
             <ion-card-header><ion-card-title>Total this month</ion-card-title></ion-card-header>
             <ion-card-content>
-              <div class="nb-total" :class="{ 'nb-total-zero': !store.financeSummary.db_exists }">
+              <div class="nb-total" :class="{ 'nb-total-zero': !store.financeSummary.total }">
                 {{ formatBrl(store.financeSummary.total) }}
               </div>
               <div v-if="!store.financeSummary.db_exists" class="nb-muted">No finance.db — summary is zeroed.</div>
@@ -56,7 +57,7 @@
           <ion-card>
             <ion-card-header><ion-card-title>Previous month</ion-card-title></ion-card-header>
             <ion-card-content>
-              <div class="nb-total nb-total-smaller">{{ formatBrl(store.financeSummary.prev_total) }}</div>
+              <div class="nb-total nb-total-smaller" :class="{ 'nb-total-zero': !store.financeSummary.prev_total }">{{ formatBrl(store.financeSummary.prev_total) }}</div>
               <div class="nb-mom" :class="momClass">
                 <template v-if="momLabel !== null">{{ momLabel }} vs previous month</template>
                 <template v-else><span class="nb-muted">no comparison base</span></template>
@@ -78,7 +79,7 @@
           <ion-card-content>
             <div class="nb-cat-list">
               <div v-for="bar in categoryBars" :key="bar.category" class="nb-cat-bar">
-                <span class="nb-cat-label">{{ bar.category }}</span>
+                <span class="nb-cat-label">{{ categoryLabelEn(bar.category) }}</span>
                 <span class="nb-cat-track"><span class="nb-cat-fill" :style="{ width: bar.width + '%' }" /></span>
                 <span class="nb-cat-value">{{ formatBrl(bar.value) }}</span>
               </div>
@@ -98,8 +99,8 @@
               <tbody>
                 <tr v-for="tx in store.financeTransactions" :key="tx.rec_id">
                   <td>{{ formatIsoShort(tx.ts) }}</td>
-                  <td><ion-badge :color="tx.kind === 'recebimento' ? 'success' : tx.kind === 'gasto' ? 'warning' : 'medium'">{{ tx.kind }}</ion-badge></td>
-                  <td>{{ tx.category }}</td>
+                  <td><span class="nb-status-chip" :class="tx.kind === 'recebimento' ? 'nb-status-ok' : tx.kind === 'gasto' ? 'nb-status-warn' : ''">{{ tx.kind }}</span></td>
+                  <td>{{ categoryLabelEn(tx.category) }}</td>
                   <td class="nb-num">{{ formatBrl(tx.amount) }}</td>
                   <td class="nb-desc">{{ tx.description || '—' }}</td>
                   <td class="nb-bundle">{{ tx.bundle || '—' }}</td>
@@ -119,16 +120,12 @@
                 <template v-else>{{ store.reportStatus?.exists ? '(Re)generate report' : 'Generate report' }}</template>
               </ion-button>
               <template v-if="reportPath">
-                <ion-button fill="outline" :disabled="!reportOpenable" @click="openReport">Open in browser</ion-button>
-                <ion-button fill="outline" :disabled="!reportOpenable" @click="revealReport">Reveal in Finder</ion-button>
+                <ion-button fill="clear" :disabled="!reportOpenable" @click="openReport">Open in browser</ion-button>
+                <ion-button fill="clear" :disabled="!reportOpenable" @click="revealReport">Reveal in Finder</ion-button>
               </template>
             </div>
-            <div v-if="reportPath" class="nb-report-path">
-              {{ reportPath }} {{ store.reportStatus?.exists && !store.reportResult ? '(already exists — click (Re)generate to refresh)' : '' }}
-            </div>
-            <div v-if="store.reportResult" class="nb-report-ok">
-              <strong>Report generated:</strong> {{ store.reportResult.html_path }}
-            </div>
+            <div v-if="reportPath" class="nb-report-path" :title="reportPath">{{ reportPath }}</div>
+            <div v-if="store.reportResult" class="nb-report-ok">Report generated.</div>
             <!-- R6: clamped to 2 lines (shared .nb-error-line); full text in title -->
             <div v-if="store.reportError" class="nb-error-line" :title="store.reportError">{{ store.reportError }}</div>
           </ion-card-content>
@@ -141,7 +138,6 @@
 <script setup lang="ts">
 import { computed, onMounted } from 'vue';
 import {
-  IonBadge,
   IonButton,
   IonButtons,
   IonCard,
@@ -162,6 +158,7 @@ import { chevronBackOutline, chevronForwardOutline, lockClosedOutline } from 'io
 
 import { useBotStore } from '@/stores/bot';
 import {
+  categoryLabelEn,
   currentMonth,
   formatBrl,
   formatMomDelta,
@@ -285,6 +282,7 @@ onMounted(async () => {
   font-size: var(--nb-fs-title);
   font-weight: 600;
   line-height: 1.3;
+  color: var(--nb-text-primary);
 }
 .nb-total-zero {
   color: var(--nb-text-secondary);
@@ -336,9 +334,14 @@ onMounted(async () => {
 .nb-ledger th,
 .nb-ledger td {
   text-align: left;
-  padding: var(--nb-space-1) var(--nb-space-2);
-  border-bottom: 1px solid var(--nb-border-subtle);
+  padding: var(--nb-space-2) var(--nb-space-2);
+  border-bottom: 1px solid var(--nb-border-default);
   white-space: nowrap;
+}
+
+.nb-ledger th {
+  color: var(--nb-text-secondary);
+  font-size: var(--nb-fs-secondary);
 }
 .nb-ledger .nb-num {
   text-align: right;
@@ -353,6 +356,16 @@ onMounted(async () => {
 .nb-ledger-wrap {
   overflow-x: auto;
 }
+@media (max-width: 900px) {
+  .nb-ledger th:nth-child(6),
+  .nb-ledger td:nth-child(6) {
+    display: none;
+  }
+
+  .nb-ledger .nb-desc {
+    max-width: 220px;
+  }
+}
 .nb-report-row {
   display: flex;
   flex-wrap: wrap;
@@ -364,7 +377,9 @@ onMounted(async () => {
   font-size: var(--nb-fs-micro);
   color: var(--nb-text-secondary);
   font-family: var(--nb-mono);
-  word-break: break-all;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .nb-report-ok {
   margin-top: var(--nb-space-1);
