@@ -17,6 +17,7 @@ per run; the server process is always terminated.
 import contextlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -33,8 +34,14 @@ if REPO_ROOT not in sys.path:
 
 from notifybot.finance import FinanceLedger
 from notifybot.report import validate_month  # noqa: F401  (contract reference)
+from notifybot.agent_tools import ARTIFACTS_PORT, artifacts_port_from_env
 
-PREFERRED_PORT = 4770
+# The API port must stay OUTSIDE the artifacts range: the artifacts
+# sub-service binds 4770 in production (fixed constant, no auto-increment by
+# design), so the API smoke prefers 4789. When the artifacts port itself is
+# owned (e.g. a live bot), the sandbox falls back to the documented TEST-ONLY
+# NOTIFYBOT_ARTIFACTS_PORT override (see pick_artifacts_port below).
+PREFERRED_PORT = 4789
 HEALTH_TIMEOUT_S = 20.0
 
 
@@ -42,6 +49,32 @@ def print_check(name: str, passed: bool, evidence: str) -> bool:
     """Emit ``[PASSED/FAILED] <name> — <evidence>`` (smoke_e2e style)."""
     print("[%s] %s \u2014 %s" % ("PASSED" if passed else "FAILED", name, evidence))
     return passed
+
+
+def can_bind(port: int) -> bool:
+    """True when nothing owns 127.0.0.1:<port> right now."""
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def pick_artifacts_port() -> int:
+    """Artifacts port for the smoke sandbox: the production default 4770 when
+    bindable (or an explicit env override), else the first free 4771..4780 via
+    the documented test-only NOTIFYBOT_ARTIFACTS_PORT override. Production
+    itself never moves off 4770."""
+    preferred = artifacts_port_from_env()
+    if preferred != ARTIFACTS_PORT or can_bind(preferred):
+        return preferred
+    for candidate in range(ARTIFACTS_PORT + 1, ARTIFACTS_PORT + 11):
+        if can_bind(candidate):
+            return candidate
+    raise RuntimeError(
+        f"nenhuma porta livre para artifacts entre {ARTIFACTS_PORT + 1} e {ARTIFACTS_PORT + 10}"
+    )
 
 
 def free_port(preferred: int = PREFERRED_PORT) -> int:
@@ -154,6 +187,20 @@ def main() -> int:
 
         env = dict(os.environ)
         env.pop("NOTIFYBOT_API_PORT", None)  # --port wins for the sandbox server
+        # Mock-mode agent rows: forward the hook to the server subprocess so
+        # the agent loop uses the deterministic scripted LLM (no Ollama calls).
+        agent_mock = os.environ.get("NOTIFYBOT_SMOKE_AGENT_MOCK", "") == "1"
+        if agent_mock:
+            env["NOTIFYBOT_SMOKE_AGENT_MOCK"] = "1"
+        # Mock-mode connectors rows: forward the hook so probes/actions use the
+        # in-process connectors world (no osascript, no TCC prompt).
+        connectors_mock = os.environ.get("NOTIFYBOT_CONNECTORS_MOCK", "") == "1"
+        if connectors_mock:
+            env["NOTIFYBOT_CONNECTORS_MOCK"] = "1"
+        # Artifacts port resolution for the sandbox (default 4770 when free;
+        # documented test-only override otherwise). Production keeps 4770.
+        artifacts_port = pick_artifacts_port()
+        env["NOTIFYBOT_ARTIFACTS_PORT"] = str(artifacts_port)
         proc = subprocess.Popen(
             [sys.executable, "bot.py", "api", "--config", config_path, "--port", str(port)],
             cwd=REPO_ROOT,
@@ -274,6 +321,126 @@ def main() -> int:
                                       and body.get("posted") == 3, str(body))
             else:
                 print("[SKIPPED] test-notify POST — publique notificações reais com NOTIFYBOT_SMOKE_TEST_NOTIFY=1")
+
+            # #11-#14 agent rows — mock-mode only (NOTIFYBOT_SMOKE_AGENT_MOCK=1
+            # forwards to the server subprocess; never talks to a live Ollama).
+            if agent_mock:
+                status, body = api_request(base, "POST", "/api/agent/turn", {"message": "dashboard, por favor"})
+                urls = (body or {}).get("urls") or []
+                url = urls[0] if (status == 200 and body and urls) else None
+                turn_ok = (
+                    status == 200 and bool(body) and bool(body.get("answer"))
+                    and url is not None
+                    and re.match(
+                        "^http://127\\.0\\.0\\.1:" + str(artifacts_port) + "/[0-9a-f]{32}\\.html$",
+                        url,
+                    )
+                    is not None
+                )
+                all_ok &= print_check(
+                    "agent turn pipeline",
+                    turn_ok,
+                    f"artifacts_port={artifacts_port} status={status} "
+                    f"answer={(body or {}).get('answer', '')[:60]!r} urls={urls}",
+                )
+
+                if turn_ok:
+                    session_id = body["session_id"]
+                    with urllib.request.urlopen(url, timeout=10) as resp:
+                        served_html = resp.read().decode("utf-8")
+                    all_ok &= print_check("agent artifact served", resp.status == 200
+                                          and "Agent Health Overview" in served_html,
+                                          f"GET {url} -> {len(served_html)} bytes com título do dashboard")
+
+                    status, services = api_request(base, "GET", "/api/services")
+                    artifacts_row = (services or {}).get("services", {}).get("artifacts", {})
+                    all_ok &= print_check("agent services row", status == 200
+                                          and artifacts_row.get("running") is True
+                                          and artifacts_row.get("port") == artifacts_port
+                                          and bool(artifacts_row.get("root")) and bool(artifacts_row.get("since")),
+                                          str(artifacts_row))
+
+                    status, sessions = api_request(base, "GET", "/api/agent/sessions")
+                    found = [row for row in (sessions or {}).get("sessions", []) if row.get("session_id") == session_id]
+                    all_ok &= print_check("agent sessions list", status == 200 and len(found) == 1
+                                          and found[0].get("preview", "").startswith("dashboard"),
+                                          f"1 sessão com preview={found[0].get('preview', '')[:40]!r}" if found else str(sessions))
+
+                    status, detail = api_request(base, "GET", f"/api/agent/session/{session_id}")
+                    records = (detail or {}).get("records", []) if status == 200 else []
+                    roles = [record.get("role") for record in records]
+                    all_ok &= print_check("agent session fetch", status == 200 and bool(records)
+                                          and roles[0] == "user" and roles[-1] == "assistant",
+                                          f"roles={roles}")
+            else:
+                print("[SKIPPED] agent rows — rode com NOTIFYBOT_SMOKE_AGENT_MOCK=1 para exercitar o pipeline do agente (mock, sem Ollama)")
+
+            # #15-#16 connectors rows — gated on the connectors mock
+            # (NOTIFYBOT_CONNECTORS_MOCK=1 forwards to the server subprocess;
+            # without it a probe would fire real osascript + TCC prompts).
+            if connectors_mock:
+                status, conn_body = api_request(base, "GET", "/api/connectors")
+                connectors = (conn_body or {}).get("connectors", {})
+                shape_ok = (
+                    status == 200
+                    and set(connectors) == {"reminders", "notes", "system"}
+                    and all(
+                        set(connectors.get(domain, {})) == {"status", "granted", "last_probe", "hint"}
+                        for domain in ("reminders", "notes", "system")
+                    )
+                    and connectors.get("system", {}).get("status") == "granted"
+                    and connectors.get("system", {}).get("granted") is True
+                    and connectors.get("system", {}).get("hint") == "no consent required"
+                )
+                all_ok &= print_check(
+                    "connectors list shape", shape_ok,
+                    f"domains={sorted(connectors)} system={connectors.get('system')}",
+                )
+
+                status, probe_body = api_request(base, "POST", "/api/connectors/probe", {"domain": "notes"})
+                probe_ok = status == 200 and (probe_body or {}).get("status") == "granted" and (probe_body or {}).get("ok") is True
+                all_ok &= print_check(
+                    "connectors probe notes -> granted", probe_ok, str(probe_body)
+                )
+                state_exists = os.path.exists(os.path.join(root, "data", "connectors_state.json"))
+                all_ok &= print_check(
+                    "connectors state file", state_exists, "data/connectors_state.json gravado no sandbox"
+                )
+
+                status, bad_probe = api_request(base, "POST", "/api/connectors/probe", {"domain": "bogus"})
+                all_ok &= print_check("connectors probe unknown -> 400", status == 400, str(bad_probe))
+
+                if agent_mock:
+                    # consent first (probe through the SAME manager the agent uses)
+                    status, rem_probe = api_request(base, "POST", "/api/connectors/probe", {"domain": "reminders"})
+                    all_ok &= print_check(
+                        "connectors probe reminders -> granted", status == 200 and (rem_probe or {}).get("status") == "granted",
+                        str(rem_probe),
+                    )
+                    status, turn_body = api_request(
+                        base, "POST", "/api/agent/turn", {"message": "adde um reminder pro projeto X"}
+                    )
+                    conn_turn = (turn_body or {}).get("turn", [])
+                    turn_tools = [step.get("tool") for step in conn_turn]
+                    answer_text = str((turn_body or {}).get("answer", ""))
+                    steps_ok = (
+                        [step.get("args", {}).get("action") for step in conn_turn] == ["add", "list_reminders"]
+                        and all(step.get("error") is None for step in conn_turn)
+                    )
+                    agent_conn_ok = (
+                        status == 200
+                        and turn_tools == ["native.call", "native.call"]
+                        and steps_ok
+                        and "Ler o relatório do projeto X" in answer_text
+                    )
+                    all_ok &= print_check(
+                        "agent connectors turn",
+                        agent_conn_ok,
+                        f"tools={turn_tools} actions={[step.get('args', {}).get('action') for step in conn_turn]} "
+                        f"answer={answer_text[:80]!r}",
+                    )
+            else:
+                print("[SKIPPED] connectors rows — rode com NOTIFYBOT_CONNECTORS_MOCK=1 para exercitar probes/actions (mock, sem osascript)")
         finally:
             proc.terminate()
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
@@ -285,3 +452,32 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+# ---------------------------------------------------------------------------
+# Supervisor REAL-WINDOW smoke checklist (executed by the supervisor ONLY —
+# this script covers the mock-mode path; these items need a human + the real
+# Electron window + real Ollama + osascript consent):
+#
+#   1. Launch the packaged/dev desktop app (`cd desktop && npm run desktop:start`).
+#   2. Open the Chat tab and ask for "notificações de teste" -> the agent calls
+#      notify.test; verify 3 macOS banners appear and any osascript/automation
+#      CONSENT prompt is granted (consent identity may differ under the
+#      Electron-spawned python child vs terminal runs).
+#   3. If a daemon is live, confirm it CONSUMED the 3 test events (watermark
+#      advanced in the Dashboard tab / .bot_state.json).
+#   4. Ask for a dashboard with the REAL model (Ollama live): verify the agent
+#      produces turn chips (app.data -> dashboard.create -> server.serve) and
+#      the iframe PAINTS the artifact (non-blank pixels, not a blank frame).
+#   5. Confirm GET /api/services shows the artifacts row running on 4770 and
+#      the tab bar reads Dashboard / Finance / Chat / Settings / Logs.
+#   6. Open Settings › Connectors: press Connect on reminders and notes and
+#      approve the macOS AUTOMATION consent prompt WHILE THE APP IS FOCUSED
+#      (TCC attributes consent to the responsible parent — the
+#      Electron-spawned python child may not see the same dialog from
+#      Terminal runs). Both rows should flip to Granted after the probe.
+#   7. In Chat, ask "adiciona um lembrete Ler o relatório X" with the REAL
+#      model: verify the agent calls native.call (add step chip) and the
+#      reminder actually lands in Reminders.app (iCloud sync may lag a few
+#      seconds); an ungranted domain must answer the PT-BR "conecte <domain>
+#      em Settings › Connectors" error verbatim and NOT retry.
+# ---------------------------------------------------------------------------

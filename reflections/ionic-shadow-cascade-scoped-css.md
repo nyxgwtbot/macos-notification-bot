@@ -1,0 +1,12 @@
+# Ionic shadow-DOM styling on Vue scoped CSS — empirical rules (desktop UI)
+
+Empirically verified on this machine against this app's stack (Electron/Chromium 116, @ionic/core 8.8.19). Applies whenever per-view scoped CSS in `desktop/src/views/*.vue` tries to restyle Ionic custom elements.
+
+- **Custom properties declared by `:host()` rules inside an Ionic shadow root beat outer-tree declarations of equal/any specificity** on the host element. The documented exception is the only reliable route: **outer-tree `!important` on the custom property wins over non-important shadow declarations** (`--background: X !important` on `.nb-btn-quiet` took effect; without `!important` the same var was ignored and Ionic's `--background: transparent` kept).
+- Regular properties are inherited-based: to recolor toolbar buttons (md outline consumes `var(--ion-toolbar-color, var(--color))` for BOTH text and border — that is what made `New chat` render as a loud white outline), re-point `--ion-toolbar-color` on the button host — **element-own declaration beats plain inheritance, no `!important` needed** (`--ion-toolbar-color: var(--nb-text-secondary)` on the quiet button fixed text+border).
+- `ion-title` (md, 8.8.19): shadow `:host` hardcodes `font-size: 1.25rem`/`500`/`padding-inline: 20px` — outer rules need `!important`; done centrally once in `desktop/src/theme/nb-shared.css` (.nb-page-header X1 pattern), do NOT re-fight it per view.
+- `v-html` content carries NO Vue scoped attribute: any CSS targeting rendered markup must go through `:deep()` (used by the chat md-normalization block C6).
+- `ion-input/ion-textarea` in this build DON'T expose `::part(label)` (ion-select/ion-tab-button DO expose parts). ion-input internals (`label-text-wrapper`, `input-wrapper`) are **light-DOM scoped classes** — style them with `:deep(...)` descendants.
+- `ion-tab-button`'s icon/label gap must be set on `::part(native)` — a `gap` on the shadow-host does NOT reach the actual flex container.
+- `ion-chip` (md) has its own 4px host margins — in tokenized gap rows neutralize with `margin: 0`, else you measure 10px effective gaps while the code says 4.
+- ion-button `size="small"` renders 2.1em@13px ≈ 27.3px tall, but inside `ion-buttons` the `.in-buttons` font-size (17px) makes it ~34-36px — align custom header rows with explicit outer `min-height/height` (28px shared row in the chat header).

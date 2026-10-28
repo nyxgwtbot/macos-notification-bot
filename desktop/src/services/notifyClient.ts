@@ -10,14 +10,20 @@
  */
 
 import type {
+  AgentSessionDetail,
+  AgentSessionsResponse,
+  AgentTurnResponse,
   ApiErrorBody,
   BotConfig,
+  ConnectorProbeResponse,
+  ConnectorsResponse,
   EventsResponse,
   FinanceReportResult,
   FinanceReportStatus,
   FinanceSummary,
   FinanceTransactionsResponse,
   HealthResponse,
+  ServicesResponse,
   TestNotifyResponse,
 } from '@/types/bot';
 import type { NotifyAPI } from '@/notify';
@@ -163,6 +169,37 @@ export class NotifyClient {
   // #9
   postTestNotify(): Promise<TestNotifyResponse> {
     return this.request('POST', '/api/test-notify', {});
+  }
+
+  // #11 (synchronous agent turn; sessionId omitted -> new session)
+  postAgentTurn(sessionId: string | null, message: string): Promise<AgentTurnResponse> {
+    const body = sessionId === null ? { message } : { session_id: sessionId, message };
+    return this.request('POST', '/api/agent/turn', body);
+  }
+
+  // #12
+  getAgentSessions(): Promise<AgentSessionsResponse> {
+    return this.request('GET', '/api/agent/sessions');
+  }
+
+  // #13
+  getAgentSession(sessionId: string): Promise<AgentSessionDetail> {
+    return this.request('GET', `/api/agent/session/${encodeURIComponent(sessionId)}`);
+  }
+
+  // #14
+  getServices(): Promise<ServicesResponse> {
+    return this.request('GET', '/api/services');
+  }
+
+  // #15
+  getConnectors(): Promise<ConnectorsResponse> {
+    return this.request('GET', '/api/connectors');
+  }
+
+  // #16 (single-flight per domain server-side; concurrent probe -> 409)
+  postConnectorProbe(domain: string): Promise<ConnectorProbeResponse> {
+    return this.request('POST', '/api/connectors/probe', { domain });
   }
 
   /**

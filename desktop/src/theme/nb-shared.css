@@ -1,0 +1,246 @@
+/*
+ * Notification Bot Desktop — shared utility classes.
+ * Consolidated from per-view scoped blocks and tokenized per the redesign spec.
+ */
+
+.nb-content {
+  --padding-top: var(--nb-space-4);
+  --padding-start: var(--nb-space-4);
+  --padding-end: var(--nb-space-4);
+  --padding-bottom: var(--nb-space-6);
+}
+
+.nb-muted {
+  color: var(--nb-text-secondary);
+  font-size: var(--nb-fs-secondary);
+}
+
+.nb-center {
+  display: block;
+  margin: var(--nb-space-8) auto;
+  width: var(--nb-space-8);
+  height: var(--nb-space-8);
+}
+
+.nb-empty {
+  text-align: center;
+  color: var(--nb-text-secondary);
+  padding: var(--nb-space-6) 0;
+  font-size: var(--nb-fs-secondary);
+}
+
+.nb-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--nb-space-2);
+  margin: 0 0 var(--nb-space-4);
+  padding: var(--nb-space-2) var(--nb-space-3);
+  border-radius: var(--nb-radius-md);
+  font-size: var(--nb-fs-secondary);
+}
+
+.nb-banner-warn {
+  background: var(--nb-warning-muted);
+  color: var(--ion-color-warning);
+}
+
+.nb-banner-err {
+  background: var(--nb-danger-muted);
+  color: var(--ion-color-danger);
+}
+
+.nb-offline {
+  display: flex;
+  align-items: center;
+  gap: var(--nb-space-2);
+  margin: 0 0 var(--nb-space-4);
+  padding: var(--nb-space-2) var(--nb-space-3);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-danger-muted);
+  color: var(--ion-color-danger);
+  font-size: var(--nb-fs-secondary);
+}
+
+.nb-error-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--nb-space-2);
+  margin: 0 0 var(--nb-space-3);
+  padding: var(--nb-space-2) var(--nb-space-3);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-danger-muted);
+  color: var(--ion-color-danger);
+  font-size: var(--nb-fs-secondary);
+}
+
+.nb-error-line {
+  margin-top: var(--nb-space-1);
+  font-size: var(--nb-fs-secondary);
+  color: var(--ion-color-danger);
+  /* R6: error strings render unbounded (daemon lastError especially) —
+     clamp to ~2 lines; consumers keep the full text in the title attr */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.nb-card-footer {
+  padding-top: var(--nb-space-3);
+  display: flex;
+  align-items: center;
+}
+
+/* ========================================
+   SR-ONLY — visually hidden, announced only. Live regions (feed activity,
+   restart arm label, future save announcements) render through this so the
+   visible layout never shifts or shows assistive text.
+   ======================================== */
+.nb-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* ========================================
+   SOFT STATUS CHIPS — the shared tinted status pill: background is a
+   ~14-16% tint of the semantic color (never a solid fill), text + dot at
+   full strength, radius-sm. The base class is the neutral state; tone
+   classes select the semantic pair. Consumers: Status card headers
+   (Daemon / Bot state) and the Settings connector rows.
+   ======================================== */
+.nb-status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nb-space-1);
+  width: max-content;
+  max-width: 100%;
+  padding: 2px var(--nb-space-2); /* 2px micro-inner exception */
+  border-radius: var(--nb-radius-sm);
+  font-size: var(--nb-fs-micro);
+  font-weight: 600;
+  line-height: 1.45;
+  white-space: nowrap;
+  background: var(--nb-bg-elevated);
+  color: var(--nb-text-secondary);
+}
+/* Solid-state dot; tone classes below set the full-strength color. */
+.nb-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: var(--nb-radius-full);
+  background: currentColor;
+}
+.nb-status-ok {
+  background: var(--nb-chip-ok-bg);
+  color: var(--nb-chip-ok-fg);
+}
+.nb-status-info {
+  background: var(--nb-info-muted);
+  color: var(--nb-info);
+}
+.nb-status-warn {
+  background: var(--nb-chip-warn-bg);
+  color: var(--nb-chip-warn-fg);
+}
+.nb-status-bad {
+  background: var(--nb-chip-danger-bg);
+  color: var(--nb-chip-danger-fg);
+}
+.nb-status-live {
+  background: var(--nb-teal-muted);
+  color: var(--nb-teal-light);
+}
+
+/* ========================================
+   FILTER CHIPS — the shared 3-chip kind filter row (Status feed + Logs
+   header). Same tinted-chip DNA as the status chips above: 2px micro-inner
+   padding, radius-sm, micro type; the selected option wears the teal info
+   tint, unselected stays neutral, hover brightens via --nb-bg-hover.
+   Native buttons (role=group + aria-pressed) so keyboard toggling is free.
+   ======================================== */
+.nb-filter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--nb-space-1);
+}
+.nb-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px var(--nb-space-2); /* 2px micro-inner exception */
+  border-radius: var(--nb-radius-sm);
+  font-size: var(--nb-fs-micro);
+  font-weight: 600;
+  line-height: 1.45;
+  white-space: nowrap;
+  border: 1px solid transparent;
+  background: var(--nb-bg-elevated);
+  color: var(--nb-text-secondary);
+  cursor: pointer;
+}
+.nb-filter-chip:hover {
+  background: var(--nb-bg-hover);
+}
+.nb-filter-chip[data-active='true'] {
+  background: var(--nb-info-muted);
+  color: var(--nb-info);
+  border-color: transparent;
+}
+
+/* ========================================
+   PAGE HEADER PATTERN (X1) — one shared structure: single-row title at
+   --nb-fs-title-lg (18px/600) with inline actions, --nb-space-3 vertical
+   padding, hairline bottom border. Views opt in via .nb-page-header on
+   their ion-toolbar (the only toolbars in the app are page headers).
+   ======================================== */
+.nb-page-header {
+  --padding-top: var(--nb-space-3);
+  --padding-bottom: var(--nb-space-3);
+  --padding-start: 0;
+  --padding-end: 0;
+  --min-height: 44px;
+  --border-width: 1px;
+  --border-style: solid;
+  --border-color: var(--nb-border-default);
+}
+
+/* Outer !important beats the md :host title declarations (20px/500,
+   padding-inline 20px) — the H1-26px-era header ends for good.
+   R8: every <ion-title> under this shared pattern carries
+   role="heading" aria-level="1" (the title IS the page's real H1); the five
+   view templates set the attributes — keep any new view consistent. */
+.nb-page-header ion-title {
+  font-size: var(--nb-fs-title-lg) !important;
+  font-weight: 600 !important;
+  line-height: 1.3 !important;
+  padding-inline: var(--nb-space-4) !important;
+}
+
+/* ========================================
+   REDUCED MOTION — app-wide gate (R6). Users with prefers-reduced-motion:
+   reduce get transitions/animations collapsed to imperceptible and
+   scroll-behavior degraded to auto, everywhere. Programmatic scroll call
+   sites de-grade their 'smooth' behavior through src/utils/motion.ts
+   (wired in their own missions); new motion must respect this base.
+   ======================================== */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

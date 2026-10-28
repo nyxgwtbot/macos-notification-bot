@@ -26,5 +26,12 @@ contextBridge.exposeInMainWorld('notifyAPI', {
   },
   app: {
     info: () => ipcRenderer.invoke('notify:app:info')
+  },
+  navigate: {
+    // G1: menu accelerator clicks push a route string from the main process;
+    // the renderer (main.ts) guards it against the known route allowlist.
+    onNavigate: (handler: (path: string) => void) => {
+      ipcRenderer.on('notify:navigate', (_event, path: string) => handler(path));
+    }
   }
 });

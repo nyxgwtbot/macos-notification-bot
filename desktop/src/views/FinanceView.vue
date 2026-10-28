@@ -1,8 +1,15 @@
 <template>
   <ion-page>
     <ion-header>
-      <ion-toolbar>
-        <ion-title>Finanças</ion-title>
+      <ion-toolbar class="nb-page-header">
+        <!-- R8: the page title is a real heading (level 1) — the shared
+             .nb-page-header pattern's a11y contract, kept in every view -->
+        <ion-title role="heading" aria-level="1">Finance (legacy)</ion-title>
+        <ion-buttons slot="end">
+          <ion-note class="nb-legacy-note">
+            Pre-agent example — the agent builds finance dashboards in Chat.
+          </ion-note>
+        </ion-buttons>
       </ion-toolbar>
     </ion-header>
 
@@ -10,22 +17,25 @@
       <!-- disabled state -->
       <div v-if="financeDisabled" class="nb-banner nb-banner-warn">
         <ion-icon aria-hidden="true" :icon="lockClosedOutline" />
-        <span>Plugin finance desabilitado (config.finance.enabled = false). Habilite-o na aba <strong>Config</strong>.</span>
+        <span>Finance plugin is disabled (config.finance.enabled = false). Enable it in Settings.</span>
       </div>
+      <p v-if="financeDisabled && !store.financeSummary" class="nb-empty">Finance data appears here once the plugin is enabled.</p>
 
       <!-- error banner -->
       <div v-if="store.financeError" class="nb-banner nb-banner-err">
         <span>{{ store.financeError }}</span>
-        <ion-button size="small" fill="outline" @click="reload">Tentar de novo</ion-button>
+        <ion-button size="small" fill="outline" @click="reload">Retry</ion-button>
       </div>
 
       <!-- month navigator -->
       <div class="nb-month-nav">
-        <ion-button fill="clear" size="small" :disabled="financeDisabled" @click="gotoMonth(previousMonth(store.financeMonth))">
+        <ion-button fill="clear" size="small" :disabled="financeDisabled" aria-label="Previous month" @click="gotoMonth(previousMonth(store.financeMonth))">
           <ion-icon aria-hidden="true" :icon="chevronBackOutline" />
         </ion-button>
-        <ion-chip color="primary" :disabled="financeDisabled" @click="gotoMonth(currentMonth())">{{ store.financeMonth || currentMonth() }} · {{ monthLabelPt(store.financeMonth || currentMonth()) }}</ion-chip>
-        <ion-button fill="clear" size="small" :disabled="financeDisabled" @click="gotoMonth(nextMonth(store.financeMonth))">
+        <ion-chip color="primary" :disabled="financeDisabled" @click="gotoMonth(currentMonth())">
+          {{ store.financeMonth || currentMonth() }} · {{ monthLabelEn(store.financeMonth || currentMonth()) }}
+        </ion-chip>
+        <ion-button fill="clear" size="small" :disabled="financeDisabled" aria-label="Next month" @click="gotoMonth(nextMonth(store.financeMonth))">
           <ion-icon aria-hidden="true" :icon="chevronForwardOutline" />
         </ion-button>
       </div>
@@ -36,59 +46,61 @@
         <!-- summary cards -->
         <div class="nb-summary-row" :class="{ 'nb-summary-row-disabled': financeDisabled }">
           <ion-card>
-            <ion-card-header><ion-card-title>Total do mês</ion-card-title></ion-card-header>
+            <ion-card-header><ion-card-title>Total this month</ion-card-title></ion-card-header>
             <ion-card-content>
-              <div class="nb-total" :class="{ 'nb-total-zero': !store.financeSummary.db_exists }">
+              <div class="nb-total" :class="{ 'nb-total-zero': !store.financeSummary.total }">
                 {{ formatBrl(store.financeSummary.total) }}
               </div>
-              <div v-if="!store.financeSummary.db_exists" class="nb-muted">Sem finance.db — resumo zerado.</div>
+              <div v-if="!store.financeSummary.db_exists" class="nb-muted">No finance.db — summary is zeroed.</div>
             </ion-card-content>
           </ion-card>
           <ion-card>
-            <ion-card-header><ion-card-title>Mês anterior</ion-card-title></ion-card-header>
+            <ion-card-header><ion-card-title>Previous month</ion-card-title></ion-card-header>
             <ion-card-content>
-              <div class="nb-total nb-total-smaller">{{ formatBrl(store.financeSummary.prev_total) }}</div>
+              <div class="nb-total nb-total-smaller" :class="{ 'nb-total-zero': !store.financeSummary.prev_total }">{{ formatBrl(store.financeSummary.prev_total) }}</div>
               <div class="nb-mom" :class="momClass">
-                <template v-if="momLabel !== null">{{ momLabel }} vs mês anterior</template>
-                <template v-else><span class="nb-muted">sem base de comparação</span></template>
+                <template v-if="momLabel !== null">{{ momLabel }} vs previous month</template>
+                <template v-else><span class="nb-muted">no comparison base</span></template>
               </div>
             </ion-card-content>
           </ion-card>
           <ion-card>
-            <ion-card-header><ion-card-title>Transações</ion-card-title></ion-card-header>
+            <ion-card-header><ion-card-title>Transactions</ion-card-title></ion-card-header>
             <ion-card-content>
               <div class="nb-total nb-total-smaller">{{ store.financeSummary.count }}</div>
-              <div class="nb-muted" v-if="byKind">recebimentos: {{ byKind.recebimento ? formatBrl(byKind.recebimento) : '—' }}</div>
+              <div class="nb-muted" v-if="byKind">income: {{ byKind.recebimento ? formatBrl(byKind.recebimento) : '—' }}</div>
             </ion-card-content>
           </ion-card>
         </div>
 
         <!-- by-category inline bars (no chart lib) -->
         <ion-card v-if="categoryBars.length > 0">
-          <ion-card-header><ion-card-title>Por categoria</ion-card-title></ion-card-header>
+          <ion-card-header><ion-card-title>By category</ion-card-title></ion-card-header>
           <ion-card-content>
-            <div v-for="bar in categoryBars" :key="bar.category" class="nb-cat-bar">
-              <span class="nb-cat-label">{{ bar.category }}</span>
-              <span class="nb-cat-track"><span class="nb-cat-fill" :style="{ width: bar.width + '%' }" /></span>
-              <span class="nb-cat-value">{{ formatBrl(bar.value) }}</span>
+            <div class="nb-cat-list">
+              <div v-for="bar in categoryBars" :key="bar.category" class="nb-cat-bar">
+                <span class="nb-cat-label">{{ categoryLabelEn(bar.category) }}</span>
+                <span class="nb-cat-track"><span class="nb-cat-fill" :style="{ width: bar.width + '%' }" /></span>
+                <span class="nb-cat-value">{{ formatBrl(bar.value) }}</span>
+              </div>
             </div>
           </ion-card-content>
         </ion-card>
 
         <!-- ledger table -->
         <ion-card>
-          <ion-card-header><ion-card-title>Lançamentos</ion-card-title></ion-card-header>
+          <ion-card-header><ion-card-title>Ledger</ion-card-title></ion-card-header>
           <ion-card-content class="nb-ledger-wrap">
-            <p v-if="store.financeTransactions.length === 0" class="nb-empty">Nenhuma transação registrada neste mês.</p>
+            <p v-if="store.financeTransactions.length === 0" class="nb-empty">No transactions recorded for this month.</p>
             <table v-else class="nb-ledger">
               <thead>
-                <tr><th>Data</th><th>Tipo</th><th>Categoria</th><th class="nb-num">Valor</th><th>Descrição</th><th>App</th></tr>
+                <tr><th>Date</th><th>Type</th><th>Category</th><th class="nb-num">Amount</th><th>Description</th><th>App</th></tr>
               </thead>
               <tbody>
                 <tr v-for="tx in store.financeTransactions" :key="tx.rec_id">
                   <td>{{ formatIsoShort(tx.ts) }}</td>
-                  <td><ion-badge :color="tx.kind === 'recebimento' ? 'success' : tx.kind === 'gasto' ? 'warning' : 'medium'">{{ tx.kind }}</ion-badge></td>
-                  <td>{{ tx.category }}</td>
+                  <td><span class="nb-status-chip" :class="tx.kind === 'recebimento' ? 'nb-status-ok' : tx.kind === 'gasto' ? 'nb-status-warn' : ''">{{ tx.kind }}</span></td>
+                  <td>{{ categoryLabelEn(tx.category) }}</td>
                   <td class="nb-num">{{ formatBrl(tx.amount) }}</td>
                   <td class="nb-desc">{{ tx.description || '—' }}</td>
                   <td class="nb-bundle">{{ tx.bundle || '—' }}</td>
@@ -100,25 +112,22 @@
 
         <!-- report generation -->
         <ion-card>
-          <ion-card-header><ion-card-title>Relatório</ion-card-title></ion-card-header>
+          <ion-card-header><ion-card-title>Report</ion-card-title></ion-card-header>
           <ion-card-content>
             <div class="nb-report-row">
               <ion-button fill="solid" :disabled="store.reportBusy || financeDisabled" @click="generate">
                 <ion-spinner v-if="store.reportBusy" name="crescent" />
-                <template v-else>{{ store.reportStatus?.exists ? '(Re)gerar relatório' : 'Gerar relatório' }}</template>
+                <template v-else>{{ store.reportStatus?.exists ? '(Re)generate report' : 'Generate report' }}</template>
               </ion-button>
               <template v-if="reportPath">
-                <ion-button fill="outline" :disabled="!reportOpenable" @click="openReport">Abrir no navegador</ion-button>
-                <ion-button fill="outline" :disabled="!reportOpenable" @click="revealReport">Mostrar no Finder</ion-button>
+                <ion-button fill="clear" :disabled="!reportOpenable" @click="openReport">Open in browser</ion-button>
+                <ion-button fill="clear" :disabled="!reportOpenable" @click="revealReport">Reveal in Finder</ion-button>
               </template>
             </div>
-            <div v-if="reportPath" class="nb-report-path">
-              {{ reportPath }} {{ store.reportStatus?.exists && !store.reportResult ? '(já existe — clique em (Re)gerar para atualizar)' : '' }}
-            </div>
-            <div v-if="store.reportResult" class="nb-report-ok">
-              <strong>Relatório gerado:</strong> {{ store.reportResult.html_path }}
-            </div>
-            <div v-if="store.reportError" class="nb-error-line">{{ store.reportError }}</div>
+            <div v-if="reportPath" class="nb-report-path" :title="reportPath">{{ reportPath }}</div>
+            <div v-if="store.reportResult" class="nb-report-ok">Report generated.</div>
+            <!-- R6: clamped to 2 lines (shared .nb-error-line); full text in title -->
+            <div v-if="store.reportError" class="nb-error-line" :title="store.reportError">{{ store.reportError }}</div>
           </ion-card-content>
         </ion-card>
       </template>
@@ -129,8 +138,8 @@
 <script setup lang="ts">
 import { computed, onMounted } from 'vue';
 import {
-  IonBadge,
   IonButton,
+  IonButtons,
   IonCard,
   IonCardContent,
   IonCardHeader,
@@ -139,6 +148,7 @@ import {
   IonContent,
   IonHeader,
   IonIcon,
+  IonNote,
   IonPage,
   IonSpinner,
   IonTitle,
@@ -148,16 +158,25 @@ import { chevronBackOutline, chevronForwardOutline, lockClosedOutline } from 'io
 
 import { useBotStore } from '@/stores/bot';
 import {
+  categoryLabelEn,
   currentMonth,
   formatBrl,
   formatMomDelta,
-  monthLabelPt,
   nextMonth,
   previousMonth
 } from '@/utils/financeFormat';
 import { formatIsoShort } from '@/utils/time';
 
 const store = useBotStore();
+
+const monthFormatter = new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numeric' });
+
+function monthLabelEn(monthStr: string): string {
+  const [y, m] = monthStr.split('-').map(Number);
+  if (!y || !m) return monthStr;
+  const date = new Date(Date.UTC(y, m - 1, 15));
+  return monthFormatter.format(date);
+}
 
 const financeDisabled = computed(() => {
   if (store.health?.finance?.enabled === false) return true;
@@ -189,7 +208,7 @@ const categoryBars = computed(() => {
 const reportPath = computed(() => store.reportResult?.html_path ?? store.reportStatus?.html_path ?? '');
 const reportOpenable = computed(() => {
   if (typeof window === 'undefined') return false;
-  if (!window.notifyAPI?.report) return false; // browser dev: não abre arquivos locais
+  if (!window.notifyAPI?.report) return false; // browser dev: do not open local files
   return true;
 });
 
@@ -210,7 +229,7 @@ function openReport() {
   const bridge = window.notifyAPI?.report;
   if (!bridge || !reportPath.value) return;
   void bridge.openExternal(reportPath.value).then((result) => {
-    if (!result.success) console.warn('openExternal falhou:', result.error);
+    if (!result.success) console.warn('openExternal failed:', result.error);
   });
 }
 
@@ -218,7 +237,7 @@ function revealReport() {
   const bridge = window.notifyAPI?.report;
   if (!bridge || !reportPath.value) return;
   void bridge.revealInFinder(reportPath.value).then((result) => {
-    if (!result.success) console.warn('revealInFinder falhou:', result.error);
+    if (!result.success) console.warn('revealInFinder failed:', result.error);
   });
 }
 
@@ -231,112 +250,98 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.nb-content {
-  padding: 12px;
-}
-.nb-banner {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 0 4px 12px;
-  padding: 10px 14px;
-  border-radius: 10px;
-}
-.nb-banner-warn {
-  background: var(--nb-warning-muted, rgba(210, 153, 34, 0.15));
-  color: var(--ion-color-warning);
-}
-.nb-banner-err {
-  background: var(--nb-danger-muted, rgba(248, 81, 73, 0.15));
-  color: var(--ion-color-danger);
+.nb-legacy-note {
+  font-size: var(--nb-fs-secondary);
+  color: var(--nb-text-secondary);
+  margin-inline-end: var(--nb-space-3);
 }
 .nb-month-nav {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  margin-bottom: 12px;
+  gap: var(--nb-space-2);
+  margin-top: var(--nb-space-4);
+  margin-bottom: var(--nb-space-4);
 }
 .nb-summary-row {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 12px;
-  margin-bottom: 12px;
+  gap: var(--nb-space-3);
+  margin-bottom: 0;
 }
 .nb-summary-row-disabled {
   opacity: 0.6;
 }
 .nb-total {
-  font-size: 26px;
+  font-size: var(--nb-fs-display);
   font-weight: 700;
+  line-height: 1.2;
   color: var(--ion-color-primary);
 }
 .nb-total-smaller {
-  font-size: 20px;
+  font-size: var(--nb-fs-title);
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--nb-text-primary);
 }
 .nb-total-zero {
-  color: var(--ion-color-medium);
+  color: var(--nb-text-secondary);
 }
 .nb-mom {
-  font-size: 13px;
+  font-size: var(--nb-fs-secondary);
 }
 .nb-mom-up {
-  color: var(--nb-danger, var(--ion-color-danger));
+  color: var(--ion-color-danger);
 }
 .nb-mom-down {
   color: var(--ion-color-success);
 }
-.nb-muted {
-  color: var(--nb-text-secondary, var(--ion-color-medium));
-  font-size: 13px;
+.nb-cat-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-space-2);
 }
 .nb-cat-bar {
   display: grid;
   grid-template-columns: 130px 1fr 90px;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 6px;
-  font-size: 13px;
+  gap: var(--nb-space-2);
+  margin-bottom: 0;
+  font-size: var(--nb-fs-secondary);
 }
 .nb-cat-track {
   display: block;
   height: 12px;
-  border-radius: 6px;
-  background: var(--nb-bg-elevated, #262f3c);
+  border-radius: var(--nb-radius-sm);
+  background: var(--nb-bg-elevated);
   overflow: hidden;
 }
 .nb-cat-fill {
   display: block;
   height: 100%;
-  border-radius: 6px;
+  border-radius: var(--nb-radius-sm);
   background: var(--ion-color-primary);
 }
 .nb-cat-value {
   text-align: right;
 }
-.nb-center {
-  display: block;
-  margin: 32px auto;
-  width: 32px;
-  height: 32px;
-}
-.nb-empty {
-  color: var(--nb-text-secondary, var(--ion-color-medium));
-  text-align: center;
-  padding: 16px 0;
-}
 .nb-ledger {
   width: 100%;
   border-collapse: collapse;
-  font-size: 12px;
-  font-family: var(--nb-mono, monospace);
+  font-size: var(--nb-fs-body);
+  font-family: var(--nb-mono);
 }
 .nb-ledger th,
 .nb-ledger td {
   text-align: left;
-  padding: 5px 8px;
-  border-bottom: 1px solid var(--nb-border-subtle, #1e2833);
+  padding: var(--nb-space-2) var(--nb-space-2);
+  border-bottom: 1px solid var(--nb-border-default);
   white-space: nowrap;
+}
+
+.nb-ledger th {
+  color: var(--nb-text-secondary);
+  font-size: var(--nb-fs-secondary);
 }
 .nb-ledger .nb-num {
   text-align: right;
@@ -351,27 +356,34 @@ onMounted(async () => {
 .nb-ledger-wrap {
   overflow-x: auto;
 }
+@media (max-width: 900px) {
+  .nb-ledger th:nth-child(6),
+  .nb-ledger td:nth-child(6) {
+    display: none;
+  }
+
+  .nb-ledger .nb-desc {
+    max-width: 220px;
+  }
+}
 .nb-report-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--nb-space-2);
   align-items: center;
 }
 .nb-report-path {
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--nb-text-secondary, var(--ion-color-medium));
-  font-family: var(--nb-mono, monospace);
-  word-break: break-all;
+  margin-top: var(--nb-space-2);
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-secondary);
+  font-family: var(--nb-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .nb-report-ok {
-  margin-top: 6px;
-  font-size: 13px;
+  margin-top: var(--nb-space-1);
+  font-size: var(--nb-fs-secondary);
   color: var(--ion-color-success);
-}
-.nb-error-line {
-  margin-top: 6px;
-  font-size: 13px;
-  color: var(--ion-color-danger);
 }
 </style>

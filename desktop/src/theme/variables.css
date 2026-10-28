@@ -6,7 +6,9 @@
  * http://ionicframework.com/docs/theming/
  */
 
-:root {
+:root,
+:root.md,
+:root.ios {
   /* ========================================
      BASE BACKGROUNDS
      ======================================== */
@@ -23,6 +25,39 @@
   --nb-text-primary: #e8eef5;
   --nb-text-secondary: #9aa5b5;
   --nb-text-muted: #6b7685;
+
+  /* ========================================
+     SPACING SCALE
+     ======================================== */
+  --nb-space-1: 4px;   /* micro: chip/badge gaps, inline icon gaps, kv row padding */
+  --nb-space-2: 8px;   /* intra-component: bubble/chip padding, list row gaps, field gaps */
+  --nb-space-3: 12px;  /* component insets: card padding, event padding, section sub-gaps */
+  --nb-space-4: 16px;  /* page inset & section separation */
+  --nb-space-6: 24px;  /* breathing: empty states, bottom page pad */
+  --nb-space-8: 32px;  /* max separation: centered loaders */
+
+  /* ========================================
+     TYPE SCALE — 6 sizes, 3 weights
+     ======================================== */
+  --nb-fs-display: 24px;  /* w700 lh1.2 — hero stat (.nb-total) */
+  --nb-fs-title-lg: 18px; /* w600 lh1.3 — section h2 (.nb-feed-header h2) */
+  --nb-fs-title: 16px;    /* w600 lh1.3 — ion-card-title */
+  --nb-fs-body: 14px;     /* w400 lh1.5 — bubbles, feed titles, ledger */
+  --nb-fs-secondary: 13px;/* w400 lh1.45 — kv, hints, mom, muted copy */
+  --nb-fs-micro: 11px;    /* w400 — mono raw logs (compact, lh1.35), line numbers, previews, top meta, badges */
+
+  /* ========================================
+     RADIUS
+     ======================================== */
+  --nb-radius-sm: 6px;    /* code, micro chips */
+  --nb-radius-md: 10px;   /* cards, banners, event rows, inputs, tool chips */
+  --nb-radius-lg: 14px;   /* chat bubbles */
+  --nb-radius-full: 9999px;
+
+  /* ========================================
+     ARTIFACT
+     ======================================== */
+  --nb-artifact-bg: #ffffff;
 
   /* ========================================
      PRIMARY ACCENT — Teal (bot heartbeat)
@@ -50,13 +85,27 @@
   --nb-purple: #a371d9;
   --nb-purple-muted: rgba(163, 113, 217, 0.15);
 
+  /* ========================================
+     SOFT STATUS CHIPS — tinted chip pairs: background at ~14-16% alpha of
+     the semantic color, text at full strength, dot solid. ok (green),
+     danger (red), warn (amber, pending/consent states).
+     ======================================== */
+  --nb-chip-ok-bg: rgba(63, 185, 80, 0.14);
+  --nb-chip-ok-fg: var(--nb-green);
+  --nb-chip-danger-bg: rgba(248, 81, 73, 0.16);
+  --nb-chip-danger-fg: var(--nb-danger);
+  --nb-chip-warn-bg: rgba(210, 153, 34, 0.14);
+  --nb-chip-warn-fg: var(--nb-warning);
+
   --nb-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
   /* ========================================
      IONIC OVERRIDES
      ======================================== */
   --ion-background-color: var(--nb-bg-deepest);
+  --ion-background-color-rgb: 18, 23, 29;
   --ion-text-color: var(--nb-text-primary);
+  --ion-text-color-rgb: 232, 238, 245;
 
   --ion-color-primary: var(--nb-teal);
   --ion-color-primary-rgb: 62, 184, 160;
@@ -108,7 +157,7 @@
   --ion-card-color: var(--nb-text-primary);
 
   --ion-tab-bar-background: var(--nb-bg-deep);
-  --ion-tab-bar-color: var(--nb-text-muted);
+  --ion-tab-bar-color: var(--nb-text-secondary);
   --ion-tab-bar-color-selected: var(--nb-teal);
 
   --ion-content-background-alt: var(--nb-bg-deep);
@@ -116,20 +165,66 @@
 
 /* Neutral-scheme step grid so chips/toasts look right in system light mode too. */
 @media (prefers-color-scheme: light) {
-  :root {
+  :root,
+  :root.md,
+  :root.ios {
     --ion-background-color: #f6f7f9;
+    --ion-background-color-rgb: 246, 247, 249;
     --ion-text-color: #1b2430;
+    --ion-text-color-rgb: 27, 36, 48;
 
     --ion-toolbar-background: #ffffff;
     --ion-toolbar-color: #1b2430;
     --ion-item-background: #ffffff;
     --ion-card-background: #ffffff;
     --ion-tab-bar-background: #ffffff;
-    --ion-tab-bar-color: #6b7685;
+    --ion-tab-bar-color: var(--nb-text-secondary);
 
+    --nb-text-primary: #1b2430;
+    --nb-text-secondary: #4a5768;
+    --nb-text-muted: #5b6470;
     --nb-bg-surface: #ffffff;
     --nb-bg-deep: #eef1f5;
+    --nb-bg-elevated: #eef1f5;
+    --nb-bg-hover: #dfe4ea;
     --nb-border-subtle: #e3e8ee;
     --nb-border-default: #d0d7de;
+    --nb-border-strong: #b6bfcc;
   }
+}
+
+/* ========================================
+   CARD & COMPONENT NORMALIZERS
+   ======================================== */
+ion-card {
+  margin: 0;
+  border-radius: var(--nb-radius-md);
+}
+
+ion-card-header {
+  padding: var(--nb-space-3) var(--nb-space-3) 0;
+}
+
+ion-card-content {
+  padding: 0 var(--nb-space-3) var(--nb-space-3);
+}
+
+ion-button {
+  margin: 0;
+}
+
+.nb-content > ion-card {
+  margin-top: var(--nb-space-4);
+}
+
+.nb-content > ion-card:first-child {
+  margin-top: 0;
+}
+
+/* ========================================
+   FOCUS VISIBILITY
+   ======================================== */
+:focus-visible {
+  outline: 2px solid var(--nb-info);
+  outline-offset: 2px;
 }

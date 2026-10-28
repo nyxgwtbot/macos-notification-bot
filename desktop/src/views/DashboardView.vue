@@ -1,8 +1,17 @@
 <template>
   <ion-page>
     <ion-header>
-      <ion-toolbar>
-        <ion-title>Painel</ion-title>
+      <ion-toolbar class="nb-page-header">
+        <!-- R8: the page title is a real heading (level 1) — the shared
+             .nb-page-header pattern's a11y contract, kept in every view -->
+        <ion-title role="heading" aria-level="1">Status</ion-title>
+        <!-- S2: page header row carries the feed liveness badge inline (title at
+             fs-title-lg + badge on ONE row; shared pattern lands in X1).
+             R8: one shared badge wording app-wide — "Live" + a tooltip that
+             reads the real cadence from this poller's config (FEED_POLL_MS). -->
+        <div slot="end" class="nb-head-end">
+          <LiveBadge :interval-ms="FEED_POLL_MS" :error="store.feedError" />
+        </div>
       </ion-toolbar>
     </ion-header>
 
@@ -12,115 +21,302 @@
         <ion-spinner v-if="store.feedLoading" name="crescent" />
         <ion-icon aria-hidden="true" :icon="cloudOfflineOutline" />
         <span>API offline: {{ store.feedError }}</span>
-        <ion-button size="small" fill="outline" @click="retryPolls">Tentar de novo</ion-button>
+        <ion-button size="small" fill="outline" @click="retryPolls">Retry</ion-button>
       </div>
 
       <div class="nb-cards">
         <!-- Daemon card: process managed by Electron main (not via the API) -->
         <ion-card>
-          <ion-card-header>
-            <ion-card-title>Daemon do bot</ion-card-title>
-            <ion-badge :color="daemonBadgeColor">{{ daemonBadgeText }}</ion-badge>
+          <ion-card-header class="nb-card-head">
+            <ion-card-title>Daemon</ion-card-title>
+            <!-- S1: compact status chip (dot + label) right-aligned, not a full-width pill -->
+            <span class="nb-status-chip" :class="'nb-status-' + daemonChipTone">
+              <i class="nb-dot" aria-hidden="true"></i>{{ daemonBadgeText }}
+            </span>
           </ion-card-header>
           <ion-card-content>
             <template v-if="store.daemon">
               <div class="nb-kv"><span>PID</span><strong>{{ store.daemon.pid ?? '—' }}</strong></div>
               <div class="nb-kv"><span>Uptime</span><strong>{{ formatUptime(store.daemon.uptimeSec) || '—' }}</strong></div>
-              <div class="nb-kv"><span>Iniciado</span><strong>{{ formatIsoShort(store.daemon.startedAt) || '—' }}</strong></div>
-              <div class="nb-kv"><span>Porta API</span><strong>{{ store.daemon.port ?? '—' }}</strong></div>
-              <div class="nb-kv"><span>Adotado</span><strong>{{ store.daemon.adopted ? 'sim (instância externa)' : 'não (gerenciado aqui)' }}</strong></div>
-              <div v-if="store.daemon.lastError" class="nb-error-line">Erro: {{ store.daemon.lastError }}</div>
+              <!-- R2: the stamp stays the primary value, with the live age as
+                   a fs-micro muted secondary hanging under it -->
+              <div class="nb-kv">
+                <span>Started</span>
+                <span class="nb-kv-stack">
+                  <strong :title="formatIsoShort(store.daemon.startedAt) || undefined">{{ formatIsoShort(store.daemon.startedAt) || '—' }}</strong>
+                  <span v-if="daemonStartedAge" class="nb-age-secondary">{{ daemonStartedAge }}</span>
+                </span>
+              </div>
+              <div class="nb-kv"><span>API port</span><strong>{{ apiPortDisplay }}</strong></div>
+              <div class="nb-kv"><span>Adopted</span><strong>{{ store.daemon.adopted ? 'yes (external instance)' : 'no (managed here)' }}</strong></div>
+              <!-- R6: the shared .nb-error-line clamps to 2 lines; the full
+                   text survives as the hover/focus title -->
+              <div
+                v-if="store.daemon.lastError"
+                class="nb-error-line"
+                :title="'Error: ' + store.daemon.lastError"
+              >
+                Error: {{ store.daemon.lastError }}
+              </div>
             </template>
             <template v-else>
               <p class="nb-muted">
-                {{ store.daemonError === 'bridge-ausente' ? 'Process manager indisponível no modo navegador (vite). Gerencie o daemon via `python3 bot.py`.' : store.daemonError || 'Sem status do daemon.' }}
+                {{ store.daemonError === 'bridge-ausente' ? 'Process manager unavailable in browser mode (vite). Manage the daemon via `python3 bot.py`.' : store.daemonError || 'No daemon status.' }}
               </p>
             </template>
-            <ion-button
-              size="small"
-              fill="outline"
-              :disabled="store.daemonBusy || !daemonBridge"
-              @click="onRestartDaemon"
-            >
-              <ion-spinner v-if="store.daemonBusy" name="crescent" />
-              <template v-else>Reiniciar daemon</template>
-            </ion-button>
+            <div class="nb-card-footer">
+              <!-- dangerous action made hard: two clicks 3s apart; click 1 arms,
+                   expiry disarms silently, only click 2 restarts -->
+              <ion-button
+                size="small"
+                fill="outline"
+                class="nb-restart-btn"
+                :class="{ 'nb-restart-armed': restartArmed }"
+                :disabled="store.daemonBusy || !daemonBridge"
+                @click="onRestartDaemon"
+              >
+                <!-- R6: the arm flip ("Restart daemon" -> "Confirm restart?")
+                     is announced politely; the span persists so the flip is
+                     a text change on a stable live node -->
+                <span aria-live="polite">
+                  <ion-spinner v-if="store.daemonBusy" name="crescent" />
+                  <template v-else>{{ restartArmed ? 'Confirm restart?' : 'Restart daemon' }}</template>
+                </span>
+              </ion-button>
+            </div>
           </ion-card-content>
         </ion-card>
 
         <!-- Health card: watermark + state + ollama (from GET /api/health) -->
         <ion-card>
-          <ion-card-header>
-            <ion-card-title>Estado do bot</ion-card-title>
-            <ion-badge :color="store.healthError ? 'danger' : 'success'">
-              {{ store.healthError ? 'erro' : 'ok' }}
-            </ion-badge>
+          <ion-card-header class="nb-card-head">
+            <ion-card-title>Bot state</ion-card-title>
+            <span class="nb-status-chip" :class="'nb-status-' + healthChipTone">
+              <i class="nb-dot" aria-hidden="true"></i>{{ store.healthError ? 'error' : 'ok' }}
+            </span>
           </ion-card-header>
           <ion-card-content>
             <template v-if="store.health">
-              <div class="nb-kv"><span>Watermark (last_rec_id)</span><strong>{{ store.health.watermark.last_rec_id }}</strong></div>
-              <div class="nb-kv"><span>Último ciclo (state.updated_at)</span><strong>{{ formatIsoShort(store.health.watermark.updated_at) || '—' }}</strong></div>
-              <div class="nb-kv"><span>Ollama</span><strong>{{ store.health.ollama.url }}</strong></div>
-              <div class="nb-kv"><span>Modelo</span><strong>{{ store.health.ollama.model }}</strong></div>
-              <div class="nb-kv"><span>Log</span><strong>{{ formatBytes(store.health.log.bytes) }} · v{{ store.health.bot_version }}/api v{{ store.health.api_version }}</strong></div>
-              <div class="nb-kv"><span>Finance</span><strong>{{ store.health.finance.enabled ? (store.health.finance.db_exists ? 'habilitado' : 'habilitado (sem ledger)') : 'desabilitado' }}</strong></div>
+              <div class="nb-kv"><span title="last_rec_id">Watermark</span><strong>{{ store.health.watermark.last_rec_id }}</strong></div>
+              <!-- R2: the AGE is the live value (recomputed on each 2s poll
+                   tick via nowMs); the absolute stamp survives as tooltip -->
+              <div class="nb-kv">
+                <span title="state.updated_at">Last cycle</span>
+                <strong :title="formatIsoShort(store.health.watermark.updated_at) || undefined">{{ lastCycleAge || '—' }}</strong>
+              </div>
+              <div class="nb-kv nb-kv-tech"><span>Ollama</span><strong :title="store.health.ollama.url">{{ store.health.ollama.url }}</strong></div>
+              <div class="nb-kv nb-kv-tech"><span>Model</span><strong :title="store.health.ollama.model">{{ store.health.ollama.model }}</strong></div>
+              <!-- R2 split: the log size is one row (value only), versions
+                   read as their own row instead of a cryptic cram suffix -->
+              <div class="nb-kv"><span>Log</span><strong>{{ formatBytes(store.health.log.bytes) }}</strong></div>
+              <div class="nb-kv"><span>Version</span><strong>{{ store.health.bot_version }} (api v{{ store.health.api_version }})</strong></div>
+              <div class="nb-kv"><span>Finance</span><strong>{{ store.health.finance.enabled ? (store.health.finance.db_exists ? 'enabled' : 'enabled (no ledger)') : 'disabled' }}</strong></div>
             </template>
             <template v-else>
               <p class="nb-muted">
                 <ion-spinner v-if="store.healthLoading" name="crescent" />
-                <span v-else>Sem resposta de /api/health{{ store.healthError ? `: ${store.healthError}` : '…' }}</span>
+                <span v-else>No response from /api/health{{ store.healthError ? `: ${store.healthError}` : '…' }}</span>
               </p>
             </template>
           </ion-card-content>
         </ion-card>
       </div>
 
+      <!-- R6: feed activity for AT — a visually-hidden polite region fed by
+           the events-length delta; the list itself stays non-live (an
+           aria-live list at the 2s poll cadence would spam announcements) -->
+      <p class="nb-sr-only" aria-live="polite">{{ srFeedAnnouncement }}</p>
+
       <!-- Live feed -->
       <div class="nb-feed-header">
-        <h2>Eventos ao vivo</h2>
-        <ion-badge :color="store.feedError ? 'danger' : 'primary'">
-          <ion-icon aria-hidden="true" :icon="pulseOutline" />
-          {{ store.feedError ? 'offline' : 'a cada 2s' }}
-        </ion-badge>
+        <h2>Live events</h2>
+        <!-- feed kind filter chips: they filter ONLY this feed (server-side
+             `kind=` on /api/events, full reload per change), so they live on
+             the feed header row, not at the page top; shared .nb-filter-chips
+             container wraps them on narrow widths -->
+        <div class="nb-filter-chips" role="group" aria-label="Filter events by kind">
+          <button
+            v-for="option in EVENT_KIND_OPTIONS"
+            :key="option.value"
+            type="button"
+            class="nb-filter-chip"
+            :data-active="store.feedKind === option.value"
+            :aria-pressed="store.feedKind === option.value"
+            @click="onKindChange(option.value)"
+          >
+            {{ option.label }}
+          </button>
+        </div>
       </div>
+
+      <!-- R2 finding 4: all-startup feed cue — the filtered feed has zero
+           macOS notification events yet (startup lines only), so the user
+           hasn't seen the full notification flow; static EN copy -->
+      <p v-if="showStartupHint" class="nb-feed-hint">
+        Nothing from macOS yet — send a test notification from Chat to see the full flow.
+      </p>
 
       <ion-spinner v-if="store.feedLoading && store.events.length === 0" name="crescent" class="nb-center" />
 
       <p v-else-if="!store.apiDown && store.events.length === 0" class="nb-empty">
-        Nenhum evento ainda — o bot ainda não registrou nenhuma notificação. Use a aba <strong>Config</strong> para regras ou espere um evento do macOS.
+        No events yet — the bot hasn't recorded a notification. Ask the bot in <strong>Chat</strong>, or wait for a macOS event.
       </p>
 
-      <div v-if="store.events.length > 0" class="nb-feed">
-        <div v-for="row in feedRows" :key="row.key" class="nb-event" :class="{ 'nb-event-startup': row.kind === 'startup' }">
-          <div class="nb-event-top">
-            <span class="nb-app">{{ row.app }}</span>
-            <span class="nb-when">{{ formatIsoShort(row.timestamp) }}</span>
-            <span v-if="row.recId !== null" class="nb-recid">rec_id {{ row.recId }}</span>
+      <!-- R6: entrance motion (130ms fade/slide-in for newly appended rows,
+           keyed on row.key) + aria-busy while the kind-filter reload polls;
+           reduced-motion users get neither motion nor scroll anims via the
+           app-wide gate in theme/nb-shared.css -->
+      <TransitionGroup
+        v-if="store.events.length > 0"
+        tag="div"
+        name="nb-event-enter"
+        class="nb-feed"
+        :aria-busy="store.feedLoading"
+      >
+        <template v-for="item in feedItems" :key="item.key">
+          <!-- S5: digest summary row for consecutive runs of >= 3 bare startup rows -->
+          <div
+            v-if="item.kind === 'startup-digest'"
+            class="nb-event nb-event-digest"
+            :class="{ 'nb-event-open': expandedRows.has('digest:' + item.key) }"
+            role="button"
+            tabindex="0"
+            :aria-expanded="expandedRows.has('digest:' + item.key)"
+            :aria-label="item.count + ' daemon starts, latest ' + item.latestRel"
+            @click="toggleExpand('digest:' + item.key)"
+            @keydown.enter.prevent="toggleExpand('digest:' + item.key)"
+            @keydown.space.prevent="toggleExpand('digest:' + item.key)"
+          >
+            <div class="nb-event-top">
+              <ion-icon class="nb-event-chev" aria-hidden="true" :icon="chevronForwardOutline" />
+              <span class="nb-kind nb-kind-startup" aria-hidden="true">
+                <ion-icon :icon="timeOutline" />
+              </span>
+              <span class="nb-digest-label">
+                <strong>{{ item.count }}</strong> daemon starts · latest {{ item.latestRel }}
+              </span>
+            </div>
+            <!-- Expand: inline run of existing nb-event rows -->
+            <div v-if="expandedRows.has('digest:' + item.key)" class="nb-digest-rows" @click.stop @keydown.stop>
+              <div
+                v-for="row in item.rows"
+                :key="row.key"
+                class="nb-event nb-event-startup"
+                :class="{ 'nb-event-open': expandedRows.has(row.key) }"
+                role="button"
+                tabindex="0"
+                :aria-expanded="expandedRows.has(row.key)"
+                :aria-label="'Expand raw payload for ' + (row.app || row.kind)"
+                @click="toggleExpand(row.key)"
+                @keydown.enter.prevent="toggleExpand(row.key)"
+                @keydown.space.prevent="toggleExpand(row.key)"
+              >
+                <div class="nb-event-top">
+                  <ion-icon class="nb-event-chev" aria-hidden="true" :icon="chevronForwardOutline" />
+                  <span class="nb-kind nb-kind-startup" aria-hidden="true">
+                    <ion-icon :icon="timeOutline" />
+                  </span>
+                  <span class="nb-when">{{ formatIsoShort(row.timestamp) }}</span>
+                  <span v-if="row.relText" class="nb-when nb-when-rel">{{ row.relText }}</span>
+                  <span v-if="row.recId !== null" class="nb-recid">rec_id {{ row.recId }}</span>
+                </div>
+                <!-- expand: raw event payload -->
+                <div
+                  v-if="expandedRows.has(row.key)"
+                  class="nb-event-raw"
+                  role="region"
+                  :aria-label="'Raw payload for ' + (row.app || row.kind)"
+                  @click.stop
+                  @keydown.stop
+                >
+                  <button class="nb-raw-copy" aria-label="Copy raw payload" @click="copyRaw(row)">
+                    <ion-icon aria-hidden="true" :icon="copyOutline" />
+                    <span v-if="copiedKey === row.key" class="nb-raw-copied">Copied</span>
+                  </button>
+                  <span v-if="expandedRowCaption(row)" class="nb-event-raw-source">{{ expandedRowCaption(row) }}</span>
+                  <pre class="nb-event-raw-text">{{ rawPreview(row).text }}</pre>
+                  <span v-if="rawPreview(row).truncatedChars > 0" class="nb-event-raw-note">
+                    … {{ rawPreview(row).truncatedChars }} chars trimmed (2 KB display cap) — copy takes the full payload
+                  </span>
+                </div>
+              </div>
+            </div>
           </div>
-          <div class="nb-event-title">{{ row.kind === 'startup' ? 'inicialização' : row.title || '(sem título)' }}</div>
-          <template v-if="row.kind === 'notification'">
-            <div class="nb-event-summary">{{ row.summary }}</div>
-            <div class="nb-chips">
-              <ion-chip :color="categoryColor">{{ row.category }}</ion-chip>
-              <ion-chip :color="urgencyColor(row.urgency)">{{ row.urgency }}</ion-chip>
-              <ion-badge v-if="row.layer" :color="layerBadgeColor(row.layer)" class="nb-badge">{{ row.layerLabel }}</ion-badge>
-              <ion-badge v-if="row.ruleMatched" color="secondary" class="nb-badge">regra: {{ row.ruleMatched }}</ion-badge>
-              <ion-badge v-if="row.confidencePct" color="tertiary" class="nb-badge">confiança {{ row.confidencePct }}</ion-badge>
-              <ion-badge v-if="row.telegramStatus" :color="telegramBadgeColor(row.telegramStatus)" class="nb-badge">telegram {{ row.telegramStatus }}</ion-badge>
-              <ion-badge v-if="row.financeStatus" :color="financeBadgeColor(row.financeStatus)" class="nb-badge">finance {{ row.financeStatus }}</ion-badge>
+
+          <!-- Normal Event Row (notifications or 1-2 startup rows) -->
+          <div
+            v-else
+            class="nb-event"
+            :class="{ 'nb-event-startup': item.kind === 'startup', 'nb-event-open': expandedRows.has(item.key) }"
+            role="button"
+            tabindex="0"
+            :aria-expanded="expandedRows.has(item.key)"
+            :aria-label="'Expand raw payload for ' + (item.app || item.kind)"
+            @click="toggleExpand(item.key)"
+            @keydown.enter.prevent="toggleExpand(item.key)"
+            @keydown.space.prevent="toggleExpand(item.key)"
+          >
+            <div class="nb-event-top">
+              <ion-icon class="nb-event-chev" aria-hidden="true" :icon="chevronForwardOutline" />
+              <!-- kind identity: leading tinted icon chip; R2 finding 1 — the
+                   collapsed row reads as chevron + icon + tag + timestamps and
+                   the per-row source label lives ONLY in the expanded inset -->
+              <span class="nb-kind" :class="'nb-kind-' + eventKindIdentity(item)" aria-hidden="true">
+                <ion-icon :icon="KIND_ICONS[eventKindIdentity(item)]" />
+              </span>
+              <span class="nb-when">{{ formatIsoShort(item.timestamp) }}</span>
+              <!-- relative age recomputed on every 2s feed poll tick -->
+              <span v-if="item.relText" class="nb-when nb-when-rel">{{ item.relText }}</span>
+              <span v-if="item.recId !== null" class="nb-recid">rec_id {{ item.recId }}</span>
             </div>
-            <div v-if="row.actions.length > 0" class="nb-actions">
-              <span v-for="action in row.actions" :key="action" class="nb-action">{{ action }}</span>
+            <!-- R2 finding 1: the repeated bold kind/title line is gone from the
+                 collapsed row — notifications speak with their classifier
+                 summary (better signal); the label survives as the micro
+                 caption in the expanded raw inset -->
+            <template v-if="item.kind === 'notification'">
+              <div class="nb-event-summary">{{ item.summary }}</div>
+              <div class="nb-chips">
+                <ion-chip :color="categoryColor">{{ item.category }}</ion-chip>
+                <ion-chip :color="urgencyColor(item.urgency)">{{ item.urgency }}</ion-chip>
+                <ion-badge v-if="item.layer" :color="layerBadgeColor(item.layer)" class="nb-badge">{{ item.layerLabel }}</ion-badge>
+                <ion-badge v-if="item.ruleMatched" color="secondary" class="nb-badge">rule: {{ item.ruleMatched }}</ion-badge>
+                <ion-badge v-if="item.confidencePct" color="tertiary" class="nb-badge">confidence {{ item.confidencePct }}</ion-badge>
+                <ion-badge v-if="item.telegramStatus" :color="telegramBadgeColor(item.telegramStatus)" class="nb-badge">telegram {{ item.telegramStatus }}</ion-badge>
+                <ion-badge v-if="item.financeStatus" :color="financeBadgeColor(item.financeStatus)" class="nb-badge">finance {{ item.financeStatus }}</ion-badge>
+              </div>
+              <div v-if="item.actions.length > 0" class="nb-actions">
+                <span v-for="action in item.actions" :key="action" class="nb-action">{{ action }}</span>
+              </div>
+            </template>
+            <!-- expand: raw event payload, pretty-printed, 2 KB tail-trim, full copy on hover -->
+            <div
+              v-if="expandedRows.has(item.key)"
+              class="nb-event-raw"
+              role="region"
+              :aria-label="'Raw payload for ' + (item.app || item.kind)"
+              @click.stop
+            >
+              <button class="nb-raw-copy" aria-label="Copy raw payload" @click="copyRaw(item)">
+                <ion-icon aria-hidden="true" :icon="copyOutline" />
+                <span v-if="copiedKey === item.key" class="nb-raw-copied">Copied</span>
+              </button>
+              <!-- the row label (source app + notification title) lives only in
+                   the expanded view now, as a micro caption above the raw JSON -->
+              <span v-if="expandedRowCaption(item)" class="nb-event-raw-source">{{ expandedRowCaption(item) }}</span>
+              <pre class="nb-event-raw-text">{{ rawPreview(item).text }}</pre>
+              <span v-if="rawPreview(item).truncatedChars > 0" class="nb-event-raw-note">
+                … {{ rawPreview(item).truncatedChars }} chars trimmed (2 KB display cap) — copy takes the full payload
+              </span>
             </div>
-          </template>
-        </div>
-      </div>
+          </div>
+        </template>
+      </TransitionGroup>
     </ion-content>
   </ion-page>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import {
   IonBadge,
   IonButton,
@@ -137,24 +333,140 @@ import {
   IonTitle,
   IonToolbar
 } from '@ionic/vue';
-import { cloudOfflineOutline, pulseOutline } from 'ionicons/icons';
+import { cashOutline, chevronForwardOutline, cloudOfflineOutline, copyOutline, notificationsOutline, timeOutline } from 'ionicons/icons';
 
 import { useBotStore } from '@/stores/bot';
 import { usePolling } from '@/composables/usePolling';
+import LiveBadge from '@/components/LiveBadge.vue';
+import { copyText } from '@/utils/clipboard';
 import { formatBytes, formatIsoShort, formatUptime } from '@/utils/time';
+import { ageLabel, formatApiPort } from '@/viewModels/statusViewModel';
+import {
+  EVENT_KIND_OPTIONS,
+  eventKindIdentity,
+  expandedRowCaption,
+  feedIsAllStartup,
+  foldStartupDigests,
+  newEventsAnnouncement,
+  payloadPreview,
+  relativeTimeLabel,
+  type EventKindIdentity,
+  type EventKindValue,
+  type EventRow,
+  type FeedItem
+} from '@/viewModels/eventViewModel';
 
 const store = useBotStore();
 
 const daemonBridge = computed(() => typeof window !== 'undefined' && !!window.notifyAPI?.daemon);
 
-const feedRows = computed(() => [...store.events].reverse());
+/** Kind identity -> leading icon (startup: clock, notification: bell,
+ * finance: cash). The identity itself is a pure view-model helper. */
+const KIND_ICONS: Record<EventKindIdentity, string> = {
+  startup: timeOutline,
+  notification: notificationsOutline,
+  finance: cashOutline
+};
 
-const daemonBadgeColor = computed(() =>
-  store.daemon?.running ? (store.daemon.adopted ? 'secondary' : 'success') : 'medium'
+/** Feed row plus the relative-age caption; recomputed against nowMs, which
+ * the 2s feed poller bumps every tick. */
+type FeedRow = EventRow & { relText: string };
+const nowMs = ref<number>(Date.now());
+const feedRows = computed<FeedRow[]>(() =>
+  [...store.events]
+    .reverse()
+    .map((row) => ({ ...row, relText: relativeTimeLabel(row.timestamp, nowMs.value) }))
 );
+
+const feedItems = computed<Array<FeedItem<FeedRow>>>(() =>
+  foldStartupDigests(feedRows.value, nowMs.value)
+);
+
+/** R2 finding 2: realtime card ages — recomputed on every 2s feed tick
+ * (nowMs), so "4s ago" -> "12s ago" reads live although health itself
+ * refreshes on the slower 5s loop. */
+const lastCycleAge = computed(() => ageLabel(store.health?.watermark.updated_at ?? '', nowMs.value));
+const daemonStartedAge = computed(() => ageLabel(store.daemon?.startedAt ?? '', nowMs.value));
+
+/** R2 finding 4: the all-startup cue renders whenever the filtered feed is
+ * non-empty and carries zero notification-kind rows (API down keeps the
+ * offline banner in charge; an empty feed keeps the plain empty state). */
+const showStartupHint = computed(() => !store.apiDown && feedIsAllStartup(store.events));
+
+/** R6 finding 2: feed activity for AT — a visually-hidden polite region fed
+ * by the events-length delta ("N new events" via newEventsAnnouncement).
+ * Growth announces; a shrink (kind-filter reload) drops the stale text and
+ * lets the reload cues (center spinner + aria-busy) carry it instead. The
+ * region is cleared then filled on the next tick so identical repeats
+ * ("1 new event" on two polls) still mutate the live node, and the fill
+ * only lands if the feed didn't change again mid-tick. */
+const srFeedAnnouncement = ref('');
+watch(
+  () => store.events.length,
+  async (len, prev) => {
+    if (len === prev) return;
+    if (len > (prev ?? 0)) {
+      const text = newEventsAnnouncement(prev ?? 0, len);
+      srFeedAnnouncement.value = '';
+      await nextTick();
+      if (store.events.length === len) srFeedAnnouncement.value = text;
+    } else {
+      srFeedAnnouncement.value = '';
+    }
+  }
+);
+
+/** Event expand state: per-row key, component-local (like the chat tool chips). */
+const expandedRows = reactive(new Set<string>());
+const copiedKey = ref<string | null>(null);
+
+function toggleExpand(key: string): void {
+  if (expandedRows.has(key)) {
+    expandedRows.delete(key);
+  } else {
+    expandedRows.add(key);
+  }
+}
+
+function rawPreview(row: EventRow) {
+  return payloadPreview(row.raw);
+}
+
+async function copyRaw(row: EventRow): Promise<void> {
+  try {
+    const text = JSON.stringify(row.raw, null, 2);
+    if (await copyText(text)) {
+      copiedKey.value = row.key;
+      window.setTimeout(() => {
+        if (copiedKey.value === row.key) copiedKey.value = null;
+      }, 1200);
+    }
+  } catch (err) {
+    console.debug('payload copy failed', err);
+  }
+}
+
+function onKindChange(kind: EventKindValue): void {
+  void store.setFeedKind(kind);
+}
+
+const apiPortDisplay = computed(() =>
+  formatApiPort({
+    daemonPort: store.daemon?.port,
+    adopted: store.daemon?.adopted,
+    hasHealth: !!store.health,
+    apiStarted: store.apiStarted,
+  })
+);
+
+/** S1: compact status chips — tone maps to quiet semantic tint classes. */
+const daemonChipTone = computed(() =>
+  store.daemon ? (store.daemon.running ? (store.daemon.adopted ? 'info' : 'ok') : 'muted') : 'muted'
+);
+const healthChipTone = computed(() => (store.healthError ? 'bad' : 'ok'));
 const daemonBadgeText = computed(() => {
-  if (store.daemon) return store.daemon.running ? (store.daemon.adopted ? 'rodando (adotado)' : 'rodando') : 'parado';
-  return store.daemonError === 'bridge-ausente' ? 'bridge ausente' : 'sem status';
+  if (store.daemon) return store.daemon.running ? (store.daemon.adopted ? 'running (adopted)' : 'running') : 'stopped';
+  return store.daemonError === 'bridge-ausente' ? 'bridge missing' : 'no status';
 });
 const categoryColor = computed(() => 'primary');
 
@@ -182,7 +494,33 @@ function financeBadgeColor(status: string): string {
   return 'success';
 }
 
-function onRestartDaemon() {
+/** Restart double-arm (S6): click 1 arms the button for 3s ("Confirm restart?",
+ * warn tint); expiry disarms silently; only click 2 fires the existing bridge
+ * restart. No server-side change — pure client guard. */
+const RESTART_ARM_MS = 3000;
+const restartArmed = ref(false);
+let restartArmTimer: number | null = null;
+
+function clearRestartArmTimer(): void {
+  if (restartArmTimer !== null) {
+    window.clearTimeout(restartArmTimer);
+    restartArmTimer = null;
+  }
+}
+
+function disarmRestart(): void {
+  restartArmed.value = false;
+  clearRestartArmTimer();
+}
+
+function onRestartDaemon(): void {
+  if (!restartArmed.value) {
+    restartArmed.value = true;
+    clearRestartArmTimer();
+    restartArmTimer = window.setTimeout(disarmRestart, RESTART_ARM_MS);
+    return;
+  }
+  disarmRestart();
   void store.restartDaemon().then(() => store.pollDaemon());
 }
 
@@ -191,7 +529,15 @@ function retryPolls() {
   void store.pollFeed();
 }
 
-const feedPoller = usePolling(() => store.pollFeed(), { intervalMs: 2000 });
+/** R8: the feed cadence as ONE const — the poller config and the "Live"
+ * badge tooltip both read it, so the badge can't drift from the real tick. */
+const FEED_POLL_MS = 2000;
+
+const feedPoller = usePolling(async () => {
+  await store.pollFeed();
+  // relative ages recompute on every 2s poll tick via the shared render clock
+  nowMs.value = Date.now();
+}, { intervalMs: FEED_POLL_MS });
 const statusPoller = usePolling(async () => {
   await Promise.all([store.loadHealth(), store.pollDaemon()]);
 }, {
@@ -206,128 +552,309 @@ onMounted(() => {
 onUnmounted(() => {
   feedPoller.stop();
   statusPoller.stop();
+  // never leave the armed restart timer running past the view lifetime
+  disarmRestart();
 });
 </script>
 
 <style scoped>
-.nb-content {
-  padding: 12px;
+/* S2: header end slot keeps the inline badge away from the window edge */
+.nb-head-end {
+  padding-inline-end: var(--nb-space-4);
 }
-.nb-offline {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 0 4px 12px;
-  padding: 10px 14px;
-  border-radius: 10px;
-  background: var(--nb-danger-muted, rgba(248, 81, 73, 0.15));
-  color: var(--ion-color-danger);
-}
+
 .nb-cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-  gap: 12px;
-  margin-bottom: 12px;
+  gap: var(--nb-space-3);
+  margin-bottom: 0;
 }
+/* S1 (iter3): ONE left-aligned header row — flex-direction: row beats
+   Ionic's :host column (which centered the title horizontally and dropped
+   the chip below it); title at fs-title 16px/600, chip adjacent with a
+   --nb-space-2 gap */
+.nb-card-head {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--nb-space-2);
+}
+.nb-card-head ion-card-title {
+  font-size: var(--nb-fs-title);
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Soft status chip + dot + tone classes live in theme/nb-shared.css so the
+   Settings connector rows share the same tinted chip system */
+
+/* armed restart: chip-warn tint pair overrides the outline button colors */
+.nb-restart-armed {
+  --background: var(--nb-chip-warn-bg);
+  --border-color: var(--nb-warning);
+  --color: var(--nb-chip-warn-fg);
+  --box-shadow: none;
+}
+
 .nb-kv {
   display: flex;
   justify-content: space-between;
-  gap: 8px;
-  font-size: 13px;
-  padding: 2px 0;
+  gap: var(--nb-space-2);
+  font-size: var(--nb-fs-secondary);
+  padding: var(--nb-space-1) 0;
 }
+/* S3: last kv row inherits the card-content 12px bottom inset like the footer */
+.nb-kv:last-child {
+  padding-bottom: 0;
+}
+/* S5: normalized kv label column so PID/watermark rows align across cards */
 .nb-kv span {
-  color: var(--nb-text-secondary, var(--ion-color-medium));
+  min-width: 160px;
+  color: var(--nb-text-secondary);
 }
-.nb-error-line {
-  margin-top: 6px;
-  font-size: 12px;
-  color: var(--ion-color-danger);
+.nb-kv strong {
+  font-weight: 600;
 }
-.nb-muted {
-  font-size: 13px;
-  color: var(--nb-text-secondary, var(--ion-color-medium));
+.nb-kv-tech strong {
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-secondary);
+  color: var(--nb-text-secondary);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+/* R2: value column that stacks the live age under the absolute stamp */
+.nb-kv-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  text-align: right;
+  min-width: 0;
+}
+.nb-age-secondary {
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-muted);
+}
+/* feed header + its kind chips share ONE row; wraps under the h2 when narrow
+   (chips use the shared .nb-filter-chips container from theme/nb-shared.css) */
 .nb-feed-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  margin: 4px 4px 10px;
+  gap: var(--nb-space-2) var(--nb-space-3);
+  margin: var(--nb-space-4) 0 var(--nb-space-2);
 }
 .nb-feed-header h2 {
   margin: 0;
-  font-size: 17px;
-}
-.nb-center {
-  display: block;
-  margin: 32px auto;
-  width: 32px;
-  height: 32px;
-}
-.nb-empty {
-  padding: 24px 8px;
-  color: var(--nb-text-secondary, var(--ion-color-medium));
-  text-align: center;
+  font-size: var(--nb-fs-title-lg);
+  font-weight: 600;
+  line-height: 1.3;
 }
 .nb-feed {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--nb-space-2);
 }
 .nb-event {
-  border: 1px solid var(--nb-border-default, #2a3544);
-  border-radius: 10px;
-  padding: 10px 12px;
+  border: 1px solid var(--nb-border-default);
+  border-radius: var(--nb-radius-md);
+  padding: var(--nb-space-2) var(--nb-space-3);
   background: var(--ion-card-background);
+  /* click-to-expand target: pointer + hover tint, collapsed height kept */
+  cursor: pointer;
+}
+.nb-event:hover {
+  border-color: var(--nb-border-strong);
+  /* R6: hover parity with the Logs rows (LogsView .nb-line:hover) */
+  background: var(--nb-bg-hover);
+}
+.nb-event:focus-visible {
+  outline: 2px solid var(--nb-info);
+  outline-offset: 2px;
+}
+/* R6: entrance for newly appended rows — 130ms fade with a 6px drop-in
+   (rows prepend newest-first, keyed on row.key); gated app-wide by the
+   prefers-reduced-motion block in theme/nb-shared.css */
+.nb-event-enter-active {
+  transition: opacity 130ms ease, transform 130ms ease;
+}
+.nb-event-enter-from {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+/* chevron in the meta gutter: rotates 90° when the row is open */
+.nb-event-chev {
+  flex: none;
+  font-size: 12px;
+  margin-top: 2px;
+  color: var(--nb-text-secondary);
+  transition: transform 120ms ease;
+}
+.nb-event-open .nb-event-chev {
+  transform: rotate(90deg);
+}
+/* expanded raw payload: elevated inset + mono micro + full-payload copy */
+.nb-event-raw {
+  position: relative;
+  margin-top: var(--nb-space-2);
+  padding: var(--nb-space-2) var(--nb-space-3);
+  border-radius: var(--nb-radius-sm);
+  background: var(--nb-bg-elevated);
+}
+/* the source label ("bot" etc.) as a micro caption, only in the expanded view */
+.nb-event-raw-source {
+  display: block;
+  margin-bottom: var(--nb-space-1);
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-muted);
+}
+.nb-event-raw-text {
+  margin: 0;
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-micro);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 240px;
+  overflow-y: auto;
+  color: var(--nb-text-primary);
+}
+.nb-event-raw-note {
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-muted);
+}
+/* copy affordance is noise at rest — same hover reveal as the log rows */
+.nb-raw-copy {
+  position: absolute;
+  top: var(--nb-space-1);
+  right: var(--nb-space-1);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nb-space-1);
+  background: none;
+  border: none;
+  color: var(--nb-text-secondary);
+  cursor: pointer;
+  padding: 2px var(--nb-space-1); /* 2px micro-inner exception */
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.nb-event-raw:hover .nb-raw-copy,
+.nb-raw-copy:focus-visible {
+  opacity: 1;
+}
+.nb-raw-copy:hover {
+  color: var(--nb-text-primary);
+}
+.nb-raw-copied {
+  font-size: var(--nb-fs-micro);
+  color: var(--ion-color-success);
 }
 .nb-event-startup {
   opacity: 0.65;
 }
 .nb-event-top {
   display: flex;
-  gap: 10px;
+  gap: var(--nb-space-2);
   align-items: baseline;
-  font-size: 12px;
-  color: var(--nb-text-secondary, var(--ion-color-medium));
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-secondary);
 }
-.nb-app {
+/* kind identity chip: leading tinted icon circle — startup slate (neutral
+   elevated), notification teal, finance green; the shared tinted-chip DNA
+   (soft ~15% alpha background, icon at full strength) */
+.nb-kind {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--nb-radius-full);
+  background: var(--nb-bg-elevated);
+  color: var(--nb-text-secondary);
+  /* center the circle against the micro text under the row's baseline layout */
+  align-self: center;
+}
+.nb-kind ion-icon {
+  font-size: 14px;
+}
+.nb-digest-label {
+  color: var(--nb-text-muted);
+}
+.nb-digest-label strong {
   font-weight: 600;
-  color: var(--nb-teal-light, var(--ion-color-primary));
+  color: var(--nb-text-primary);
+}
+.nb-digest-rows {
+  margin-top: var(--nb-space-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-space-2);
+}
+.nb-kind-notification {
+  background: var(--nb-teal-muted);
+  color: var(--nb-teal-light);
+}
+.nb-kind-finance {
+  background: var(--nb-green-muted);
+  color: var(--nb-green);
 }
 .nb-when,
 .nb-recid {
-  color: var(--nb-text-muted, var(--ion-color-medium));
+  color: var(--nb-text-secondary);
 }
-.nb-event-title {
-  font-weight: 600;
-  margin-top: 2px;
+/* R6: the meta cluster (stamp / rel age / rec_id) reads as one right-aligned
+   column — margin-left:auto on the FIRST meta element pushes the trio to the
+   far edge instead of raggedly following the kind chip */
+.nb-when {
+  margin-left: auto;
+}
+/* the relative caption reads one step quieter than the absolute stamp */
+.nb-when-rel {
+  color: var(--nb-text-muted);
+}
+/* R2 finding 4: one-line cue under the filter chips for an all-startup feed */
+.nb-feed-hint {
+  margin: 0 0 var(--nb-space-2);
+  font-size: var(--nb-fs-secondary);
+  color: var(--nb-text-muted);
 }
 .nb-event-summary {
-  color: var(--nb-text-secondary, var(--ion-color-medium));
-  font-size: 13px;
-  margin-top: 2px;
+  color: var(--nb-text-secondary);
+  font-size: var(--nb-fs-secondary);
+  margin-top: var(--nb-space-1);
+}
+/* S4: chip rhythm — one step between chip rows, one micro-gap inside;
+   ion-chip's own 4px host margins are neutralized for uniform gaps */
+.nb-chips ion-chip {
+  margin: 0;
 }
 .nb-chips {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
-  margin-top: 8px;
+  gap: var(--nb-space-1);
+  margin-top: var(--nb-space-2);
   align-items: center;
 }
 .nb-badge {
-  font-size: 11px;
+  font-size: var(--nb-fs-micro);
 }
 .nb-actions {
-  margin-top: 6px;
+  margin-top: var(--nb-space-2);
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: var(--nb-space-1);
 }
 .nb-action {
-  font-family: var(--nb-mono, monospace);
-  font-size: 11px;
-  padding: 2px 6px;
-  border-radius: 6px;
-  background: var(--nb-purple-muted, rgba(163, 113, 217, 0.15));
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-micro);
+  padding: 2px var(--nb-space-1); /* 2px micro-inner exception */
+  border-radius: var(--nb-radius-sm);
+  background: var(--nb-purple-muted);
 }
 </style>
