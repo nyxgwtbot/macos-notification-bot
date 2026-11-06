@@ -105,7 +105,7 @@
                         :icon="chevronDownOutline"
                       />
                       <span>Thinking</span>
-                      <span v-if="!expandedThinking.has(item.id)" class="nb-thinking-preview-inline">{{ thinkingTail(item.thinking) }}</span>
+                      <span v-if="!expandedThinking.has(item.id)" class="nb-thinking-preview-inline">{{ smoothProgressPreview(item.thinking) }}</span>
                     </button>
                     <button
                       type="button"
@@ -174,7 +174,7 @@
                         :icon="chevronDownOutline"
                       />
                       <span>Thinking</span>
-                      <span v-if="!expandedThinking.has(item.id)" class="nb-thinking-preview-inline">{{ thinkingTail(item.rawPartial) }}</span>
+                      <span v-if="!expandedThinking.has(item.id)" class="nb-thinking-preview-inline">{{ smoothProgressPreview(item.rawPartial) }}</span>
                     </button>
                     <button
                       type="button"
@@ -241,7 +241,7 @@
                         :icon="chevronDownOutline"
                       />
                       <span>Thinking</span>
-                      <span v-if="!expandedThinking.has(item.id)" class="nb-thinking-preview-inline">{{ thinkingTail(item.thinking) }}</span>
+                      <span v-if="!expandedThinking.has(item.id)" class="nb-thinking-preview-inline">{{ smoothProgressPreview(item.thinking) }}</span>
                     </button>
                     <button
                       type="button"
@@ -407,6 +407,7 @@ import {
   initialChatState,
   isIpcTimeout,
   reduceChat,
+  smoothProgressPreview,
   toolSummaryFromChips,
   type ChatBubble,
   type ChatEvent,
@@ -608,14 +609,6 @@ function toggleThinking(itemId: string): void {
   } else {
     expandedThinking.add(itemId);
   }
-}
-
-/** Single-line collapsed preview: the last non-empty line of the raw tail. */
-function thinkingTail(text: string): string {
-  const trimmed = text.trimEnd();
-  if (trimmed === '') return '';
-  const lines = trimmed.split('\n');
-  return lines[lines.length - 1].trim();
 }
 
 /** F3: prefill (not send) the composer draft from a suggestion and focus it. */

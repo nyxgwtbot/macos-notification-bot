@@ -234,6 +234,20 @@ export function toolSummaryFromChips(chips: ChatToolChip[]): string {
     .join(' \u00b7 ');
 }
 
+/** Smoothed single-line progress preview for a collapsed Thinking block. */
+export function smoothProgressPreview(tail: string): string {
+  // Prefer the tail of an in-stream answer string value.
+  const m = tail.match(/"answer"\s*:\s*"((?:[^"\\]|\\.)*)$/); // unterminated string tail
+  if (m) {
+    const s = m[1];
+    return s.length > 140 ? '…' + s.slice(-140) : s;
+  }
+  // Prefer an in-stream tool call name being written.
+  const t = tail.match(/"tool"\s*:\s*"([^"]{0,40})$/);
+  if (t) return `Preparing tool ${t[1]}…`;
+  return tail; // raw tail as-is (compact JSON or thinking text)
+}
+
 /** One collapsible tool-activity group for a turn's steps, ids scoped to the
  * group so they stay unique across turns. `thinking` carries the turn's
  * collapsible model output when present. */

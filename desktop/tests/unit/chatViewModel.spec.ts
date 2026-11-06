@@ -9,6 +9,7 @@ import {
   initialChatState,
   isIpcTimeout,
   reduceChat,
+  smoothProgressPreview,
   toToolChip,
   toolSummaryFromChips,
   transcriptFromRecords,
@@ -624,6 +625,40 @@ describe('IPC-timeout recovery path calls getAgentSession', () => {
     ]);
     expect(state.items[1].kind).toBe('tools');
     expect(state.artifactUrl).toBe(ARTIFACT_URL);
+  });
+});
+
+// ---- smoothProgressPreview ----
+describe('smoothProgressPreview', () => {
+  test('returns the in-progress answer text from an unterminated JSON tail', () => {
+    expect(smoothProgressPreview('{"answer": "Painel de gastos de novembro/2026 pronto!')).toBe(
+      'Painel de gastos de novembro/2026 pronto!',
+    );
+  });
+
+  test('keeps the last 140 characters with an ellipsis when the in-progress answer is longer', () => {
+    const body = 'x'.repeat(160);
+    expect(smoothProgressPreview(`{"answer": "${body}`)).toBe(`…${body.slice(-140)}`);
+  });
+
+  test('passes a complete JSON line through unchanged', () => {
+    expect(smoothProgressPreview('{"answer": "done"}')).toBe('{"answer": "done"}');
+  });
+
+  test('announces the tool name being streamed', () => {
+    expect(smoothProgressPreview('{"tool": "query_data')).toBe('Preparing tool query_data…');
+  });
+
+  test('passes plain thinking text through unchanged', () => {
+    expect(smoothProgressPreview('weighing the options')).toBe('weighing the options');
+  });
+
+  test('returns an empty string for empty input', () => {
+    expect(smoothProgressPreview('')).toBe('');
+  });
+
+  test('preserves escaped characters inside the in-progress answer', () => {
+    expect(smoothProgressPreview('{"answer": "He said \\"hi')).toBe('He said \\"hi');
   });
 });
 
