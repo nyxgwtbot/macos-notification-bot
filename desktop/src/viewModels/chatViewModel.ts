@@ -234,16 +234,42 @@ export function toolSummaryFromChips(chips: ChatToolChip[]): string {
     .join(' \u00b7 ');
 }
 
+/** Unescape common JSON string escapes (\\n and \\u00XX) for display. */
+function unescapeForDisplay(s: string): string {
+  return s
+    .replace(/\\n/g, '\n')
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)));
+}
+
 /** Smoothed single-line progress preview for a collapsed Thinking block. */
-export function smoothProgressPreview(tail: string): string {
-  // Prefer the tail of an in-stream answer string value.
-  const m = tail.match(/"answer"\s*:\s*"((?:[^"\\]|\\.)*)$/); // unterminated string tail
-  if (m) {
-    const s = m[1];
+export function smoothProgressPreview(raw: string): string {
+  const tail = raw ?? '';
+  if (!tail.trim()) return '';
+  // Prefer a complete JSON object in the tail (best case: parse out the answer text).
+  try {
+    const trimmed = tail.trim();
+    const obj = JSON.parse(trimmed.startsWith('{') ? trimmed : trimmed.slice(trimmed.indexOf('{')));
+    const ans = typeof obj?.answer === 'string' ? obj.answer : null;
+    if (ans && ans.trim()) {
+      const s = unescapeForDisplay(ans.trim());
+      return s.length > 140 ? '…' + s.slice(-140) : s;
+    }
+    const tool = typeof obj?.tool === 'string' ? obj.tool : null;
+    if (tool) return `Prepared tool ${tool}`;
+  } catch {
+    // Partial or multi-part tail: fall through to regex matching below.
+  }
+  // Prefer an unterminated answer string (stream mid-write): last match, no EOF anchor.
+  const re = /"answer"\s*:\s*"((?:[^"\\]|\\.)*)/g;
+  let m: RegExpExecArray | null;
+  let last: RegExpExecArray | null = null;
+  while ((m = re.exec(tail)) !== null) last = m;
+  if (last) {
+    const s = unescapeForDisplay(last[1]);
     return s.length > 140 ? '…' + s.slice(-140) : s;
   }
   // Prefer an in-stream tool call name being written.
-  const t = tail.match(/"tool"\s*:\s*"([^"]{0,40})$/);
+  const t = /"tool"\s*:\s*"([^"]{0,40})/.exec(tail);
   if (t) return `Preparing tool ${t[1]}…`;
   return tail; // raw tail as-is (compact JSON or thinking text)
 }

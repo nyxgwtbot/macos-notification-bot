@@ -630,34 +630,52 @@ describe('IPC-timeout recovery path calls getAgentSession', () => {
 
 // ---- smoothProgressPreview ----
 describe('smoothProgressPreview', () => {
+  test('extracts the answer text from a complete persisted JSON tail (live failing case)', () => {
+    expect(
+      smoothProgressPreview('{"answer": "Painel de gastos de novembro/2026 pronto!", "urls": ["http://x"]}'),
+    ).toBe('Painel de gastos de novembro/2026 pronto!');
+  });
+
+  test('still returns the answer when the closed brace is followed by trailing garbage', () => {
+    expect(
+      smoothProgressPreview('{"answer": "Painel de gastos de novembro/2026 pronto!", "urls": ["http://x"]} {"partia'),
+    ).toBe('Painel de gastos de novembro/2026 pronto!');
+  });
+
+  test('keeps the last 140 characters with an ellipsis for an unterminated mid-stream answer', () => {
+    const body = 'x'.repeat(160);
+    expect(smoothProgressPreview(`{"answer": "${body}`)).toBe(`…${body.slice(-140)}`);
+  });
+
   test('returns the in-progress answer text from an unterminated JSON tail', () => {
     expect(smoothProgressPreview('{"answer": "Painel de gastos de novembro/2026 pronto!')).toBe(
       'Painel de gastos de novembro/2026 pronto!',
     );
   });
 
-  test('keeps the last 140 characters with an ellipsis when the in-progress answer is longer', () => {
-    const body = 'x'.repeat(160);
-    expect(smoothProgressPreview(`{"answer": "${body}`)).toBe(`…${body.slice(-140)}`);
-  });
-
-  test('passes a complete JSON line through unchanged', () => {
-    expect(smoothProgressPreview('{"answer": "done"}')).toBe('{"answer": "done"}');
+  test('unescapes newline escapes inside the answer for display', () => {
+    expect(smoothProgressPreview('{"answer": "line one\\nline two"}')).toBe('line one\nline two');
+    expect(smoothProgressPreview('{"answer": "line one\\nline two')).toBe('line one\nline two');
   });
 
   test('announces the tool name being streamed', () => {
-    expect(smoothProgressPreview('{"tool": "query_data')).toBe('Preparing tool query_data…');
+    expect(smoothProgressPreview('{"tool": "app.data')).toBe('Preparing tool app.data…');
+  });
+
+  test('reports a completed tool call from full tool JSON', () => {
+    expect(smoothProgressPreview('{"tool": "query_data"}')).toBe('Prepared tool query_data');
   });
 
   test('passes plain thinking text through unchanged', () => {
     expect(smoothProgressPreview('weighing the options')).toBe('weighing the options');
   });
 
-  test('returns an empty string for empty input', () => {
+  test('returns an empty string for empty or whitespace input', () => {
     expect(smoothProgressPreview('')).toBe('');
+    expect(smoothProgressPreview('   \n  ')).toBe('');
   });
 
-  test('preserves escaped characters inside the in-progress answer', () => {
+  test('preserves escaped quotes inside the in-progress answer', () => {
     expect(smoothProgressPreview('{"answer": "He said \\"hi')).toBe('He said \\"hi');
   });
 });
