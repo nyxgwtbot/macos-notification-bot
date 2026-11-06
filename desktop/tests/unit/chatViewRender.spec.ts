@@ -33,3 +33,24 @@ describe('ChatView composer field insets (L5-R3)', () => {
     expect(rule?.[0]).toContain('padding-inline-start: var(--nb-space-3);');
   });
 });
+
+describe('ChatView narrow rail policy (L5-R4)', () => {
+  test('has-artifact class still toggles from the railOpen binding', () => {
+    expect(CHAT_VIEW_SOURCE).toContain(
+      `:class="{ 'has-artifact': state.artifactUrl && railOpen }"`
+    );
+  });
+
+  test('below 800px the artifact rail switches to an overlay drawer (CSS-only)', () => {
+    const narrowStart = CHAT_VIEW_SOURCE.indexOf('NARROW_RAIL_MAX = 800');
+    expect(narrowStart).toBeGreaterThan(-1);
+    const narrowBlock = CHAT_VIEW_SOURCE.slice(narrowStart, CHAT_VIEW_SOURCE.indexOf('</style>'));
+    expect(narrowBlock).toContain('NARROW_RAIL_MAX = 800');
+    expect(narrowBlock).toContain('.nb-chat-layout.has-artifact');
+    expect(narrowBlock).toContain('grid-template-columns: minmax(0, 1fr);');
+    expect(narrowBlock).toContain('.nb-chat-rail');
+    expect(narrowBlock).toContain('position: absolute;');
+    expect(narrowBlock).toContain('width: min(440px, 86%);');
+    expect(narrowBlock).toContain('z-index: 10;');
+  });
+});

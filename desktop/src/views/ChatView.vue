@@ -904,6 +904,7 @@ onUnmounted(() => {
   grid-template-columns: minmax(0, 1fr);
   height: 100%;
   min-height: 0;
+  position: relative; /* narrow-mode overlay anchor for the .nb-chat-rail drawer */
 }
 
 .nb-chat-layout:not(.has-artifact) {
@@ -1601,5 +1602,25 @@ onUnmounted(() => {
   height: 100%;
   border: none;
   background: var(--nb-artifact-bg, #ffffff);
+}
+
+/* NARROW_RAIL_MAX = 800: below 800px the artifact rail becomes an overlay
+   drawer anchored to .nb-chat-layout — the chat column keeps a single
+   minmax(0, 1fr) grid track and is never crushed. Auto-open gate stays >= 900. */
+@media (max-width: 799px) {
+  .nb-chat-layout.has-artifact {
+    grid-template-columns: minmax(0, 1fr); /* single column again */
+    position: relative;
+  }
+
+  .nb-chat-rail {
+    position: absolute;
+    inset-block: 0;
+    right: 0;
+    width: min(440px, 86%);
+    z-index: 10;
+    background: var(--ion-card-background);
+    box-shadow: -8px 0 24px rgba(0, 0, 0, .35);
+  }
 }
 </style>
