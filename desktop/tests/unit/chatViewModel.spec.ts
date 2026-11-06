@@ -1,7 +1,10 @@
 import { describe, expect, test, afterEach, vi } from 'vitest';
 
 import {
+  extractToolTarget,
   formatBubbleTime,
+  formatTurnElapsed,
+  formatTurnPhase,
   iframeUrlFrom,
   initialChatState,
   isIpcTimeout,
@@ -14,7 +17,12 @@ import {
 } from '../../src/viewModels/chatViewModel';
 import { NotifyClient } from '../../src/services/notifyClient';
 import type { NotifyAPI } from '../../src/notify';
-import type { AgentRecord, AgentSessionDetail, AgentTurnResponse } from '../../src/types/bot';
+import type {
+  AgentActiveTurnResponse,
+  AgentRecord,
+  AgentSessionDetail,
+  AgentTurnResponse
+} from '../../src/types/bot';
 
 // ---- helpers -------------------------------------------------------------
 
@@ -45,9 +53,30 @@ function withState(partial: Partial<ChatState>): ChatState {
   return { ...initialChatState(), ...partial };
 }
 
-/** Compact item outline: bubble -> 'user'/'assistant'; tools -> chips count. */
+/** Compact item outline: bubble -> 'user'/'assistant'; tools -> chips count;
+ * transient progress -> 'progress' (never present after completion). */
 function outline(items: ChatTranscriptItem[]): Array<string | number> {
-  return items.map((item) => (item.kind === 'bubble' ? item.role : item.chips.length));
+  return items.map((item) => {
+    if (item.kind === 'bubble') return item.role;
+    if (item.kind === 'progress') return 'progress';
+    return item.chips.length;
+  });
+}
+
+/** Local live-turn fixture; never imported from ChatView. */
+function activeTurn(partial: Partial<AgentActiveTurnResponse> = {}): AgentActiveTurnResponse {
+  return {
+    session_id: 'sid-live',
+    phase: 'thinking',
+    attempt: 1,
+    started_at: '2026-01-01T00:00:00.000Z',
+    current_tool: null,
+    tool_started_at: null,
+    completed_tools: [],
+    raw_partial: '',
+    done: false,
+    ...partial
+  };
 }
 
 // ---- iframe allowlist -----------------------------------------------------
@@ -154,6 +183,65 @@ describe('tool chips mapping', () => {
   });
 });
 
+// ---- live turn formatting helpers ----------------------------------------
+
+describe('extractToolTarget', () => {
+  test('skips html, slices to 24 chars and falls back to empty string', () => {
+    expect(extractToolTarget(null)).toBe('');
+    expect(extractToolTarget(undefined)).toBe('');
+    expect(extractToolTarget({})).toBe('');
+    expect(extractToolTarget({ html: '<html>…</html>' })).toBe('');
+    expect(extractToolTarget({ html: '<html>', dataset: 'health' })).toBe('health');
+
+    const longTitle = 'Financial spending and summary for October 2026';
+    const target = extractToolTarget({ html: '<html>', title: longTitle });
+    expect(target).toBe(longTitle.slice(0, 24));
+    expect(target).toHaveLength(24);
+  });
+});
+
+describe('formatTurnElapsed', () => {
+  test('null/invalid timestamps render 0s', () => {
+    expect(formatTurnElapsed(null)).toBe('Working · 0s');
+    expect(formatTurnElapsed(undefined)).toBe('Working · 0s');
+    expect(formatTurnElapsed('not-a-date')).toBe('Working · 0s');
+  });
+
+  test('renders whole elapsed seconds against an explicit clock', () => {
+    const startedAt = '2026-01-01T00:00:00.000Z';
+    const parsed = Date.parse(startedAt);
+    expect(formatTurnElapsed(startedAt, parsed + 12_000)).toBe('Working · 12s');
+    expect(formatTurnElapsed(startedAt, parsed + 1_500)).toBe('Working · 1s');
+  });
+
+  test('clamps a clock ahead of startedAt to 0s', () => {
+    const startedAt = '2026-01-01T00:00:00.000Z';
+    expect(formatTurnElapsed(startedAt, Date.parse(startedAt) - 5_000)).toBe('Working · 0s');
+  });
+});
+
+describe('formatTurnPhase', () => {
+  test('maps every loop phase to human copy', () => {
+    expect(formatTurnPhase({ phase: 'thinking', attempt: 1, current_tool: null })).toBe('Thinking…');
+    expect(formatTurnPhase({ phase: 'retry', attempt: 2, current_tool: null })).toBe(
+      'Reformatting response (retry 2)'
+    );
+    expect(formatTurnPhase({ phase: 'tool', attempt: 1, current_tool: { tool: 'app.data', target: 'health' } })).toBe(
+      'Running tool app.data…'
+    );
+    expect(formatTurnPhase({ phase: 'tool', attempt: 1, current_tool: null })).toBe('Running tool…');
+    expect(formatTurnPhase({ phase: 'serving', attempt: 1, current_tool: null })).toBe('Serving dashboard…');
+    // unknown phases fall back to thinking copy
+    expect(formatTurnPhase({ phase: 'idle', attempt: 0, current_tool: null })).toBe('Thinking…');
+  });
+
+  test('clamps the retry attempt to at least 1', () => {
+    expect(formatTurnPhase({ phase: 'retry', attempt: 0, current_tool: null })).toBe(
+      'Reformatting response (retry 1)'
+    );
+  });
+});
+
 // ---- transcript interleave ------------------------------------------------
 
 describe('per-turn tool chips interleave', () => {
@@ -188,7 +276,8 @@ describe('per-turn tool chips interleave', () => {
     expect(new Set(ids).size).toBe(ids.length);
     const groupA = state.items[1];
     const groupB = state.items[4];
-    expect(groupA.kind === 'tools' && groupB.kind === 'tools' && groupA.chips[0].id).not.toBe(groupB.chips[0].id);
+    if (groupA.kind !== 'tools' || groupB.kind !== 'tools') throw new Error('expected tools groups');
+    expect(groupA.chips[0].id).not.toBe(groupB.chips[0].id);
   });
 
   test('a free-form turn (no tool steps) produces no tools group', () => {
@@ -273,6 +362,33 @@ describe('per-turn tool chips interleave', () => {
     // raw rows must not contribute items or chip ids of their own
     const ids = items.map((item) => item.id);
     expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  test('transcriptFromRecords attaches tail-capped thinking to the tools group', () => {
+    const longRaw = 'x'.repeat(500);
+    const records: AgentRecord[] = [
+      { role: 'user', content: 'q', ts: 'r1' },
+      { role: 'assistant_raw', phase: 'attempt', raw_model_output: longRaw, ts: 'raw' },
+      { role: 'assistant', tool: 'app.data', args: {}, result: {}, ts: 't1' },
+      { role: 'assistant', answer: 'ok', urls: [], ts: 'a1' }
+    ];
+    const { items } = transcriptFromRecords(records);
+    expect(outline(items)).toEqual(['user', 1, 'assistant']);
+    const group = items[1];
+    expect(group.kind === 'tools' && group.thinking).toBe(longRaw.slice(-400));
+  });
+
+  test('transcriptFromRecords attaches thinking to the answer bubble when no tools ran', () => {
+    const records: AgentRecord[] = [
+      { role: 'user', content: 'q', ts: 'r1' },
+      { role: 'assistant_raw', raw_model_output: 'reasoning ', ts: 'raw-a' },
+      { role: 'assistant_raw', raw_model_output: 'trace', ts: 'raw-b' },
+      { role: 'assistant', answer: 'ok', urls: [], ts: 'a1' }
+    ];
+    const { items } = transcriptFromRecords(records);
+    expect(outline(items)).toEqual(['user', 'assistant']);
+    const answer = items[1];
+    expect(answer.kind === 'bubble' && answer.thinking).toBe('reasoning \ntrace');
   });
 });
 
@@ -508,5 +624,179 @@ describe('IPC-timeout recovery path calls getAgentSession', () => {
     ]);
     expect(state.items[1].kind).toBe('tools');
     expect(state.artifactUrl).toBe(ARTIFACT_URL);
+  });
+});
+
+// ---- live turn-progress reducer ------------------------------------------
+
+describe('turn-progress live item', () => {
+  test('inserts the progress item after the user bubble while pending', () => {
+    let state = reduceChat(initialChatState(), { type: 'send', message: 'dashboard, por favor' });
+    state = reduceChat(state, {
+      type: 'turn-progress',
+      progress: activeTurn({
+        phase: 'tool',
+        attempt: 1,
+        current_tool: { tool: 'dashboard.create', target: 'Gastos', args: { html: '<html>', title: 'Gastos' } },
+        completed_tools: [
+          { role: 'assistant', tool: 'app.data', args: { dataset: 'health' }, result: { ok: true }, ts: 't1' },
+          {
+            role: 'assistant',
+            tool: 'dashboard.create',
+            args: { html: '<html>', title: 'Gastos' },
+            result: { artifact_id: HEX32 },
+            ts: 't2'
+          }
+        ],
+        raw_partial: '{"tool":'
+      })
+    });
+
+    expect(outline(state.items)).toEqual(['user', 'progress']);
+    const item = state.items[1];
+    expect(item.kind).toBe('progress');
+    if (item.kind !== 'progress') throw new Error('expected progress item');
+    expect(item.phase).toBe('tool');
+    expect(item.phaseLabel).toBe('Running tool dashboard.create…');
+    expect(item.attempt).toBe(1);
+    expect(item.currentTool).toEqual({ tool: 'dashboard.create', target: 'Gastos' });
+    expect(item.completedChips.map((chip) => [chip.tool, chip.target])).toEqual([
+      ['app.data', 'health'],
+      ['dashboard.create', 'Gastos']
+    ]);
+    expect(item.rawPartial).toBe('{"tool":');
+    expect(state.pending).toBe(true);
+  });
+
+  test('backend-redacted html in completed args stays opaque and never becomes the target', () => {
+    let state = reduceChat(initialChatState(), { type: 'send', message: 'dashboard' });
+    state = reduceChat(state, {
+      type: 'turn-progress',
+      progress: activeTurn({
+        phase: 'tool',
+        completed_tools: [
+          {
+            role: 'assistant',
+            tool: 'dashboard.create',
+            args: { title: 'Ops', html: '[redacted html: 4123 chars]' },
+            result: { ok: true },
+            ts: 't1'
+          }
+        ]
+      })
+    });
+
+    const item = state.items[1];
+    expect(item.kind).toBe('progress');
+    if (item.kind !== 'progress') throw new Error('expected progress item');
+    expect(item.completedChips).toHaveLength(1);
+    const [chip] = item.completedChips;
+    expect(chip.target).toBe('Ops');
+    expect(chip.ok).toBe(true);
+    expect(chip.target).not.toContain('redacted');
+    expect(chip.preview).not.toContain('redacted html');
+  });
+
+  test('updates in place, preserving the item id and last non-empty rawPartial', () => {
+    let state = reduceChat(initialChatState(), { type: 'send', message: 'go' });
+    state = reduceChat(state, {
+      type: 'turn-progress',
+      progress: activeTurn({ phase: 'thinking', raw_partial: 'partial text' })
+    });
+    const first = state.items[1];
+    expect(first.kind).toBe('progress');
+    const id = first.id;
+
+    state = reduceChat(state, {
+      type: 'turn-progress',
+      progress: activeTurn({
+        phase: 'tool',
+        current_tool: { tool: 'app.data', target: 'health' },
+        raw_partial: ''
+      })
+    });
+
+    expect(state.items).toHaveLength(2);
+    const second = state.items[1];
+    expect(second.kind).toBe('progress');
+    if (second.kind !== 'progress') throw new Error('expected progress item');
+    expect(second.id).toBe(id);
+    expect(second.rawPartial).toBe('partial text');
+    expect(second.phaseLabel).toBe('Running tool app.data…');
+  });
+
+  test('ignores late progress when the turn is no longer pending', () => {
+    const state = withState({ pending: false });
+    expect(reduceChat(state, { type: 'turn-progress', progress: activeTurn() })).toBe(state);
+  });
+
+  test('ignores a done snapshot that has no live item to update', () => {
+    const state = reduceChat(initialChatState(), { type: 'send', message: 'go' });
+    expect(
+      reduceChat(state, { type: 'turn-progress', progress: activeTurn({ phase: 'done', done: true }) })
+    ).toBe(state);
+  });
+
+  test('ignores a progress snapshot from a different session', () => {
+    const state = withState({ pending: true, sessionId: 'sid-a' });
+    expect(
+      reduceChat(state, { type: 'turn-progress', progress: activeTurn({ session_id: 'sid-b' }) })
+    ).toBe(state);
+  });
+
+  test('adopts the event session id on the item for a brand-new chat', () => {
+    let state = reduceChat(initialChatState(), { type: 'send', message: 'first turn' });
+    state = reduceChat(state, {
+      type: 'turn-progress',
+      progress: activeTurn({ session_id: 'new-sid' })
+    });
+    const item = state.items[1];
+    expect(item.kind).toBe('progress');
+    expect(item.kind === 'progress' && item.sessionId).toBe('new-sid');
+    // POST /api/agent/turn alone commits state.sessionId on success.
+    expect(state.sessionId).toBeNull();
+  });
+
+  test('turn-succeeded replaces progress with the tools group + bubble, preserving thinking', () => {
+    let state = reduceChat(initialChatState(), { type: 'send', message: 'dashboard' });
+    state = reduceChat(state, {
+      type: 'turn-progress',
+      progress: activeTurn({ phase: 'tool', raw_partial: 'thinking so far' })
+    });
+
+    const response = chainResponse();
+    state = reduceChat(state, { type: 'turn-succeeded', response });
+
+    expect(outline(state.items)).toEqual(['user', response.turn.length, 'assistant']);
+    expect(state.items.some((item) => item.kind === 'progress')).toBe(false);
+    const group = state.items[1];
+    expect(group.kind).toBe('tools');
+    expect(group.kind === 'tools' && group.thinking).toBe('thinking so far');
+  });
+
+  test('turn-succeeded attaches thinking to the bubble when the turn ran no tools', () => {
+    let state = reduceChat(initialChatState(), { type: 'send', message: 'ping' });
+    state = reduceChat(state, {
+      type: 'turn-progress',
+      progress: activeTurn({ phase: 'thinking', raw_partial: 'reasoning' })
+    });
+    state = reduceChat(state, {
+      type: 'turn-succeeded',
+      response: { session_id: 'sid', turn: [], answer: 'olá!', urls: [] }
+    });
+
+    expect(outline(state.items)).toEqual(['user', 'assistant']);
+    const answer = state.items[1];
+    expect(answer.kind === 'bubble' && answer.thinking).toBe('reasoning');
+  });
+
+  test('turn-failed removes the progress item and clears pending', () => {
+    let state = reduceChat(initialChatState(), { type: 'send', message: 'go' });
+    state = reduceChat(state, { type: 'turn-progress', progress: activeTurn() });
+    state = reduceChat(state, { type: 'turn-failed', error: 'ECONNREFUSED' });
+
+    expect(outline(state.items)).toEqual(['user']);
+    expect(state.pending).toBe(false);
+    expect(state.error).toBe('ECONNREFUSED');
   });
 });

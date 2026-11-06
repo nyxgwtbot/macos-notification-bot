@@ -53,11 +53,13 @@ stubs; the API smoke (``scripts/smoke_api.py``) uses the env hook to
 exercise the server-side pipeline without a live Ollama model.
 """
 
+import copy
 import json
 import logging
 import os
 import re
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -110,6 +112,11 @@ AUTO_COMPLETE_PHASE = "auto_complete"
 # non-transport exceptions surface immediately (hard-failure guard path).
 OLLAMA_TRANSPORT_RETRIES = 2
 OLLAMA_RETRY_BACKOFF_S = 2.0
+
+# Live turn progress side channel (GET /api/agent/active-turn): the model's
+# streamed thinking/raw tail is capped at this many chars while streaming
+# (longer buffers keep the LAST chars, ellipsis-prefixed).
+RAW_PARTIAL_MAX_CHARS = 400
 
 PROMPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_prompt.md")
 
@@ -193,6 +200,194 @@ class AgentSessionNotFound(ValueError):
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Live turn progress (in-memory side channel; additive, no disk writes)
+# ---------------------------------------------------------------------------
+
+
+def _raw_tail(text: str) -> str:
+    """Tail ``RAW_PARTIAL_MAX_CHARS`` chars of the model's raw/thinking
+    stream; longer texts keep the LAST chars prefixed with an ellipsis."""
+    if len(text) > RAW_PARTIAL_MAX_CHARS:
+        return "…" + text[-RAW_PARTIAL_MAX_CHARS:]
+    return text
+
+
+def _extract_tool_target(args: Any) -> str:
+    """First string arg value in insertion order, skipping ``html`` and
+    sliced to 24 chars — intentionally mirrors ``extractToolTarget``/toToolChip
+    in desktop/src/viewModels/chatViewModel.ts so the LIVE running chip's
+    target matches the completed chips' target. Empty string otherwise."""
+    if not isinstance(args, dict):
+        return ""
+    for key, value in args.items():
+        if key == "html":
+            continue
+        if isinstance(value, str):
+            return value[:24]
+    return ""
+
+
+def _sanitize_step_for_progress(step: dict) -> dict:
+    """Poll-sized copy of a persisted tool step: ``args`` stays a dict (so the
+    frontend toToolChip target extraction works unchanged) while its ``html``
+    VALUE collapses to the redacted short summary (no ~6 KB html echoes over
+    the poll wire); every other key/value (and the
+    ``role``/``tool``/``result``/``error``/``ts`` fields) stays verbatim."""
+    sanitized = dict(step)
+    args = step.get("args")
+    if isinstance(args, dict):
+        redacted_args = dict(args)
+        html = redacted_args.get("html")
+        if isinstance(html, str):
+            redacted_args["html"] = summarize_tool_args({"html": html})
+        sanitized["args"] = redacted_args
+    return sanitized
+
+
+class TurnProgressRegistry:
+    """One live turn progress snapshot per agent runtime, polled over HTTP
+    (``GET /api/agent/active-turn``) while ``POST /api/agent/turn`` runs on a
+    sibling ThreadingHTTPServer thread.
+
+    In-memory and transient (no SQLite/JSONL schema changes): every mutation
+    and the ``snapshot()`` read are guarded by ``self._lock`` so a concurrent
+    GET can never observe a torn ``completed_tools`` list, and ``snapshot()``
+    returns deep copies (immutable from the caller's side). ``raw_partial``
+    holds the model's LAST non-empty raw/thinking tail (capped to
+    ``RAW_PARTIAL_MAX_CHARS``, ellipsis-prefixed) so polls between LLM calls
+    still carry it. When a runtime provides no registry (None) every run_turn
+    hook is a no-op — the turn contract is unchanged.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._session_id: Optional[str] = None
+        self._phase: str = "idle"  # idle|thinking|retry|tool|serving|done
+        self._attempt: int = 0
+        self._started_at: Optional[str] = None
+        self._current_tool: Optional[dict] = None
+        self._tool_started_at: Optional[str] = None
+        self._completed_tools: List[dict] = []
+        self._raw_buffer: str = ""
+        self._raw_partial: str = ""
+        self._done: bool = False
+
+    # ---- turn lifecycle (all run_turn milestones) ----
+
+    def start_turn(self, session_id: str) -> None:
+        """Reset every piece of state for a fresh turn; the turn opens in the
+        ``thinking`` phase (attempt 1)."""
+        with self._lock:
+            self._session_id = session_id
+            self._phase = "thinking"
+            self._attempt = 1
+            self._started_at = _utcnow_iso()
+            self._current_tool = None
+            self._tool_started_at = None
+            self._completed_tools = []
+            self._raw_buffer = ""
+            self._raw_partial = ""
+            self._done = False
+
+    def begin_llm_call(self, session_id: str, phase: str = "thinking", attempt: int = 1) -> None:
+        """One LLM call boundary (``thinking`` or ``retry``): the streamed
+        buffer RESETS for the new call, but the last non-empty ``raw_partial``
+        is KEPT until new chunks arrive."""
+        with self._lock:
+            self._session_id = session_id
+            self._phase = phase
+            self._attempt = attempt
+            self._current_tool = None
+            self._tool_started_at = None
+            self._raw_buffer = ""
+
+    def append_raw_chunk(self, chunk: str) -> None:
+        """Streaming hook (Ollama NDJSON lines via _transport_post): append
+        the chunk and refresh the tail-capped ``raw_partial``. Empty/no-op
+        chunks are accepted gracefully."""
+        if not chunk:
+            return
+        with self._lock:
+            self._raw_buffer += chunk
+            self._raw_partial = _raw_tail(self._raw_buffer)
+
+    def set_raw_output(self, session_id: str, raw: str) -> None:
+        """Non-streaming LLM return (llm_fn stubs, _mock_llm, final raw):
+        cap-set ``raw_partial`` to the output tail. An empty raw leaves the
+        previous tail in place."""
+        with self._lock:
+            if raw:
+                self._session_id = session_id
+                self._raw_partial = _raw_tail(raw)
+
+    def begin_tool(self, session_id: str, tool_name: str, args: Any, phase: str = "tool") -> None:
+        """Tool dispatch boundary (``tool``, or ``serving`` for the loop's
+        auto-executed server.serve)."""
+        with self._lock:
+            self._session_id = session_id
+            self._phase = phase
+            self._current_tool = {"tool": tool_name, "target": _extract_tool_target(args)}
+            self._tool_started_at = _utcnow_iso()
+
+    def complete_tool(self, session_id: str, step: dict) -> None:
+        """Tool finished: archive the sanitized step for the completed chips
+        and clear the live running chip."""
+        with self._lock:
+            self._session_id = session_id
+            self._completed_tools.append(_sanitize_step_for_progress(step))
+            self._current_tool = None
+            self._tool_started_at = None
+
+    def finish_turn(self, session_id: str) -> None:
+        """run_turn's finally: the turn is over (success, guard answer or
+        exception) — no live tool may outlive it."""
+        with self._lock:
+            self._session_id = session_id
+            self._phase = "done"
+            self._current_tool = None
+            self._tool_started_at = None
+            self._done = True
+
+    def reset_raw_buffer(self, session_id: Optional[str] = None) -> None:
+        """Per-retry call from ``_ollama_chat``: the dead attempt's streamed
+        buffer is dropped before the next attempt; the last non-empty
+        ``raw_partial`` is preserved (same semantics as begin_llm_call)."""
+        with self._lock:
+            self._raw_buffer = ""
+
+    def snapshot(self, session_id: Optional[str] = None) -> dict:
+        """Deep-copied read-only view for the HTTP poll. When ``session_id``
+        is requested and does not match the live turn, a truthful idle/done
+        shape for the requested id is returned; with no param the live state
+        is returned (a fresh registry reads session_id=None/phase=``idle``/
+        done=False)."""
+        with self._lock:
+            if session_id is not None and session_id != self._session_id:
+                return {
+                    "session_id": session_id,
+                    "phase": "idle",
+                    "attempt": 0,
+                    "started_at": None,
+                    "current_tool": None,
+                    "tool_started_at": None,
+                    "completed_tools": [],
+                    "raw_partial": "",
+                    "done": True,
+                }
+            return {
+                "session_id": self._session_id,
+                "phase": self._phase,
+                "attempt": self._attempt,
+                "started_at": self._started_at,
+                "current_tool": copy.deepcopy(self._current_tool),
+                "tool_started_at": self._tool_started_at,
+                "completed_tools": copy.deepcopy(self._completed_tools),
+                "raw_partial": self._raw_partial,
+                "done": self._done,
+            }
 
 
 class AgentSessionStore:
@@ -577,10 +772,22 @@ def default_llm_fn(runtime: Any) -> Callable[[List[dict]], str]:
 
 
 def _transport_post(runtime: Any, messages: List[dict]) -> str:
-    """ONE POST to config.ollama.url ({model, stream:false, messages}) —
+    """ONE POST to config.ollama.url ({model, stream:true, messages}) —
     same wire format as notifybot.classifier.LLMClassifier. Raises on any
     failure; ``_ollama_chat`` layers the transport retries on top of this
-    seam (monkeypatched in tests)."""
+    seam (monkeypatched in tests).
+
+    The reply is read by LINE ITERATION: Ollama streams newline-delimited
+    JSON (one object per line; the last one carries ``"done": true``) while
+    a non-streamed body is a single full-JSON line — the same loop handles
+    both transparently. ``message.content`` is assembled and returned for
+    parse_model_json; ``message.thinking`` (fallback ``message.content``) is
+    fed into the runtime's live TurnProgressRegistry when present. urllib
+    errors propagate unchanged so ``_ollama_chat``'s retry logic stays
+    intact; every undecodable (non-UTF8), malformed-JSON, or non-object
+    (scalar/array) line is skipped (the loop is resilient, strict per-line
+    JSON is never fabricated from partial bytes).
+    """
     from notifybot.api import read_config_strict  # lazy (api wires the loop)
 
     config = read_config_strict(runtime.config_path)
@@ -588,16 +795,32 @@ def _transport_post(runtime: Any, messages: List[dict]) -> str:
     url = ollama_cfg.get("url") or "http://127.0.0.1:11434/api/chat"
     model = ollama_cfg.get("model") or "glm-5.3-flash:cloud"
     timeout = float(ollama_cfg.get("timeout", 30.0))
-    payload = {"model": model, "stream": False, "messages": messages}
+    payload = {"model": model, "stream": True, "messages": messages}
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    progress = getattr(runtime, "turn_progress", None)
+    content = ""
     with urllib.request.urlopen(request, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    return str((data.get("message") or {}).get("content", ""))
+        for raw_line in resp:
+            try:
+                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue  # undecodable/malformed line: skip it, never raise mid-stream
+            if not isinstance(obj, dict):
+                continue  # scalar/array JSON line: there is no message to read
+            msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+            content += str(msg.get("content") or "")
+            if progress is not None:
+                progress.append_raw_chunk(str(msg.get("thinking") or msg.get("content") or ""))
+    return content
 
 
 def _transport_backoff(attempt: int) -> None:
@@ -637,6 +860,14 @@ def _ollama_chat(runtime: Any, messages: List[dict]) -> str:
                 logger.warning(
                     "Agent LLM transport failure (attempt %d/%d): %s", attempt + 1, attempts, e
                 )
+                # Retry hygiene (placement: at the TOP of the retry branch, so
+                # even a stubbed _transport_backoff in tests still sees the
+                # reset): the next attempt re-streams from scratch, so drop
+                # the dead attempt's buffer while keeping the last non-empty
+                # raw_partial (same buffer semantics as begin_llm_call).
+                progress = getattr(runtime, "turn_progress", None)
+                if progress is not None:
+                    progress.reset_raw_buffer()
                 _transport_backoff(attempt + 1)
     assert last_exc is not None  # loop always sets it before exhausting
     raise last_exc
@@ -901,197 +1132,230 @@ def run_turn(
     # the plain grounded prompt.
     had_prior_history = len(records) > 0
 
+    # Live turn progress (additive, in-memory; without a registry on the
+    # runtime every hook below is inert). Resolved BEFORE the wrapped region
+    # so the finally below always references a bound name — a NameError
+    # inside a finally would mask the original exception otherwise.
+    progress = getattr(runtime, "turn_progress", None)
+
     user_record = {"role": "user", "content": message}
     store.append(session_id, user_record)
     records.append(user_record)
+    if progress is not None:
+        progress.start_turn(session_id)
 
-    resolve_llm = llm_fn if llm_fn is not None else default_llm_fn(runtime)
-    system_prompt = grounded_system_prompt()
-    if had_prior_history:
-        system_prompt = system_prompt + "\n" + STANDING_PROTOCOL_REMINDER
-    registry = _tool_registry_for(runtime)
+    # Every code path below (budget break, llm_down break, unparsable,
+    # max_turns, synthesis, return) exits through this finally, so the live
+    # turn ALWAYS finalizes with done=True — including the raise paths of
+    # resolve_llm/registry resolution.
+    try:
+        resolve_llm = llm_fn if llm_fn is not None else default_llm_fn(runtime)
+        system_prompt = grounded_system_prompt()
+        if had_prior_history:
+            system_prompt = system_prompt + "\n" + STANDING_PROTOCOL_REMINDER
+        registry = _tool_registry_for(runtime)
 
-    started = time.monotonic()
-    turn_steps: List[dict] = []
-    answer_text: Optional[str] = None
-    urls: List[str] = []
-    model_answered = False
+        started = time.monotonic()
+        turn_steps: List[dict] = []
+        answer_text: Optional[str] = None
+        urls: List[str] = []
+        model_answered = False
 
-    budget_answer = (
-        f"Desculpe, a operação excedeu o tempo limite interno ({int(TURN_BUDGET_S)}s) "
-        "e foi interrompida no meio. Tente um pedido mais simples ou repita o pedido."
-    )
-    llm_down_answer = (
-        "Desculpe, não consegui falar com o modelo de IA agora. Verifique se o Ollama "
-        "está rodando e tente novamente em instantes."
-    )
-
-    for turn_index in range(MAX_TOOL_TURNS):
-        if time.monotonic() - started > TURN_BUDGET_S:
-            answer_text = budget_answer
-            break
-
-        continuation = continuation_reminder_for(records)
-        extra_messages: List[dict] = []
-        if continuation is not None:
-            # Recipe re-anchoring: right after a successful dashboard.create
-            # the next prompt carries the exact server.serve continuation.
-            extra_messages.append({"role": "user", "content": continuation})
-
-        try:
-            raw = resolve_llm(build_context(system_prompt, records) + extra_messages)
-        except Exception as e:  # noqa: BLE001 - graceful LLM failure, never a 500
-            logger.warning("Agent LLM call failed: %s", e)
-            answer_text = llm_down_answer
-            break
-
-        # Observability: persist the RAW output of every LLM call before
-        # parsing (phase-tagged; cap ~8 KB) so drift post-mortems use real data.
-        store.append(
-            session_id,
-            {
-                "role": "assistant_raw",
-                "phase": "attempt",
-                "raw_model_output": truncate_raw_model_output(str(raw)),
-            },
+        budget_answer = (
+            f"Desculpe, a operação excedeu o tempo limite interno ({int(TURN_BUDGET_S)}s) "
+            "e foi interrompida no meio. Tente um pedido mais simples ou repita o pedido."
+        )
+        llm_down_answer = (
+            "Desculpe, não consegui falar com o modelo de IA agora. Verifique se o Ollama "
+            "está rodando e tente novamente em instantes."
         )
 
-        parsed = parse_model_json(raw)
-        if parsed is None:
-            # One retry, not persisted to the session. When the drift happened
-            # right after dashboard.create, the retry re-anchors with the
-            # targeted continuation recipe instead of the generic reminder.
-            retry_tail = continuation if continuation is not None else PROTOCOL_REMINDER
+        for turn_index in range(MAX_TOOL_TURNS):
+            if time.monotonic() - started > TURN_BUDGET_S:
+                answer_text = budget_answer
+                break
+
+            continuation = continuation_reminder_for(records)
+            extra_messages: List[dict] = []
+            if continuation is not None:
+                # Recipe re-anchoring: right after a successful dashboard.create
+                # the next prompt carries the exact server.serve continuation.
+                extra_messages.append({"role": "user", "content": continuation})
+
+            if progress is not None:
+                progress.begin_llm_call(session_id, phase="thinking", attempt=1)
             try:
-                retry_raw = resolve_llm(
-                    build_context(system_prompt, records) + [{"role": "user", "content": retry_tail}]
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Agent LLM protocol-retry failed: %s", e)
+                raw = resolve_llm(build_context(system_prompt, records) + extra_messages)
+            except Exception as e:  # noqa: BLE001 - graceful LLM failure, never a 500
+                logger.warning("Agent LLM call failed: %s", e)
                 answer_text = llm_down_answer
                 break
+
+            if progress is not None:
+                progress.set_raw_output(session_id, str(raw))
+
+            # Observability: persist the RAW output of every LLM call before
+            # parsing (phase-tagged; cap ~8 KB) so drift post-mortems use real data.
             store.append(
                 session_id,
                 {
                     "role": "assistant_raw",
-                    "phase": "protocol_retry",
-                    "raw_model_output": truncate_raw_model_output(str(retry_raw)),
+                    "phase": "attempt",
+                    "raw_model_output": truncate_raw_model_output(str(raw)),
                 },
             )
-            parsed = parse_model_json(retry_raw)
+
+            parsed = parse_model_json(raw)
             if parsed is None:
-                answer_text = (
-                    "Desculpe, o modelo não respondeu no formato JSON esperado duas vezes "
-                    "seguidas. A conversa continua salva — tente reformular o pedido."
+                # One retry, not persisted to the session. When the drift happened
+                # right after dashboard.create, the retry re-anchors with the
+                # targeted continuation recipe instead of the generic reminder.
+                retry_tail = continuation if continuation is not None else PROTOCOL_REMINDER
+                if progress is not None:
+                    progress.begin_llm_call(session_id, phase="retry", attempt=1)
+                try:
+                    retry_raw = resolve_llm(
+                        build_context(system_prompt, records) + [{"role": "user", "content": retry_tail}]
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Agent LLM protocol-retry failed: %s", e)
+                    answer_text = llm_down_answer
+                    break
+                if progress is not None:
+                    progress.set_raw_output(session_id, str(retry_raw))
+                store.append(
+                    session_id,
+                    {
+                        "role": "assistant_raw",
+                        "phase": "protocol_retry",
+                        "raw_model_output": truncate_raw_model_output(str(retry_raw)),
+                    },
                 )
-                break
+                parsed = parse_model_json(retry_raw)
+                if parsed is None:
+                    answer_text = (
+                        "Desculpe, o modelo não respondeu no formato JSON esperado duas vezes "
+                        "seguidas. A conversa continua salva — tente reformular o pedido."
+                    )
+                    break
 
-        if "tool" in parsed:
-            if time.monotonic() - started > TURN_BUDGET_S:
-                answer_text = budget_answer
-                break
-            tool_name = parsed["tool"]
-            tool_args = parsed.get("args", {})
-            error: Optional[str] = None
-            result: Optional[dict] = None
-            if registry is None:
-                error = "tool registry unavailable"
-            else:
-                dispatched = registry.dispatch(
-                    tool_name, tool_args, ctx={"turn_index": turn_index, "session_id": session_id}
-                )
-                if isinstance(dispatched, dict) and "error" in dispatched:
-                    error = str(dispatched["error"])
-                elif isinstance(dispatched, dict):
-                    result = dispatched
+            if "tool" in parsed:
+                if time.monotonic() - started > TURN_BUDGET_S:
+                    answer_text = budget_answer
+                    break
+                tool_name = parsed["tool"]
+                tool_args = parsed.get("args", {})
+                if progress is not None:
+                    progress.begin_tool(session_id, tool_name, tool_args, phase="tool")
+                error: Optional[str] = None
+                result: Optional[dict] = None
+                if registry is None:
+                    error = "tool registry unavailable"
                 else:
-                    error = f"invalid tool result: {dispatched!r}"
-            step: dict = {"role": "assistant", "tool": tool_name, "args": tool_args}
-            if error is None:
-                step["result"] = result
-            else:
-                step["error"] = error
-            store.append(session_id, step)  # append stamps the shared ts
-            records.append(step)
-            turn_steps.append(step)
+                    dispatched = registry.dispatch(
+                        tool_name, tool_args, ctx={"turn_index": turn_index, "session_id": session_id}
+                    )
+                    if isinstance(dispatched, dict) and "error" in dispatched:
+                        error = str(dispatched["error"])
+                    elif isinstance(dispatched, dict):
+                        result = dispatched
+                    else:
+                        error = f"invalid tool result: {dispatched!r}"
+                step: dict = {"role": "assistant", "tool": tool_name, "args": tool_args}
+                if error is None:
+                    step["result"] = result
+                else:
+                    step["error"] = error
+                store.append(session_id, step)  # append stamps the shared ts
+                if progress is not None:
+                    progress.complete_tool(session_id, step)
+                records.append(step)
+                turn_steps.append(step)
 
-            # Deterministic recipe completion: when the MODEL-driven
-            # dashboard.create succeeded, the loop itself executes the
-            # server.serve step — no model call, and it does NOT consume a
-            # MAX_TOOL_TURNS slot (the cap counts model tool turns only).
-            # Budget guard still applies to the auto step.
-            artifact_id = (
-                _artifact_id_of(result)
-                if (tool_name == "dashboard.create" and error is None and result is not None)
-                else None
-            )
-            if artifact_id is None:
+                # Deterministic recipe completion: when the MODEL-driven
+                # dashboard.create succeeded, the loop itself executes the
+                # server.serve step — no model call, and it does NOT consume a
+                # MAX_TOOL_TURNS slot (the cap counts model tool turns only).
+                # Budget guard still applies to the auto step.
+                artifact_id = (
+                    _artifact_id_of(result)
+                    if (tool_name == "dashboard.create" and error is None and result is not None)
+                    else None
+                )
+                if artifact_id is None:
+                    continue
+
+                if time.monotonic() - started > TURN_BUDGET_S:
+                    answer_text = budget_answer
+                    break
+
+                serve_args = {"action": "ensure", "artifact_id": artifact_id}
+                if progress is not None:
+                    progress.begin_tool(session_id, "server.serve", serve_args, phase="serving")
+                serve_error: Optional[str] = None
+                serve_result: Optional[dict] = None
+                if registry is None:
+                    serve_error = "tool registry unavailable"
+                else:
+                    served = registry.dispatch("server.serve", serve_args, ctx={"turn_index": turn_index, "session_id": session_id})
+                    if isinstance(served, dict) and "error" in served:
+                        serve_error = str(served["error"])
+                    elif isinstance(served, dict):
+                        serve_result = served
+                    else:
+                        serve_error = f"invalid tool result: {served!r}"
+                auto_step: dict = {
+                    "role": "assistant",
+                    "tool": "server.serve",
+                    "args": serve_args,
+                    "phase": AUTO_SERVE_PHASE,
+                }
+                if serve_error is None:
+                    auto_step["result"] = serve_result
+                else:
+                    auto_step["error"] = serve_error
+                store.append(session_id, auto_step)
+                if progress is not None:
+                    progress.complete_tool(session_id, auto_step)
+                records.append(auto_step)
+                turn_steps.append(auto_step)
                 continue
 
-            if time.monotonic() - started > TURN_BUDGET_S:
-                answer_text = budget_answer
-                break
+            answer_text = parsed["answer"]
+            urls = list(parsed.get("urls", []))
+            model_answered = True
+            break
 
-            serve_args = {"action": "ensure", "artifact_id": artifact_id}
-            serve_error: Optional[str] = None
-            serve_result: Optional[dict] = None
-            if registry is None:
-                serve_error = "tool registry unavailable"
-            else:
-                served = registry.dispatch("server.serve", serve_args, ctx={"turn_index": turn_index, "session_id": session_id})
-                if isinstance(served, dict) and "error" in served:
-                    serve_error = str(served["error"])
-                elif isinstance(served, dict):
-                    serve_result = served
-                else:
-                    serve_error = f"invalid tool result: {served!r}"
-            auto_step: dict = {
-                "role": "assistant",
-                "tool": "server.serve",
-                "args": serve_args,
-                "phase": AUTO_SERVE_PHASE,
-            }
-            if serve_error is None:
-                auto_step["result"] = serve_result
-            else:
-                auto_step["error"] = serve_error
-            store.append(session_id, auto_step)
-            records.append(auto_step)
-            turn_steps.append(auto_step)
-            continue
+        if answer_text is None:
+            answer_text = (
+                f"Desculpe, atingi o limite de {MAX_TOOL_TURNS} passos de ferramenta nesta resposta "
+                "sem concluir a tarefa. Peça de novo e eu continuo a partir daqui."
+            )
 
-        answer_text = parsed["answer"]
-        urls = list(parsed.get("urls", []))
-        model_answered = True
-        break
+        answer_record = {"role": "assistant", "answer": answer_text, "urls": urls}
+        if not model_answered:
+            # Deterministic completion: when create->serve already succeeded but
+            # the loop exits WITHOUT a model answer (drift/LLM-down/turn cap/
+            # budget), the guard answer is replaced by the synthesized final
+            # answer carrying the served URL — the user-facing pipeline
+            # completes; the record/turn is marked ``auto_complete``.
+            create_result, serve_result = _completed_pipeline_results(turn_steps)
+            if create_result is not None and serve_result is not None:
+                synthesized = synthesize_dashboard_answer(create_result, serve_result)
+                answer_record["answer"] = answer_text = synthesized["answer"]
+                answer_record["urls"] = urls = list(synthesized["urls"])
+                answer_record["phase"] = AUTO_COMPLETE_PHASE
+        store.append(session_id, answer_record)
 
-    if answer_text is None:
-        answer_text = (
-            f"Desculpe, atingi o limite de {MAX_TOOL_TURNS} passos de ferramenta nesta resposta "
-            "sem concluir a tarefa. Peça de novo e eu continuo a partir daqui."
-        )
-
-    answer_record = {"role": "assistant", "answer": answer_text, "urls": urls}
-    if not model_answered:
-        # Deterministic completion: when create->serve already succeeded but
-        # the loop exits WITHOUT a model answer (drift/LLM-down/turn cap/
-        # budget), the guard answer is replaced by the synthesized final
-        # answer carrying the served URL — the user-facing pipeline
-        # completes; the record/turn is marked ``auto_complete``.
-        create_result, serve_result = _completed_pipeline_results(turn_steps)
-        if create_result is not None and serve_result is not None:
-            synthesized = synthesize_dashboard_answer(create_result, serve_result)
-            answer_record["answer"] = answer_text = synthesized["answer"]
-            answer_record["urls"] = urls = list(synthesized["urls"])
-            answer_record["phase"] = AUTO_COMPLETE_PHASE
-    store.append(session_id, answer_record)
-
-    payload = {
-        "session_id": session_id,
-        "turn": turn_steps,
-        "answer": answer_text,
-        "urls": urls,
-    }
-    if answer_record.get("phase") == AUTO_COMPLETE_PHASE:
-        payload["phase"] = AUTO_COMPLETE_PHASE
-    return payload
+        payload = {
+            "session_id": session_id,
+            "turn": turn_steps,
+            "answer": answer_text,
+            "urls": urls,
+        }
+        if answer_record.get("phase") == AUTO_COMPLETE_PHASE:
+            payload["phase"] = AUTO_COMPLETE_PHASE
+        return payload
+    finally:
+        if progress is not None:
+            progress.finish_turn(session_id)

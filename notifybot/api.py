@@ -19,6 +19,7 @@ Serves the endpoint rows of the Electron desktop plan over a stdlib
 14. GET  /api/services              -> sub-service registry status (artifacts)
 15. GET  /api/connectors            -> per-domain connector status/hints
 16. POST /api/connectors/probe      -> one osascript consent probe per domain
+17. GET  /api/agent/active-turn     -> read-only in-memory turn progress snapshot
 Plus one support endpoint for the Logs screen (raw text tail with malformed
 lines flagged, needed to render them dimmed): GET /api/logs/tail?lines=N.
 
@@ -59,6 +60,7 @@ from notifybot.agent import (
     AgentSessionError,
     AgentSessionNotFound,
     AgentSessionStore,
+    TurnProgressRegistry,
     run_turn,
 )
 from notifybot.agent_tools import (
@@ -524,6 +526,8 @@ class BotApiRuntime:
         # the API never binds ports or creates directories as a side effect.
         self.agent_registry: Optional[ArtifactServerRegistry] = None
         self.tool_registry: Optional[ToolRegistry] = None
+        # Live agent turn progress (row 17): lazy in-memory snapshot registry.
+        self.turn_progress: Optional[TurnProgressRegistry] = None
         # Connectors executor (rows 15-16 + native.call): lazy singleton too.
         self.connector_manager: Optional[ConnectorManager] = None
 
@@ -566,10 +570,19 @@ class BotApiRuntime:
             self.connector_manager = ConnectorManager(self.config_dir)
         return self.connector_manager
 
+    def ensure_turn_progress(self) -> TurnProgressRegistry:
+        """Lazy live turn progress registry (one per server process): the
+        read-only side channel behind GET /api/agent/active-turn. Creating it
+        has no side effects (no ports, no directories, no disk writes)."""
+        if self.turn_progress is None:
+            self.turn_progress = TurnProgressRegistry()
+        return self.turn_progress
+
     def ensure_agent_registry(self) -> ArtifactServerRegistry:
         """Lazy artifacts sub-service registry: one per server process (the
         single BotApiRuntime keeps it singleton). The registry binds nothing
         here — the listener starts on the first server.serve tool call."""
+        self.ensure_turn_progress()  # run_turn resolves runtime.turn_progress before the loop
         if self.agent_registry is None:
             self.agent_registry = ArtifactServerRegistry(
                 self.artifacts_dir(), port=artifacts_port_from_env()
@@ -890,6 +903,19 @@ class BotApiRuntime:
             raise ApiError(404, f"agent session not found: {session_id}")
         return {"session_id": session_id, "records": records}
 
+    # #17 GET /api/agent/active-turn — read-only in-memory progress snapshot
+    # for the live Chat progress view (never touches disk); optional
+    # ?session_id= filter validated like #13, HTTP 400 on a malformed id.
+    def agent_active_turn(self, params: Dict[str, List[str]]) -> dict:
+        session_filter: Optional[str] = None
+        raw_id = (params.get("session_id") or [None])[0]
+        if raw_id:
+            try:
+                session_filter = AgentSessionStore.validate_session_id(raw_id)
+            except AgentSessionError:
+                raise ApiError(400, f"invalid agent session id: {raw_id!r}") from None
+        return self.ensure_turn_progress().snapshot(session_id=session_filter)
+
     # #14 GET /api/services
     def services(self) -> dict:
         registry = self.ensure_agent_registry()
@@ -978,6 +1004,7 @@ ROUTES: Dict[str, Dict[str, str]] = {
         "/api/finance/report": "finance_report_status",
         "/api/logs/tail": "logs_tail",
         "/api/agent/sessions": "agent_sessions",
+        "/api/agent/active-turn": "agent_active_turn",
         "/api/services": "services",
         "/api/connectors": "connectors_list",
     },
@@ -989,7 +1016,7 @@ ROUTES: Dict[str, Dict[str, str]] = {
         "/api/connectors/probe": "connectors_probe",
     },
 }
-QUERY_HANDLERS = frozenset({"events", "finance_summary", "finance_transactions", "finance_report_status", "logs_tail", "agent_sessions"})
+QUERY_HANDLERS = frozenset({"events", "finance_summary", "finance_transactions", "finance_report_status", "logs_tail", "agent_sessions", "agent_active_turn"})
 
 # Dynamic route prefixes consulted BEFORE the exact-match table. v1 has a
 # single row: GET /api/agent/session/<id> — the id is validated inside the

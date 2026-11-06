@@ -5,7 +5,14 @@
  * mapping helpers.
  */
 
-import type { AgentRecord, AgentSessionSummary, AgentTurnResponse, AgentTurnStep } from '@/types/bot';
+import type {
+  AgentActiveTurnPhase,
+  AgentActiveTurnResponse,
+  AgentRecord,
+  AgentSessionSummary,
+  AgentTurnResponse,
+  AgentTurnStep,
+} from '@/types/bot';
 
 /** Defense-in-depth allowlist: only 4770-loopback artifact URLs (32-hex ids,
  * matching what dashboard.create generates) may reach iframe.src. */
@@ -33,12 +40,30 @@ export interface ChatToolChip {
   target: string;
 }
 
+/** Live turn-progress entry rendered while POST /api/agent/turn is in flight;
+ * replaced by the turn's real tools group + assistant bubble on completion. */
+export interface ChatProgressItem {
+  kind: 'progress';
+  id: string;
+  sessionId: string | null;
+  phase: AgentActiveTurnPhase;
+  phaseLabel: string;
+  attempt: number;
+  startedAt: string | null;
+  currentTool: { tool: string; target: string } | null;
+  toolStartedAt: string | null;
+  completedChips: ChatToolChip[];
+  rawPartial: string;
+}
+
 /** One transcript entry in display order. A turn's tool steps are interleaved
  * as a single collapsible group directly under that turn's user bubble and
- * before its assistant reply (kind: 'tools'). */
+ * before its assistant reply (kind: 'tools'). Completed turns keep their
+ * collapsible model thinking on the tools group or on the answer bubble. */
 export type ChatTranscriptItem =
-  | ({ kind: 'bubble' } & ChatBubble)
-  | ({ kind: 'tools'; id: string; chips: ChatToolChip[] });
+  | ({ kind: 'bubble'; thinking?: string } & ChatBubble)
+  | ({ kind: 'tools'; id: string; chips: ChatToolChip[]; thinking?: string })
+  | ChatProgressItem;
 
 export interface ChatState {
   /** Interleaved transcript: bubbles + per-turn tool groups in display order. */
@@ -59,6 +84,8 @@ export type ChatEvent =
   /** Composer keystrokes (keeps send-on-enter semantics view-side). */
   | { type: 'draft-changed'; text: string }
   | { type: 'turn-succeeded'; response: AgentTurnResponse }
+  /** ~1s poll of GET /api/agent/active-turn while a turn is pending. */
+  | { type: 'turn-progress'; progress: AgentActiveTurnResponse }
   | { type: 'turn-failed'; error: string }
   | { type: 'error-cleared' }
   | { type: 'sessions-loaded'; sessions: AgentSessionSummary[] }
@@ -123,6 +150,45 @@ export function formatBubbleTime(ts: string | null | undefined): string {
   return `${two(date.getHours())}:${two(date.getMinutes())}`;
 }
 
+/** First string value of a tool-args record, skipping 'html', sliced to 24
+ * chars ('' when absent). Shared by persisted chips and live progress. */
+export function extractToolTarget(args: Record<string, unknown> | undefined | null): string {
+  if (!args || typeof args !== 'object') return '';
+  for (const [key, val] of Object.entries(args)) {
+    if (key === 'html') continue;
+    if (typeof val === 'string') return val.slice(0, 24);
+  }
+  return '';
+}
+
+/** "Working · Ns" elapsed label for the live turn; null/invalid timestamps
+ * render "Working · 0s" and a clock ahead of startedAt clamps to 0. */
+export function formatTurnElapsed(startedAt: string | null | undefined, nowMs: number = Date.now()): string {
+  if (!startedAt) return 'Working \u00b7 0s';
+  const parsed = new Date(startedAt).getTime();
+  if (Number.isNaN(parsed)) return 'Working \u00b7 0s';
+  const seconds = Math.max(0, Math.floor((nowMs - parsed) / 1000));
+  return `Working \u00b7 ${seconds}s`;
+}
+
+/** Human copy for the active loop phase (thinking / retry / tool / serving). */
+export function formatTurnPhase(
+  progress: Pick<AgentActiveTurnResponse, 'phase' | 'attempt' | 'current_tool'>
+): string {
+  switch (progress.phase) {
+    case 'thinking':
+      return 'Thinking\u2026';
+    case 'retry':
+      return `Reformatting response (retry ${Math.max(1, progress.attempt || 1)})`;
+    case 'tool':
+      return progress.current_tool?.tool ? `Running tool ${progress.current_tool.tool}\u2026` : 'Running tool\u2026';
+    case 'serving':
+      return 'Serving dashboard\u2026';
+    default:
+      return 'Thinking\u2026';
+  }
+}
+
 /** Pretty-printed preview of one tool step: result JSON on success, error
  * text otherwise, truncated to TOOL_CHIP_PREVIEW_MAX_CHARS. */
 export function toToolChip(step: AgentTurnStep, index: number): ChatToolChip {
@@ -142,16 +208,7 @@ export function toToolChip(step: AgentTurnStep, index: number): ChatToolChip {
   if (preview.length > TOOL_CHIP_PREVIEW_MAX_CHARS) {
     preview = `${preview.slice(0, TOOL_CHIP_PREVIEW_MAX_CHARS)}\n…[truncated]`;
   }
-  let target = '';
-  if (step.args && typeof step.args === 'object') {
-    for (const [key, val] of Object.entries(step.args as Record<string, unknown>)) {
-      if (key === 'html') continue;
-      if (typeof val === 'string') {
-        target = val.slice(0, 24);
-        break;
-      }
-    }
-  }
+  const target = extractToolTarget(step.args as Record<string, unknown> | undefined);
   return { id: `chip-${step.ts}-${index}`, tool: step.tool, ok, preview, target };
 }
 
@@ -178,35 +235,64 @@ export function toolSummaryFromChips(chips: ChatToolChip[]): string {
 }
 
 /** One collapsible tool-activity group for a turn's steps, ids scoped to the
- * group so they stay unique across turns. */
-function toolsItemFromSteps(steps: AgentTurnStep[]): ChatTranscriptItem {
+ * group so they stay unique across turns. `thinking` carries the turn's
+ * collapsible model output when present. */
+function toolsItemFromSteps(steps: AgentTurnStep[], thinking?: string): ChatTranscriptItem {
   const id = nextId('tools');
-  return {
-    kind: 'tools',
+  const item = {
+    kind: 'tools' as const,
     id,
     chips: steps.map((step, index) => ({ ...toToolChip(step, index), id: `${id}-${index}` })),
   };
+  return thinking && thinking.length > 0 ? { ...item, thinking } : item;
+}
+
+/** Max chars of accumulated assistant_raw text kept per turn (tail). */
+const THINKING_TAIL_MAX_CHARS = 400;
+
+/** True for the transient live progress entry. */
+function isProgressItem(item: ChatTranscriptItem): item is ChatProgressItem {
+  return item.kind === 'progress';
 }
 
 /** Rebuild the interleaved transcript (bubbles + per-turn tool groups) and
  * artifact URL from a persisted session transcript. Consecutive tool rows
  * form the group of the turn whose user message precedes them; any answer /
- * content row closes the group. Loop-internal rows (assistant_raw / phase
- * attempts) are ignored. */
+ * content row closes the group. Loop-internal assistant_raw rows feed the
+ * turn's collapsible thinking but never flush; other loop-internal rows are
+ * ignored. */
 export function transcriptFromRecords(records: AgentRecord[]): { items: ChatTranscriptItem[]; artifactUrl: string | null } {
   const items: ChatTranscriptItem[] = [];
   let artifactUrl: string | null = null;
   let toolRun: AgentTurnStep[] | null = null;
+  let rawPieces: string[] = [];
 
-  const flushTools = (): void => {
-    if (toolRun === null) return;
-    if (toolRun.length > 0) items.push(toolsItemFromSteps(toolRun));
+  /** Consume the active turn's accumulated assistant_raw text (tail-capped). */
+  const takeThinking = (): string => {
+    if (rawPieces.length === 0) return '';
+    const joined = rawPieces.join('\n');
+    rawPieces = [];
+    return joined.length > THINKING_TAIL_MAX_CHARS ? joined.slice(-THINKING_TAIL_MAX_CHARS) : joined;
+  };
+
+  /** Close the current turn at a real boundary: flush its tool group and, when
+   * no tools ran, attach its thinking to the assistant answer bubble. */
+  const closeTurn = (answerBubble: ChatBubble | null): void => {
+    const thinking = takeThinking();
+    const hasTools = toolRun !== null && toolRun.length > 0;
+    if (hasTools && toolRun !== null) {
+      items.push(toolsItemFromSteps(toolRun, thinking));
+    }
     toolRun = null;
+    if (answerBubble === null) return;
+    items.push(
+      !hasTools && thinking ? { kind: 'bubble', ...answerBubble, thinking } : { kind: 'bubble', ...answerBubble }
+    );
   };
 
   records.forEach((record) => {
     if (record.role === 'user') {
-      flushTools();
+      closeTurn(null);
       items.push({ kind: 'bubble', ...toBubble('user', String(record.content ?? ''), record.ts) });
     } else if (record.role === 'assistant' && typeof record.tool === 'string') {
       (toolRun ??= []).push({
@@ -218,47 +304,98 @@ export function transcriptFromRecords(records: AgentRecord[]): { items: ChatTran
         ts: record.ts,
       });
     } else if (record.role === 'assistant' && typeof record.answer === 'string') {
-      flushTools();
-      items.push({ kind: 'bubble', ...toBubble('assistant', record.answer, record.ts) });
+      const bubble = toBubble('assistant', record.answer, record.ts);
+      closeTurn(bubble);
       const url = iframeUrlFrom(record.urls ?? []);
       if (url) artifactUrl = url;
     } else if (record.role === 'assistant' && typeof record.content === 'string') {
       // legacy/loop-internal records without a tool or answer payload
-      flushTools();
-      items.push({ kind: 'bubble', ...toBubble('assistant', record.content, record.ts) });
+      closeTurn(toBubble('assistant', record.content, record.ts));
+    } else if (record.role === 'assistant_raw') {
+      // Loop-internal raw output feeds the turn's thinking; it NEVER flushes.
+      if (typeof record.raw_model_output === 'string' && record.raw_model_output.length > 0) {
+        rawPieces.push(record.raw_model_output);
+      }
     } else {
-      // Loop-internal rows (assistant_raw / phase attempts) NEVER flush;
-      // flushes happen only at real boundaries (user / answer / content) and at transcript end.
+      // Other loop-internal rows NEVER flush; flushes happen only at real
+      // boundaries (user / answer / content) and at transcript end.
     }
   });
-  flushTools();
+  closeTurn(null);
   return { items, artifactUrl };
 }
 
 export function reduceChat(state: ChatState, event: ChatEvent): ChatState {
   switch (event.type) {
-    case 'send':
+    case 'send': {
+      // Defensively drop a stale live-progress entry from a previous turn.
+      const items = state.items.filter((item) => !isProgressItem(item));
       return {
         ...state,
-        items: [...state.items, { kind: 'bubble', ...toBubble('user', event.message, nowIso()) }],
+        items: [...items, { kind: 'bubble', ...toBubble('user', event.message, nowIso()) }],
         draft: '',
         pending: true,
         error: null,
       };
+    }
     case 'prefill':
       return { ...state, draft: event.text };
     case 'draft-changed':
       return { ...state, draft: event.text };
+    case 'turn-progress': {
+      const progress = event.progress;
+      // Late/stale polls must never re-open a finished transcript.
+      if (!state.pending) return state;
+      const existing = state.items.find(isProgressItem);
+      if (progress.done === true && !existing) return state;
+      if (
+        state.sessionId !== null &&
+        progress.session_id !== null &&
+        state.sessionId !== progress.session_id
+      ) {
+        return state;
+      }
+      const completedChips = (progress.completed_tools ?? []).map((step, index) => toToolChip(step, index));
+      const currentTool = progress.current_tool
+        ? { tool: progress.current_tool.tool, target: extractToolTarget(progress.current_tool.args) }
+        : null;
+      const progressItem: ChatProgressItem = {
+        kind: 'progress',
+        id: existing?.id ?? nextId('progress'),
+        // Do not mutate state.sessionId: POST /api/agent/turn owns it. The item
+        // only carries the id so the view can scope polling on first turn.
+        sessionId: existing?.sessionId ?? progress.session_id ?? state.sessionId ?? null,
+        phase: progress.phase,
+        phaseLabel: formatTurnPhase(progress),
+        attempt: progress.attempt,
+        startedAt: progress.started_at,
+        currentTool,
+        toolStartedAt: progress.tool_started_at,
+        completedChips,
+        // Tool/serving ticks carry no raw chunks: keep the last non-empty tail.
+        rawPartial: progress.raw_partial || existing?.rawPartial || '',
+      };
+      return {
+        ...state,
+        items: existing
+          ? state.items.map((item) => (item === existing ? progressItem : item))
+          : [...state.items, progressItem],
+      };
+    }
     case 'turn-succeeded': {
       const response = event.response;
       const newUrl = iframeUrlFrom(response?.urls);
-      const items: ChatTranscriptItem[] = [...state.items];
+      const progressItem = state.items.find(isProgressItem);
+      const lastThinking = progressItem?.rawPartial ?? '';
+      const items: ChatTranscriptItem[] = state.items.filter((item) => !isProgressItem(item));
+      const turn = Array.isArray(response.turn) ? response.turn : [];
       // F1: the turn's tool steps land as one group under this turn's user
       // bubble, before its assistant reply (both are appended in order).
-      if (response.turn && response.turn.length > 0) {
-        items.push(toolsItemFromSteps(response.turn));
+      if (turn.length > 0) {
+        items.push(toolsItemFromSteps(turn, lastThinking));
       }
-      items.push({ kind: 'bubble', ...toBubble('assistant', response.answer, nowIso()) });
+      const answerBubble = { kind: 'bubble' as const, ...toBubble('assistant', response.answer, nowIso()) };
+      items.push(turn.length === 0 && lastThinking ? { ...answerBubble, thinking: lastThinking } : answerBubble);
       return {
         ...state,
         sessionId: response.session_id,
@@ -270,7 +407,12 @@ export function reduceChat(state: ChatState, event: ChatEvent): ChatState {
       };
     }
     case 'turn-failed':
-      return { ...state, pending: false, error: event.error };
+      return {
+        ...state,
+        items: state.items.filter((item) => !isProgressItem(item)),
+        pending: false,
+        error: event.error,
+      };
     case 'error-cleared':
       return { ...state, error: null };
     case 'sessions-loaded':

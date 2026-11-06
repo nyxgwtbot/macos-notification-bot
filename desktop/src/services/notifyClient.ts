@@ -10,6 +10,7 @@
  */
 
 import type {
+  AgentActiveTurnResponse,
   AgentSessionDetail,
   AgentSessionsResponse,
   AgentTurnResponse,
@@ -185,6 +186,11 @@ export class NotifyClient {
   // #13
   getAgentSession(sessionId: string): Promise<AgentSessionDetail> {
     return this.request('GET', `/api/agent/session/${encodeURIComponent(sessionId)}`);
+  }
+
+  // #17 (additive live-turn side channel)
+  getAgentActiveTurn(sessionId?: string | null): Promise<AgentActiveTurnResponse> {
+    return this.request('GET', '/api/agent/active-turn' + (sessionId ? '?session_id=' + encodeURIComponent(sessionId) : ''));
   }
 
   // #14

@@ -201,6 +201,8 @@ export interface AgentRecord {
   error?: string;
   answer?: string;
   urls?: string[];
+  phase?: string;
+  raw_model_output?: string;
   ts: string;
 }
 
@@ -208,6 +210,30 @@ export interface AgentRecord {
 export interface AgentSessionDetail {
   session_id: string;
   records: AgentRecord[];
+}
+
+/** GET /api/agent/active-turn phase (additive live-turn side channel). */
+export type AgentActiveTurnPhase = 'idle' | 'thinking' | 'retry' | 'tool' | 'serving' | 'done' | string;
+
+/** Currently executing tool of the live agent turn. */
+export interface AgentActiveTool {
+  tool: string;
+  target: string;
+  args?: Record<string, unknown>;
+}
+
+/** GET /api/agent/active-turn response: read-only in-memory snapshot of the
+ * running POST /api/agent/turn, polled ~1s while the view is pending. */
+export interface AgentActiveTurnResponse {
+  session_id: string | null;
+  phase: AgentActiveTurnPhase;
+  attempt: number;
+  started_at: string | null;
+  current_tool: AgentActiveTool | null;
+  tool_started_at: string | null;
+  completed_tools?: AgentTurnStep[];
+  raw_partial: string;
+  done: boolean;
 }
 
 /** Row of GET /api/services -> services.artifacts (always present). */

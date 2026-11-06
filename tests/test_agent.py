@@ -29,6 +29,7 @@ from notifybot.agent import (
     PRIOR_ANSWER_INLINE_MAX_CHARS,
     PRIOR_ANSWER_KEPT_CHARS,
     RAW_MODEL_OUTPUT_MAX_BYTES,
+    RAW_PARTIAL_MAX_CHARS,
     REMINDER_PREFIX,
     STANDING_PROTOCOL_REMINDER,
     build_context,
@@ -40,6 +41,7 @@ from notifybot.agent import (
     run_turn,
     summarize_tool_args,
     synthesize_dashboard_answer,
+    TurnProgressRegistry,
     truncate_prior_answer_text,
     truncate_raw_model_output,
     truncate_tool_result_text,
@@ -1433,6 +1435,619 @@ class TestAgentApiEndpoints(unittest.TestCase):
             artifacts["root"].endswith(os.path.join("", "artifacts"))
             and artifacts["root"].endswith("artifacts")
         )
+
+
+# ---- live turn progress (registry unit + run_turn hooks + streaming) -------------
+
+
+class TestExtractToolTargetAndSanitize(unittest.TestCase):
+    """_extract_tool_target mirrors desktop chatViewModel.ts toToolChip and
+    _sanitize_step_for_progress redacts html while keeping chip fields."""
+
+    def test_extract_tool_target_first_string_skipping_html_slice24(self):
+        extract = agent_module._extract_tool_target
+        # First string value in insertion order, sliced to 24 chars.
+        self.assertEqual(
+            extract({"title": "A" * 40, "html": "<h>big</h>", "data_source": "x"}),
+            "A" * 24,
+        )
+        # html is skipped even when it is the only/all non-string strings.
+        self.assertEqual(extract({"html": DASHBOARD_HTML}), "")
+        # An empty-string value IS the first string value (== toToolChip's
+        # `typeof val === 'string'` contract) -> target stays "".
+        self.assertEqual(extract({"title": "", "html": "<x>", "name": "dataset"}), "")
+        self.assertEqual(extract({"html": "<x>", "name": "dataset"}), "dataset")
+        # Non-string values are skipped (first STRING value wins).
+        self.assertEqual(extract({"count": 3, "label": "abc"}), "abc")
+        # Degenerate inputs -> "".
+        self.assertEqual(extract(None), "")
+        self.assertEqual(extract({}), "")
+        self.assertEqual(extract("not a dict"), "")
+        self.assertEqual(extract({"html": None, "id": "x"}), "x")
+        # Exactly 24 chars stays intact (no slice loss at the boundary).
+        self.assertEqual(extract({"t": "B" * 24}), "B" * 24)
+
+    def test_sanitize_for_progress_redacts_html_keeps_chip_keys(self):
+        step = {
+            "role": "assistant",
+            "tool": "dashboard.create",
+            "args": {"title": "Health Dashboard", "html": LARGE_HTML},
+            "result": {"artifact_id": "abc123"},
+            "ts": "2026-11-06T00:00:00+00:00",
+        }
+        sanitized = agent_module._sanitize_step_for_progress(step)
+        self.assertEqual(sanitized["role"], "assistant")
+        self.assertEqual(sanitized["tool"], "dashboard.create")
+        self.assertEqual(sanitized["result"], {"artifact_id": "abc123"})
+        self.assertEqual(sanitized["ts"], step["ts"])
+        # args stays a dict (frontend chip target contract); only html is
+        # replaced by the summarize marker, all other keys pass through.
+        self.assertIsInstance(sanitized["args"], dict)
+        self.assertEqual(sanitized["args"]["title"], "Health Dashboard")
+        self.assertIsInstance(sanitized["args"]["html"], str)
+        self.assertIn("stored in the session file, not re-sent", sanitized["args"]["html"])
+        self.assertNotIn(DRIFT_HTML_SENTINEL, json.dumps(sanitized))
+        # The original step dict is untouched (copy semantics for poll reuse).
+        self.assertIn(DRIFT_HTML_SENTINEL, step["args"]["html"])
+
+    def test_sanitize_for_progress_non_dict_args_preserved(self):
+        # Defensive: a legacy/None args value is left as-is, not stringified.
+        self.assertIsNone(
+            agent_module._sanitize_step_for_progress(
+                {"role": "assistant", "tool": "app.data", "args": None, "ts": "t"}
+            )["args"]
+        )
+        no_args = {"role": "assistant", "tool": "app.data", "ts": "t"}
+        self.assertNotIn("args", agent_module._sanitize_step_for_progress(no_args))
+
+
+class TestTurnProgressRegistry(unittest.TestCase):
+    """Registry lifecycle idle -> thinking -> retry -> tool -> serving -> done,
+    RAW_PARTIAL tail truncation, html redaction, session filtering and the
+    deep-copy isolation of snapshot()."""
+
+    def test_full_lifecycle_phase_and_raw_tails(self):
+        self.assertEqual(RAW_PARTIAL_MAX_CHARS, 400)
+        reg = TurnProgressRegistry()
+        # Fresh/empty registry (no param): live idle state.
+        self.assertEqual(
+            reg.snapshot(),
+            {"session_id": None, "phase": "idle", "attempt": 0, "started_at": None,
+             "current_tool": None, "tool_started_at": None, "completed_tools": [],
+             "raw_partial": "", "done": False},
+        )
+
+        reg.start_turn("sess-1")
+        snap = reg.snapshot()
+        self.assertEqual(snap["phase"], "thinking")
+        self.assertEqual(snap["attempt"], 1)
+        self.assertEqual(snap["session_id"], "sess-1")
+        self.assertFalse(snap["done"])
+        self.assertTrue(snap["started_at"])
+        self.assertIsNone(snap["current_tool"])
+
+        # Streaming tail: under the cap -> verbatim; empty chunks are no-ops;
+        # empty raw leaves the previous tail in place.
+        reg.append_raw_chunk("x" * 100)
+        reg.append_raw_chunk("")
+        reg.set_raw_output("sess-1", "")
+        self.assertEqual(reg.snapshot()["raw_partial"], "x" * 100)
+
+        # begin_llm_call('retry'): buffer reset, but raw_partial is KEPT until
+        # new chunks arrive.
+        reg.begin_llm_call("sess-1", phase="retry", attempt=2)
+        snap = reg.snapshot()
+        self.assertEqual(snap["phase"], "retry")
+        self.assertEqual(snap["attempt"], 2)
+        self.assertEqual(snap["raw_partial"], "x" * 100)
+        self.assertIsNone(snap["current_tool"])
+        self.assertIsNone(snap["tool_started_at"])
+
+        # set_raw_output (non-streaming) replaces the tail: exactly-400 stays
+        # verbatim, 401 gets the ellipsis preview + exact 400-tail.
+        reg.set_raw_output("sess-1", "z" * RAW_PARTIAL_MAX_CHARS)
+        self.assertEqual(reg.snapshot()["raw_partial"], "z" * RAW_PARTIAL_MAX_CHARS)
+        reg.set_raw_output("sess-1", "w" * (RAW_PARTIAL_MAX_CHARS + 1))
+        partial = reg.snapshot()["raw_partial"]
+        self.assertEqual(partial, "…" + "w" * RAW_PARTIAL_MAX_CHARS)
+
+        # Tool phase: live chip target mirrors toToolChip (html skipped, 24 slice).
+        reg.begin_tool(
+            "sess-1",
+            "dashboard.create",
+            {"title": "T" * 40, "html": "H" * 600, "data_source": "app.data:health"},
+        )
+        snap = reg.snapshot()
+        self.assertEqual(snap["phase"], "tool")
+        self.assertEqual(snap["current_tool"], {"tool": "dashboard.create", "target": "T" * 24})
+        self.assertTrue(snap["tool_started_at"])
+
+        step = {
+            "role": "assistant",
+            "tool": "dashboard.create",
+            "args": {"title": "T" * 40, "html": "H" * 600},
+            "result": {"artifact_id": "abc"},
+            "error": None,
+            "ts": "2026-11-06T00:00:00+00:00",
+        }
+        reg.complete_tool("sess-1", step)
+        snap = reg.snapshot()
+        completed = snap["completed_tools"]
+        self.assertEqual(len(completed), 1)
+        self.assertNotIn("H" * 10, json.dumps(completed[0]))  # no raw html leak
+        self.assertIsInstance(completed[0]["args"], dict)  # chip target contract
+        self.assertEqual(completed[0]["args"]["title"], "T" * 40)
+        self.assertIsInstance(completed[0]["args"]["html"], str)
+        self.assertEqual(completed[0]["result"], {"artifact_id": "abc"})
+        self.assertEqual(completed[0]["ts"], step["ts"])
+        self.assertIsNone(snap["current_tool"])
+        self.assertIsNone(snap["tool_started_at"])
+
+        # Serving phase (loop's auto server.serve): target = first non-html arg.
+        reg.begin_tool("sess-1", "server.serve", {"action": "ensure", "artifact_id": "abc"}, phase="serving")
+        snap = reg.snapshot()
+        self.assertEqual(snap["phase"], "serving")
+        self.assertEqual(snap["current_tool"], {"tool": "server.serve", "target": "ensure"})
+
+        reg.finish_turn("sess-1")
+        snap = reg.snapshot()
+        self.assertTrue(snap["done"])
+        self.assertEqual(snap["phase"], "done")
+        self.assertIsNone(snap["current_tool"])
+        self.assertIsNone(snap["tool_started_at"])
+        self.assertEqual(len(snap["completed_tools"]), 1)  # history survives
+
+    def test_snapshot_mismatch_returns_idle_done_shape(self):
+        reg = TurnProgressRegistry()
+        reg.start_turn("sess-1")
+        foreign = reg.snapshot("other-session")
+        self.assertEqual(
+            foreign,
+            {"session_id": "other-session", "phase": "idle", "attempt": 0,
+             "started_at": None, "current_tool": None, "tool_started_at": None,
+             "completed_tools": [], "raw_partial": "", "done": True},
+        )
+        # No param -> live state, regardless of the live session id.
+        self.assertEqual(reg.snapshot()["session_id"], "sess-1")
+
+    def test_snapshot_is_deep_copied(self):
+        reg = TurnProgressRegistry()
+        reg.start_turn("sess-1")
+        reg.begin_tool("sess-1", "app.data", {"dataset": "health", "html": "X" * 300})
+        live = reg.snapshot()
+        self.assertEqual(live["current_tool"], {"tool": "app.data", "target": "health"})
+        reg.complete_tool("sess-1", {"role": "assistant", "tool": "app.data",
+                                     "args": {"dataset": "health"}, "ts": "t1"})
+        snap = reg.snapshot()
+        self.assertIsNone(snap["current_tool"])  # completion clears the live chip
+        self.assertEqual(snap["tool_started_at"], None)
+        # Mutating the returned snapshot must not corrupt the registry state.
+        snap["completed_tools"][0]["tool"] = "hacked"
+        snap["completed_tools"].append({"injected": True})
+        again = reg.snapshot()
+        self.assertEqual(again["completed_tools"][0]["tool"], "app.data")
+        self.assertEqual(len(again["completed_tools"]), 1)
+
+    def test_reset_raw_buffer_clears_buffer_keeps_partial(self):
+        reg = TurnProgressRegistry()
+        reg.start_turn("sess-1")
+        reg.append_raw_chunk("stale stream tail")
+        reg.append_raw_chunk("")
+        reg.reset_raw_buffer()
+        with reg._lock:
+            self.assertEqual(reg._raw_buffer, "")
+        # The last non-empty raw_partial survives the reset.
+        self.assertEqual(reg.snapshot()["raw_partial"], "stale stream tail")
+
+
+class TestRunTurnProgressHooks(unittest.TestCase):
+    """Mid-turn observation of the run_turn milestones via an injected
+    runtime.turn_progress (make_runtime does NOT create one — hooks must stay
+    inert without it, which the rest of this module's tests already prove)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runtime = make_runtime(self.tmp.name)
+        self.runtime.turn_progress = TurnProgressRegistry()
+
+    def tearDown(self):
+        if self.runtime.agent_registry is not None:
+            self.runtime.agent_registry.stop()
+
+    def test_thinking_and_retry_phases_then_done(self):
+        runtime = self.runtime
+        observed = {}
+
+        def garbage(messages):
+            observed["thinking"] = runtime.turn_progress.snapshot()
+            return "olha, não sei — vou responder em texto livre com markdown"
+
+        def retry_capture(messages):
+            observed["retry"] = runtime.turn_progress.snapshot()
+            return json.dumps({"answer": "Olá! Como posso ajudar hoje?", "urls": []})
+
+        llm = ScriptedLLM([garbage, retry_capture])
+        response = run_turn(runtime, None, "ping", llm_fn=llm)
+        self.assertEqual(llm.call_count, 2)
+        self.assertEqual(response["answer"], "Olá! Como posso ajudar hoje?")
+
+        thinking = observed["thinking"]
+        self.assertEqual(thinking["phase"], "thinking")
+        self.assertEqual(thinking["attempt"], 1)
+        self.assertEqual(thinking["session_id"], response["session_id"])
+        self.assertTrue(thinking["started_at"])
+        self.assertFalse(thinking["done"])
+        self.assertIsNone(thinking["current_tool"])
+
+        retry = observed["retry"]
+        self.assertEqual(retry["phase"], "retry")
+        self.assertEqual(retry["attempt"], 1)
+        self.assertFalse(retry["done"])
+
+        done = runtime.turn_progress.snapshot()
+        self.assertTrue(done["done"])
+        self.assertEqual(done["phase"], "done")
+        # Non-streaming raw output lands via set_raw_output after the retry call.
+        self.assertIn("Como posso ajudar hoje?", done["raw_partial"])
+
+    def test_tool_and_serving_phases_with_live_chips(self):
+        runtime = self.runtime
+        observed = {}
+        original_dispatch = ToolRegistry.dispatch
+
+        def spy_dispatch(tool_registry_self, name, args, ctx=None):
+            observed.setdefault(name, runtime.turn_progress.snapshot())
+            return original_dispatch(tool_registry_self, name, args, ctx=ctx)
+
+        def finalize(messages):
+            observed["finalize_call"] = runtime.turn_progress.snapshot()
+            return json.dumps({"answer": "Dashboard pronto.", "urls": []})
+
+        llm = ScriptedLLM(
+            [
+                json.dumps({"tool": "app.data", "args": {"dataset": "health"}}),
+                json.dumps(
+                    {
+                        "tool": "dashboard.create",
+                        # LARGE_HTML (> TOOL_ARG_INLINE_MAX_CHARS) proves the
+                        # completed chips never leak raw html.
+                        "args": {"title": "Health Dashboard", "html": LARGE_HTML,
+                                 "data_source": "app.data:health"},
+                    }
+                ),
+                finalize,
+            ]
+        )
+        with unittest.mock.patch.object(ToolRegistry, "dispatch", spy_dispatch):
+            response = run_turn(runtime, None, "me mostre um dashboard", llm_fn=llm)
+
+        self.assertEqual(llm.call_count, 3)  # app.data, create, finalize
+        self.assertEqual([step["tool"] for step in response["turn"]],
+                         ["app.data", "dashboard.create", "server.serve"])
+
+        app_data = observed["app.data"]
+        self.assertEqual(app_data["phase"], "tool")
+        self.assertEqual(app_data["current_tool"], {"tool": "app.data", "target": "health"})
+        self.assertTrue(app_data["tool_started_at"])
+        self.assertFalse(app_data["done"])
+
+        create = observed["dashboard.create"]
+        self.assertEqual(create["phase"], "tool")
+        self.assertEqual(create["current_tool"], {"tool": "dashboard.create", "target": "Health Dashboard"})
+
+        serve = observed["server.serve"]
+        self.assertEqual(serve["phase"], "serving")  # loop-driven auto-serve
+        self.assertEqual(serve["current_tool"], {"tool": "server.serve", "target": "ensure"})
+
+        finalize_snap = observed["finalize_call"]
+        self.assertEqual(finalize_snap["phase"], "thinking")  # answer call re-opens thinking
+        self.assertTrue(finalize_snap["done"] is False)
+
+        done = runtime.turn_progress.snapshot()
+        self.assertTrue(done["done"])
+        self.assertEqual(done["phase"], "done")
+        self.assertIsNone(done["current_tool"])
+        self.assertIsNone(done["tool_started_at"])
+        self.assertEqual([step["tool"] for step in done["completed_tools"]],
+                         ["app.data", "dashboard.create", "server.serve"])
+        self.assertTrue(all(step.get("ts") for step in done["completed_tools"]))
+        # Completed chips keep DICT args (frontend chip target path) with the
+        # small string args intact; only html is summarized/redacted.
+        completed = done["completed_tools"]
+        self.assertIsInstance(completed[0]["args"], dict)
+        self.assertEqual(completed[0]["args"]["dataset"], "health")
+        self.assertIsInstance(completed[1]["args"], dict)
+        self.assertEqual(completed[1]["args"]["title"], "Health Dashboard")
+        self.assertEqual(completed[1]["args"]["data_source"], "app.data:health")
+        self.assertIsInstance(completed[1]["args"]["html"], str)
+        # Poll wire carries NO raw html (summarizeToolArgs-style redaction).
+        self.assertNotIn(DRIFT_HTML_SENTINEL, json.dumps(done["completed_tools"]))
+        # Live raw tail: the finalize call's set_raw_output is the last output.
+        self.assertIn("Dashboard pronto.", done["raw_partial"])
+
+    def test_llm_exception_still_finishes_turn(self):
+        runtime = self.runtime
+        during = {}
+
+        def boom(messages):
+            during["snap"] = runtime.turn_progress.snapshot()
+            raise RuntimeError("llm exploded")
+
+        response = run_turn(runtime, None, "ping", llm_fn=boom)
+        self.assertEqual(during["snap"]["phase"], "thinking")
+        self.assertEqual(response["turn"], [])
+        self.assertIn("não consegui falar com o modelo de IA", response["answer"])
+        done = runtime.turn_progress.snapshot()
+        self.assertTrue(done["done"])
+        self.assertEqual(done["phase"], "done")
+        self.assertIsNone(done["current_tool"])
+
+
+class TestOllamaChatProgressStreamState(unittest.TestCase):
+    """_ollama_chat retry resets the streamed raw buffer between attempts; the
+    registry keeps the previous raw_partial until fresh chunks land."""
+
+    def setUp(self):
+        os.environ.pop("NOTIFYBOT_SMOKE_AGENT_MOCK", None)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runtime = make_runtime(self.tmp.name)
+        self.runtime.turn_progress = TurnProgressRegistry()
+        self.messages = [{"role": "system", "content": "system prompt"}]
+
+    def test_retry_clears_streamed_buffer_keeps_partial(self):
+        progress = self.runtime.turn_progress
+        calls = []
+
+        def scripted_post(runtime, messages):
+            calls.append(1)
+            if len(calls) == 1:
+                progress.append_raw_chunk("stale attempt thinking")
+                raise urllib.error.URLError("connection refused")
+            progress.append_raw_chunk("fresh attempt tail")
+            return "ok fresh"
+
+        with unittest.mock.patch.object(agent_module, "_transport_post", side_effect=scripted_post), \
+                unittest.mock.patch.object(agent_module, "_transport_backoff"):
+            result = agent_module._ollama_chat(self.runtime, self.messages)
+
+        self.assertEqual(result, "ok fresh")
+        self.assertEqual(len(calls), 2)
+        # The dead attempt's buffer was dropped between attempts; the retry's
+        # fresh chunks then populate a CLEAN buffer.
+        with progress._lock:
+            self.assertEqual(progress._raw_buffer, "fresh attempt tail")
+        # The last non-empty raw_partial survived the retry (kept for polls).
+        self.assertEqual(progress.snapshot()["raw_partial"], "fresh attempt tail")
+
+    def test_no_registry_keeps_retry_inert(self):
+        self.runtime.turn_progress = None  # raw runtimes: hooks must stay no-ops
+        with unittest.mock.patch.object(
+            agent_module,
+            "_transport_post",
+            side_effect=[urllib.error.URLError("down"), "recovered"],
+        ) as posts, unittest.mock.patch.object(agent_module, "_transport_backoff"):
+            self.assertEqual(agent_module._ollama_chat(self.runtime, self.messages), "recovered")
+        self.assertEqual(posts.call_count, 2)
+
+
+class TestTransportPostStreaming(unittest.TestCase):
+    """Production _transport_post reads Ollama NDJSON by line iteration: full
+    content assembly for parse_model_json + live thinking feed into the
+    runtime's TurnProgressRegistry; a single-line non-streamed body flows
+    through the same loop."""
+
+    def setUp(self):
+        os.environ.pop("NOTIFYBOT_SMOKE_AGENT_MOCK", None)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runtime = make_runtime(self.tmp.name)
+        self.runtime.turn_progress = TurnProgressRegistry()
+        self.messages = [{"role": "user", "content": "ping"}]
+
+    class _FakeStream:
+        """urlopen context-manager stand-in whose __iter__ yields raw lines."""
+
+        def __init__(self, lines):
+            self._iter = iter(list(lines))
+
+        def __iter__(self):
+            return self._iter
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def test_ndjson_stream_assembles_content_and_feeds_thinking(self):
+        lines = [
+            json.dumps({"message": {"role": "assistant", "content": '{"answer": '}}).encode("utf-8"),
+            json.dumps({"message": {"role": "assistant", "thinking": "pensando na resposta final; ",
+                                    "content": '"pronta"'}}).encode("utf-8"),
+            b"",  # blank line: no-op
+            b"not-json at all",  # malformed line: skipped, never raised
+            json.dumps({"message": {"role": "assistant", "content": ', "urls": []}'}}).encode("utf-8"),
+            json.dumps({"done": True}).encode("utf-8"),
+        ]
+        with unittest.mock.patch("urllib.request.urlopen", return_value=self._FakeStream(lines)) as urlopen_mock:
+            result = agent_module._transport_post(self.runtime, self.messages)
+
+        self.assertEqual(result, '{"answer": "pronta", "urls": []}')
+        # stream:True went out on the wire with the configured ollama model.
+        request = urlopen_mock.call_args[0][0]
+        wire = json.loads(request.data.decode("utf-8"))
+        self.assertTrue(wire["stream"])
+        self.assertEqual(wire["model"], "glm-5.3-flash:cloud")
+        self.assertEqual(wire["messages"], self.messages)
+
+        snap = self.runtime.turn_progress.snapshot()
+        # The thinking line fed the live raw tail (buffer under 400 -> verbatim).
+        self.assertIn("pensando na resposta final", snap["raw_partial"])
+        self.assertNotIn("…", snap["raw_partial"])
+        self.assertEqual(
+            snap["raw_partial"],
+            '{"answer": pensando na resposta final; , "urls": []}',
+        )
+
+    def test_raw_partial_tail_capped_at_400_chars(self):
+        chunk = "x" * 500
+        lines = [json.dumps({"message": {"content": chunk}}).encode("utf-8")]
+        with unittest.mock.patch("urllib.request.urlopen", return_value=self._FakeStream(lines)):
+            result = agent_module._transport_post(self.runtime, self.messages)
+        self.assertEqual(result, chunk)
+        partial = self.runtime.turn_progress.snapshot()["raw_partial"]
+        self.assertEqual(partial, "…" + chunk[-RAW_PARTIAL_MAX_CHARS:])
+
+    def test_single_line_nonstreamed_body_same_loop(self):
+        body = json.dumps(
+            {"model": "glm-5.3-flash:cloud", "message": {"role": "assistant", "content": "resposta unica"},
+             "done": True}
+        )
+        with unittest.mock.patch("urllib.request.urlopen", return_value=self._FakeStream([body])):
+            result = agent_module._transport_post(self.runtime, self.messages)
+        self.assertEqual(result, "resposta unica")
+        self.assertEqual(self.runtime.turn_progress.snapshot()["raw_partial"], "resposta unica")
+
+        # Without a registry the same loop returns the assembled content only.
+        self.runtime.turn_progress = None
+        with unittest.mock.patch("urllib.request.urlopen", return_value=self._FakeStream([body])):
+            result = agent_module._transport_post(self.runtime, self.messages)
+        self.assertEqual(result, "resposta unica")
+
+    def test_str_lines_and_empty_stream(self):
+        # Line items may also arrive as str (the loop normalizes both).
+        lines = [json.dumps({"message": {"content": "texto simples"}})]
+        with unittest.mock.patch("urllib.request.urlopen", return_value=self._FakeStream(lines)):
+            result = agent_module._transport_post(self.runtime, self.messages)
+        self.assertEqual(result, "texto simples")
+        # Empty stream ends the loop with an empty content string (transport
+        # layer errors still propagate; a bare close is not one).
+        with unittest.mock.patch("urllib.request.urlopen", return_value=self._FakeStream([])):
+            self.assertEqual(agent_module._transport_post(self.runtime, self.messages), "")
+
+    def test_scalar_json_lines_are_skipped(self):
+        # Well-formed JSON that is not an object (null / array / scalar) used
+        # to crash obj.get; now the loop skips it and keeps assembling.
+        lines = [
+            json.dumps({"message": {"content": "a"}}).encode("utf-8"),
+            b"null",
+            json.dumps({"message": {"content": "b"}}).encode("utf-8"),
+            b"[1,2]",
+            json.dumps({"message": {"content": "c"}}).encode("utf-8"),
+            b'"scalar"',
+        ]
+        with unittest.mock.patch("urllib.request.urlopen", return_value=self._FakeStream(lines)):
+            result = agent_module._transport_post(self.runtime, self.messages)
+        self.assertEqual(result, "abc")
+        # raw_partial stays coherent: only the real content chunks were fed.
+        self.assertEqual(self.runtime.turn_progress.snapshot()["raw_partial"], "abc")
+
+    def test_null_content_contributes_empty_string_not_none(self):
+        lines = [
+            json.dumps({"message": {"content": "x"}}).encode("utf-8"),
+            json.dumps({"message": {"content": None}}).encode("utf-8"),
+            json.dumps({"message": {"content": "y"}}).encode("utf-8"),
+        ]
+        with unittest.mock.patch("urllib.request.urlopen", return_value=self._FakeStream(lines)):
+            result = agent_module._transport_post(self.runtime, self.messages)
+        self.assertEqual(result, "xy")
+        self.assertNotIn("None", result)
+        self.assertEqual(self.runtime.turn_progress.snapshot()["raw_partial"], "xy")
+
+    def test_non_utf8_line_is_skipped(self):
+        lines = [
+            json.dumps({"message": {"content": "oi "}}).encode("utf-8"),
+            b"\xff\xfe garbage",
+            json.dumps({"message": {"content": "tudo bem"}}).encode("utf-8"),
+        ]
+        with unittest.mock.patch("urllib.request.urlopen", return_value=self._FakeStream(lines)):
+            result = agent_module._transport_post(self.runtime, self.messages)
+        self.assertEqual(result, "oi tudo bem")
+        self.assertEqual(self.runtime.turn_progress.snapshot()["raw_partial"], "oi tudo bem")
+
+
+class TestAgentActiveTurnEndpoint(unittest.TestCase):
+    """Row 17 over HTTP: read-only in-memory progress snapshot; idle before
+    any turn, done after the mock turn, 400 on a malformed session_id, and
+    the idle/done shape for a foreign session id."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ["NOTIFYBOT_SMOKE_AGENT_MOCK"] = "1"
+        cls.fixture = AgentApiServerFixture(valid_config_payload())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fixture.close()
+        os.environ.pop("NOTIFYBOT_SMOKE_AGENT_MOCK", None)
+
+    def test_400_on_invalid_session_id(self):
+        status, body = self.fixture.request("GET", "/api/agent/active-turn?session_id=bad$id")
+        self.assertEqual(status, 400)
+        self.assertIn("invalid agent session id", body["error"])
+
+    def test_00_active_turn_before_any_turn_idle_snapshot(self):
+        # Sort-safe prefix: unittest runs methods alphabetically, so this
+        # idle assertion must precede every method that POSTs a turn.
+        status, snapshot = self.fixture.request("GET", "/api/agent/active-turn")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            set(snapshot.keys()),
+            {"session_id", "phase", "attempt", "started_at", "current_tool",
+             "tool_started_at", "completed_tools", "raw_partial", "done"},
+        )
+        self.assertIsNone(snapshot["session_id"])
+        self.assertEqual(snapshot["phase"], "idle")
+        self.assertEqual(snapshot["attempt"], 0)
+        self.assertFalse(snapshot["done"])
+        self.assertIsNone(snapshot["started_at"])
+        self.assertIsNone(snapshot["current_tool"])
+        self.assertEqual(snapshot["completed_tools"], [])
+        self.assertEqual(snapshot["raw_partial"], "")
+
+    def test_active_turn_blank_session_id_is_unfiltered(self):
+        # keep_blank_values parses the param; an empty value means "no filter"
+        # and must NOT be 400-validated.
+        status, snapshot = self.fixture.request("GET", "/api/agent/active-turn?session_id=")
+        self.assertEqual(status, 200)
+        self.assertIn("phase", snapshot)
+        self.assertIn("session_id", snapshot)
+
+    def test_active_turn_done_after_mock_turn(self):
+        # Foreign session id BEFORE any turn: truthful idle/done shape.
+        status, foreign = self.fixture.request(
+            "GET", "/api/agent/active-turn?session_id=bff0a1c2-0000-0000-0000-000000000000"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(foreign["phase"], "idle")
+        self.assertTrue(foreign["done"])
+        self.assertEqual(foreign["session_id"], "bff0a1c2-0000-0000-0000-000000000000")
+
+        status, turn = self.fixture.request("POST", "/api/agent/turn", {"message": "Olá bot! Tudo bem?"})
+        self.assertEqual(status, 200)
+        session_id = turn["session_id"]
+        self.assertRegex(session_id, r"^[A-Za-z0-9-]{1,64}$")
+
+        status, snapshot = self.fixture.request("GET", "/api/agent/active-turn")
+        self.assertEqual(status, 200)
+        self.assertTrue(snapshot["done"])
+        self.assertEqual(snapshot["phase"], "done")
+        self.assertEqual(snapshot["session_id"], session_id)
+        self.assertIn("session_id", snapshot)
+
+        # Explicit ?session_id=<real id> after the turn: same done snapshot.
+        status, filtered = self.fixture.request(
+            "GET", f"/api/agent/active-turn?session_id={session_id}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(filtered["done"], True)
+        self.assertEqual(filtered["phase"], "done")
+        self.assertEqual(filtered["session_id"], session_id)
+        # Mock return raw JSON landed in the live tail via set_raw_output.
+        self.assertTrue(filtered["raw_partial"])
+        self.assertEqual(filtered["completed_tools"], [])  # plain answer turn
 
 
 if __name__ == "__main__":

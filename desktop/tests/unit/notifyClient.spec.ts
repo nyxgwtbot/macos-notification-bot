@@ -220,3 +220,75 @@ describe('client payload wiring (typing smoke)', () => {
     expect(init.body).toBe(JSON.stringify({ domain: 'notes' }));
   });
 });
+
+// ---- #17 agent active-turn side channel -----------------------------------
+
+describe('#17 getAgentActiveTurn wiring', () => {
+  beforeEach(() => {
+    installBridge(null);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    installBridge(null);
+  });
+
+  test('without a session id it hits GET /api/agent/active-turn with no query', async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            session_id: null,
+            phase: 'idle',
+            attempt: 0,
+            started_at: null,
+            current_tool: null,
+            tool_started_at: null,
+            completed_tools: [],
+            raw_partial: '',
+            done: true
+          }),
+          { status: 200 }
+        )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await new NotifyClient().getAgentActiveTurn();
+
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('http://127.0.0.1:4769/api/agent/active-turn');
+    expect(init.method).toBe('GET');
+    expect(result.phase).toBe('idle');
+    expect(result.done).toBe(true);
+  });
+
+  test('encodes the session id into the query string', async () => {
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await new NotifyClient().getAgentActiveTurn('abc 123');
+
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('http://127.0.0.1:4769/api/agent/active-turn?session_id=abc%20123');
+    expect(init.method).toBe('GET');
+  });
+
+  test('null session id omits the query string', async () => {
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await new NotifyClient().getAgentActiveTurn(null);
+
+    const [url] = fetchMock.mock.calls[0] as unknown as [string];
+    expect(url).toBe('http://127.0.0.1:4769/api/agent/active-turn');
+  });
+
+  test('routes through the Electron bridge with the same path', async () => {
+    const requestMock = vi.fn(async () => ({ success: true, status: 200, body: '{"phase":"idle"}' }));
+    installBridge({ api: { request: requestMock as unknown as NotifyAPI['api']['request'] } } as Partial<NotifyAPI>);
+
+    await new NotifyClient().getAgentActiveTurn('abc 123');
+
+    expect(requestMock).toHaveBeenCalledWith('GET', '/api/agent/active-turn?session_id=abc%20123', undefined);
+  });
+});

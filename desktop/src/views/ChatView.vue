@@ -88,11 +88,110 @@
                     <ion-icon aria-hidden="true" :icon="copiedBubbles.has(item.id) ? checkmarkOutline : copyOutline" />
                   </button>
                 </div>
+                <!-- Step 6: a completed turn with no tool calls keeps its
+                     collapsed "Thinking" block on the answer bubble -->
+                <div v-if="item.role === 'assistant' && item.thinking" class="nb-thinking">
+                  <div class="nb-thinking-head-row">
+                    <button
+                      type="button"
+                      class="nb-thinking-head"
+                      :aria-expanded="expandedThinking.has(item.id)"
+                      :aria-controls="`nb-thinking-${item.id}`"
+                      @click="toggleThinking(item.id)"
+                    >
+                      <ion-icon
+                        aria-hidden="true"
+                        :class="{ 'is-expanded': expandedThinking.has(item.id) }"
+                        :icon="chevronDownOutline"
+                      />
+                      <span>Thinking</span>
+                      <span v-if="!expandedThinking.has(item.id)" class="nb-thinking-preview-inline">{{ thinkingTail(item.thinking) }}</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="nb-thinking-copy"
+                      aria-label="Copy thinking"
+                      @click="copyThinking(item.id, item.thinking)"
+                    >
+                      <ion-icon aria-hidden="true" :icon="copiedThinking.has(item.id) ? checkmarkOutline : copyOutline" />
+                    </button>
+                  </div>
+                  <pre v-show="expandedThinking.has(item.id)" :id="`nb-thinking-${item.id}`" class="nb-thinking-pre">{{ item.thinking }}</pre>
+                </div>
+              </div>
+
+              <!-- Step 6: live turn progress while POST /api/agent/turn is in
+                   flight — elapsed clock, phase copy, tool chips, and the
+                   streaming "Thinking" tail (replaced on completion). -->
+              <div v-else-if="item.kind === 'progress'" class="nb-bubble nb-bubble-assistant nb-turn-progress" aria-live="off">
+                <div class="nb-progress-status">
+                  <span class="nb-typing" aria-hidden="true"><i></i><i></i><i></i></span>
+                  <span class="nb-progress-elapsed">{{ formatTurnElapsed(item.startedAt ?? pendingStartedAt, nowMs) }}</span>
+                  <span class="nb-progress-sep" aria-hidden="true">·</span>
+                  <span class="nb-progress-phase">{{ item.phaseLabel }}</span>
+                </div>
+                <div v-if="item.completedChips.length > 0 || item.currentTool" class="nb-tool-activity">
+                  <div
+                    v-for="chip in item.completedChips"
+                    :key="chip.id"
+                    class="nb-tool-chip"
+                    :class="{ 'nb-tool-chip-error': !chip.ok }"
+                  >
+                    <button
+                      type="button"
+                      class="nb-tool-chip-head"
+                      :aria-expanded="expandedChips.has(chip.id)"
+                      @click="toggleChip(chip.id)"
+                    >
+                      <span class="nb-tool-tool">{{ chip.tool }}</span>
+                      <span v-if="chip.target" class="nb-tool-target">{{ chip.target }}</span>
+                      <span class="nb-tool-status" :class="chip.ok ? 'nb-tool-status-ok' : 'nb-tool-status-error'">
+                        {{ chip.ok ? 'ok' : 'error' }}
+                      </span>
+                    </button>
+                    <pre v-if="expandedChips.has(chip.id)" class="nb-tool-preview">{{ chip.preview }}</pre>
+                  </div>
+                  <div v-if="item.currentTool" class="nb-tool-chip nb-tool-chip-running">
+                    <div class="nb-tool-chip-head">
+                      <span class="nb-tool-tool">{{ item.currentTool.tool }}</span>
+                      <span v-if="item.currentTool.target" class="nb-tool-target">{{ item.currentTool.target }}</span>
+                      <span class="nb-tool-status nb-status-live">running…</span>
+                    </div>
+                  </div>
+                </div>
+                <div v-if="item.rawPartial" class="nb-thinking">
+                  <div class="nb-thinking-head-row">
+                    <button
+                      type="button"
+                      class="nb-thinking-head"
+                      :aria-expanded="expandedThinking.has(item.id)"
+                      :aria-controls="`nb-thinking-${item.id}`"
+                      @click="toggleThinking(item.id)"
+                    >
+                      <ion-icon
+                        aria-hidden="true"
+                        :class="{ 'is-expanded': expandedThinking.has(item.id) }"
+                        :icon="chevronDownOutline"
+                      />
+                      <span>Thinking</span>
+                      <span v-if="!expandedThinking.has(item.id)" class="nb-thinking-preview-inline">{{ thinkingTail(item.rawPartial) }}</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="nb-thinking-copy"
+                      aria-label="Copy thinking"
+                      @click="copyThinking(item.id, item.rawPartial)"
+                    >
+                      <ion-icon aria-hidden="true" :icon="copiedThinking.has(item.id) ? checkmarkOutline : copyOutline" />
+                    </button>
+                  </div>
+                  <pre v-show="expandedThinking.has(item.id)" :id="`nb-thinking-${item.id}`" class="nb-thinking-pre">{{ item.rawPartial }}</pre>
+                </div>
               </div>
 
               <!-- F1: collapsible per-turn tool-activity group (collapsed by
                    default, count label as the toggle) -->
-              <div v-else class="nb-turn-tools">
+              <div v-else-if="item.kind === 'tools'" class="nb-turn-tools">
                 <button
                   type="button"
                   class="nb-turn-tools-head"
@@ -125,6 +224,35 @@
                     </button>
                     <pre v-if="expandedChips.has(chip.id)" class="nb-tool-preview">{{ chip.preview }}</pre>
                   </div>
+                </div>
+                <!-- Step 6: completed turn keeps its collapsed "Thinking" block -->
+                <div v-if="item.thinking" class="nb-thinking">
+                  <div class="nb-thinking-head-row">
+                    <button
+                      type="button"
+                      class="nb-thinking-head"
+                      :aria-expanded="expandedThinking.has(item.id)"
+                      :aria-controls="`nb-thinking-${item.id}`"
+                      @click="toggleThinking(item.id)"
+                    >
+                      <ion-icon
+                        aria-hidden="true"
+                        :class="{ 'is-expanded': expandedThinking.has(item.id) }"
+                        :icon="chevronDownOutline"
+                      />
+                      <span>Thinking</span>
+                      <span v-if="!expandedThinking.has(item.id)" class="nb-thinking-preview-inline">{{ thinkingTail(item.thinking) }}</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="nb-thinking-copy"
+                      aria-label="Copy thinking"
+                      @click="copyThinking(item.id, item.thinking)"
+                    >
+                      <ion-icon aria-hidden="true" :icon="copiedThinking.has(item.id) ? checkmarkOutline : copyOutline" />
+                    </button>
+                  </div>
+                  <pre v-show="expandedThinking.has(item.id)" :id="`nb-thinking-${item.id}`" class="nb-thinking-pre">{{ item.thinking }}</pre>
                 </div>
               </div>
             </template>
@@ -160,10 +288,14 @@
               </p>
             </div>
 
-            <!-- F6: pending bubble with a CSS-only animated dot pattern -->
-            <div v-if="state.pending" class="nb-bubble nb-bubble-assistant nb-pending-bubble">
+            <!-- F6 + Step 6: pending bubble with a CSS-only animated dot pattern;
+                 instant feedback before the first progress poll resolves -->
+            <div
+              v-if="state.pending && !state.items.some((i) => i.kind === 'progress')"
+              class="nb-bubble nb-bubble-assistant nb-pending-bubble"
+            >
               <span class="nb-typing" aria-hidden="true"><i></i><i></i><i></i></span>
-              <span>Working…</span>
+              <span>{{ formatTurnElapsed(pendingStartedAt, nowMs) }} · Thinking…</span>
             </div>
           </div>
 
@@ -271,6 +403,7 @@ import { notifyClient, errorText } from '@/services/notifyClient';
 import { usePolling } from '@/composables/usePolling';
 import {
   formatBubbleTime,
+  formatTurnElapsed,
   initialChatState,
   isIpcTimeout,
   reduceChat,
@@ -280,6 +413,7 @@ import {
   type ChatState
 } from '@/viewModels/chatViewModel';
 import { mdLite } from '@/utils/mdLite';
+import { scrollBehavior } from '@/utils/motion';
 
 /** F3: card-like onboarding suggestions — click prefills the composer draft
  * (no auto-send); text is the prompt the agent performs best. */
@@ -313,6 +447,13 @@ const expandedChips = reactive(new Set<string>());
 const expandedGroups = reactive(new Set<string>());
 /** F2: transient per-bubble "copied" state (icon swaps to a checkmark). */
 const copiedBubbles = reactive(new Set<string>());
+/** Step 6: collapsible "Thinking" blocks (live + completed turns) and their
+ * transient copy feedback, both keyed by transcript item id. */
+const expandedThinking = reactive(new Set<string>());
+const copiedThinking = reactive(new Set<string>());
+/** Step 6: wall-clock anchor for the live turn's "Working · Ns" clock. */
+const pendingStartedAt = ref<string | null>(null);
+const nowMs = ref<number>(Date.now());
 const railOpen = ref(true);
 const reloadKey = ref(0);
 const copiedRecently = ref(false);
@@ -337,14 +478,61 @@ watch(
   }
 );
 
+// Step 6: the live progress item is replaced in place each poll; watch a
+// derived signature of its meaningful fields so the transcript keeps
+// following the growing status/chips/thinking without reacting to nowMs ticks.
+const liveProgressSignature = computed(() => {
+  const progressItem = state.value.items.find((item) => item.kind === 'progress');
+  if (!progressItem || progressItem.kind !== 'progress') return '';
+  return [
+    progressItem.id,
+    progressItem.phase,
+    progressItem.completedChips.length,
+    progressItem.currentTool?.tool ?? '',
+    progressItem.rawPartial.length,
+    // The raw tail saturates at its 400-char cap while streaming, so include
+    // its last characters too — length alone would stop following the body.
+    progressItem.rawPartial.slice(-24)
+  ].join('|');
+});
+
+/** Distance from the bottom (px) treated as "still at the tail". Poll ticks
+ * must not yank a reader who scrolled up into history. */
+const NEAR_TAIL_PX = 80;
+
+/** Step 6: keep a visible expanded Thinking body pinned to its stream tail
+ * (instant, so reduced-motion users are unaffected); hidden bodies skip.
+ * Only bodies already at their tail follow new text — a mid-block scroll
+ * upward stays put. */
+function followThinkingTails(): void {
+  const root = transcriptEl.value;
+  if (!root) return;
+  root.querySelectorAll<HTMLElement>('.nb-thinking-pre').forEach((el) => {
+    if (el.offsetParent !== null && el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_TAIL_PX) {
+      el.scrollTop = el.scrollHeight;
+    }
+  });
+}
+
 // Auto-scroll transcript internally when new items arrive or pending state toggles
 watch(
-  [() => state.value.items.length, () => state.value.pending, () => state.value.sessionId],
+  [
+    () => state.value.items.length,
+    () => state.value.pending,
+    () => state.value.sessionId,
+    liveProgressSignature
+  ],
   async () => {
     await nextTick();
-    if (transcriptEl.value) {
-      transcriptEl.value.scrollTo({ top: transcriptEl.value.scrollHeight, behavior: 'smooth' });
+    const el = transcriptEl.value;
+    if (!el) return;
+    // Only advance when the reader is already at the tail; a scrolled-up
+    // reader keeps their position (also covers the single turn-succeeded tick:
+    // pending flips false and this guard decides whether to jump).
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_TAIL_PX) {
+      el.scrollTo({ top: el.scrollHeight, behavior: scrollBehavior() });
     }
+    followThinkingTails();
   }
 );
 
@@ -413,6 +601,23 @@ function toggleGroup(groupId: string): void {
   }
 }
 
+/** Step 6: collapsible Thinking bodies, keyed by transcript item id. */
+function toggleThinking(itemId: string): void {
+  if (expandedThinking.has(itemId)) {
+    expandedThinking.delete(itemId);
+  } else {
+    expandedThinking.add(itemId);
+  }
+}
+
+/** Single-line collapsed preview: the last non-empty line of the raw tail. */
+function thinkingTail(text: string): string {
+  const trimmed = text.trimEnd();
+  if (trimmed === '') return '';
+  const lines = trimmed.split('\n');
+  return lines[lines.length - 1].trim();
+}
+
 /** F3: prefill (not send) the composer draft from a suggestion and focus it. */
 function prefill(text: string): void {
   dispatch({ type: 'prefill', text });
@@ -471,6 +676,19 @@ async function copyBubble(bubble: ChatBubble): Promise<void> {
   }
 }
 
+/** Step 6: copy a Thinking block's raw tail (icon flips for 2s). */
+async function copyThinking(itemId: string, text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+    copiedThinking.add(itemId);
+    setTimeout(() => {
+      copiedThinking.delete(itemId);
+    }, 2000);
+  } catch {
+    // clipboard write failure swallowed
+  }
+}
+
 async function send(): Promise<void> {
   const message = state.value.draft.trim();
   if (!message || state.value.pending) return;
@@ -516,6 +734,40 @@ async function pollHealthTick(): Promise<void> {
 
 const daemonPoller = usePolling(pollHealthTick, { intervalMs: 5000 });
 
+/** Step 6: ~1s active-turn poll during a pending turn. Each tick also bumps
+ * nowMs so the elapsed label stays honest; late/done events are ignored by
+ * the reducer, and POST /api/agent/turn owns turn failure. */
+async function pollActiveTurnTick(): Promise<void> {
+  nowMs.value = Date.now();
+  if (!state.value.pending) return;
+  try {
+    const progress = await notifyClient.getAgentActiveTurn(state.value.sessionId);
+    if (state.value.pending) {
+      dispatch({ type: 'turn-progress', progress });
+    }
+  } catch {
+    // transient poll errors are ignored; POST /api/agent/turn owns turn failure
+  }
+}
+
+const turnPoller = usePolling(pollActiveTurnTick, { intervalMs: 1000, immediate: true });
+
+// Step 6: the live poll only runs while a turn is in flight; the send action
+// flips `pending` and immediately paints the fallback bubble.
+watch(
+  () => state.value.pending,
+  (pending) => {
+    if (pending) {
+      pendingStartedAt.value = new Date().toISOString();
+      nowMs.value = Date.now();
+      turnPoller.start();
+    } else {
+      turnPoller.stop();
+      pendingStartedAt.value = null;
+    }
+  }
+);
+
 const daemonTone = ref<'running' | 'stopped' | 'unknown'>('unknown');
 
 const daemonDotTitle = computed(() =>
@@ -537,6 +789,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   daemonPoller.stop();
+  turnPoller.stop();
 });
 </script>
 
@@ -895,6 +1148,139 @@ onUnmounted(() => {
   }
 }
 
+/* Step 6: live turn-progress bubble — quiet status line, then chips/thinking */
+.nb-turn-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-space-1);
+  min-width: 0;
+}
+
+.nb-progress-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--nb-space-2);
+  font-size: var(--nb-fs-secondary);
+  line-height: 1.45;
+  color: var(--nb-text-secondary);
+  min-width: 0;
+}
+
+.nb-progress-elapsed {
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-micro);
+  color: var(--nb-text-secondary);
+  white-space: nowrap;
+}
+
+.nb-progress-sep {
+  color: var(--nb-text-muted);
+}
+
+.nb-progress-phase {
+  min-width: 0;
+  color: var(--nb-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+/* Step 6: collapsible Thinking body (live stream + completed turns) */
+.nb-thinking {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-space-1);
+  margin-top: var(--nb-space-1);
+  padding: var(--nb-space-1) var(--nb-space-2);
+  min-width: 0;
+  max-width: 100%;
+  border: 1px solid var(--nb-border-default);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-bg-elevated);
+}
+
+.nb-thinking-head-row {
+  display: flex;
+  align-items: center;
+  gap: var(--nb-space-1);
+  min-width: 0;
+}
+
+.nb-thinking-head {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nb-space-1);
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--nb-text-muted);
+  font-size: var(--nb-fs-micro);
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.nb-thinking-head:hover {
+  color: var(--nb-text-secondary);
+}
+
+.nb-thinking-head ion-icon {
+  flex: none;
+  font-size: 12px;
+  transition: transform 120ms ease;
+}
+
+.nb-thinking-head ion-icon.is-expanded {
+  transform: rotate(180deg);
+}
+
+.nb-thinking-preview-inline {
+  min-width: 0;
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-micro);
+  font-weight: 400;
+  color: var(--nb-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nb-thinking-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  padding: 0;
+  border: none;
+  border-radius: var(--nb-radius-sm);
+  background: transparent;
+  color: var(--nb-text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.nb-thinking-copy:hover {
+  color: var(--nb-text-primary);
+}
+
+.nb-thinking-pre {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  max-height: 180px;
+  overflow-y: auto;
+  font-family: var(--nb-mono);
+  font-size: var(--nb-fs-micro);
+  line-height: 1.45;
+  color: var(--nb-text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .nb-onboarding {
   display: flex;
   flex-direction: column;
@@ -1089,6 +1475,16 @@ onUnmounted(() => {
   font-size: var(--nb-fs-micro);
   line-height: 1.45;
   color: var(--nb-text-secondary);
+}
+
+/* Step 6: in-flight tool chip — teal-tinted, non-expandable, live badge */
+.nb-tool-chip-running {
+  border-color: var(--nb-teal-muted);
+  background: var(--nb-teal-muted);
+}
+
+.nb-tool-chip-running .nb-tool-chip-head {
+  cursor: default;
 }
 
 /* C3: one bordered composer group — textarea + hint/send foot inside it */
