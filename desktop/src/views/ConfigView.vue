@@ -1025,6 +1025,14 @@ onUnmounted(() => {
   padding: var(--nb-space-2) var(--nb-space-3);
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
+/* L5-R3: typed text lives on the shadow-DOM native input — inset it via the
+   Ionic custom properties (host padding reads 0px live); 12px inline, 8px top */
+.nb-field-slot ion-input {
+  --padding-start: var(--nb-space-3);
+  --padding-end: var(--nb-space-3);
+  --padding-top: var(--nb-space-2);
+  --padding-bottom: var(--nb-space-2);
+}
 .nb-field ion-input:focus-within {
   border-color: var(--nb-info);
   box-shadow: 0 0 0 2px var(--nb-info-muted);

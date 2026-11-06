@@ -1115,8 +1115,8 @@ onUnmounted(() => {
 
 .nb-composer-input {
   --background: transparent;
-  --padding-start: var(--nb-space-2);
-  --padding-end: var(--nb-space-2);
+  --padding-start: var(--nb-space-3);
+  --padding-end: var(--nb-space-3);
   --padding-top: 0;
   --padding-bottom: 0;
   font-size: var(--nb-fs-body);
@@ -1131,7 +1131,7 @@ onUnmounted(() => {
 }
 
 .nb-composer-hint {
-  padding-inline-start: var(--nb-space-2);
+  padding-inline-start: var(--nb-space-3);
   font-size: var(--nb-fs-micro);
   color: var(--nb-text-muted);
 }

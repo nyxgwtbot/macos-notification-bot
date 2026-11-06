@@ -570,7 +570,7 @@ onUnmounted(() => {
   flex: 1 1 130px;
   min-width: 110px;
   max-width: 180px;
-  padding: 3px var(--nb-space-2);
+  padding: 4px 10px;
   border: 1px solid var(--nb-border-default);
   border-radius: var(--nb-radius-sm);
   background: var(--nb-bg-deep);

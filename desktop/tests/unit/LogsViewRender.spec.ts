@@ -8,6 +8,10 @@
  * density chip persistence contract.
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia, type Pinia } from 'pinia';
 import { afterEach, describe, expect, test, vi } from 'vitest';
@@ -264,5 +268,18 @@ describe('LogsView R7 semantics, persistence, highlight', () => {
     expect(wrapper.find('.nb-log-header-end .nb-live-badge').attributes('data-state')).toBe('error');
 
     wrapper.unmount();
+  });
+
+  test('L5-R3 field comfort: log search control breathes (4px 10px, row height ≤26px)', () => {
+    // Scoped SFC CSS is not applied in vitest (no css: true in vite.config);
+    // pin the compiled rule — height budget: 11px font × 1.45 line-height
+    // ≈ 16px content + 8px vertical padding + 2px border ≈ 26px max.
+    const source = readFileSync(
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../src/views/LogsView.vue'),
+      'utf8'
+    );
+    const rule = source.match(/\.nb-log-search\s*\{[^}]*\}/);
+    expect(rule).not.toBeNull();
+    expect(rule?.[0]).toContain('padding: 4px 10px;');
   });
 });

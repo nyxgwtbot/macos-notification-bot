@@ -9,6 +9,10 @@
  * - the Connectors error banner carries a Retry that re-raises loadConnectors
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, setActivePinia, type Pinia } from 'pinia';
 import {
@@ -366,6 +370,28 @@ describe('ConfigView banner flow + actions validation (R8)', () => {
     const title = wrapper.find('ion-title');
     expect(title.attributes('role')).toBe('heading');
     expect(title.attributes('aria-level')).toBe('1');
+    wrapper.unmount();
+    mounted = null;
+  });
+
+  test('L5-R3 field comfort: field slots wrap ion-inputs and inset typed text via custom properties', async () => {
+    const { wrapper } = await mountConfig(baseConfig());
+    expect(wrapper.findAll('.nb-field-slot ion-input').length).toBe(5);
+
+    // Scoped SFC CSS is not applied in vitest (no css: true in vite.config);
+    // pin the rule that compiles into the view — the visible inset lives on
+    // the shadow-DOM native input, confirmed live via the supervisor CDP pass.
+    const source = readFileSync(
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../src/views/ConfigView.vue'),
+      'utf8'
+    );
+    const rule = source.match(/\.nb-field-slot ion-input\s*\{[^}]*\}/);
+    expect(rule).not.toBeNull();
+    expect(rule?.[0]).toContain('--padding-start: var(--nb-space-3);');
+    expect(rule?.[0]).toContain('--padding-end: var(--nb-space-3);');
+    expect(rule?.[0]).toContain('--padding-top: var(--nb-space-2);');
+    expect(rule?.[0]).toContain('--padding-bottom: var(--nb-space-2);');
+
     wrapper.unmount();
     mounted = null;
   });
