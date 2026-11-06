@@ -38,7 +38,7 @@
             @ionChange="onSessionChange($event)"
           >
             <ion-select-option v-for="session in state.sessions" :key="session.session_id" :value="session.session_id">
-              {{ session.preview }} ({{ session.turns }} turns)
+              {{ session.preview }} ({{ session.turns }} turns)<template v-if="formatBubbleTime(session.updated_at) !== ''"> · updated {{ formatBubbleTime(session.updated_at) }}</template>
             </ion-select-option>
           </ion-select>
           <ion-button size="small" fill="clear" class="nb-btn-quiet" @click="newSession">New chat</ion-button>
@@ -128,7 +128,14 @@
                   <span class="nb-typing" aria-hidden="true"><i></i><i></i><i></i></span>
                   <span class="nb-progress-elapsed">{{ formatTurnElapsed(item.startedAt ?? pendingStartedAt, nowMs) }}</span>
                   <span class="nb-progress-sep" aria-hidden="true">·</span>
-                  <span class="nb-progress-phase">{{ item.phaseLabel }}</span>
+                  <span class="nb-progress-phase" aria-live="polite">{{ item.phaseLabel }}</span>
+                  <ion-button
+                    size="small"
+                    fill="clear"
+                    class="nb-progress-stop"
+                    :title="'Stop waiting — the turn may still finish and appear here'"
+                    @click="stopWaiting"
+                  >Stop</ion-button>
                 </div>
                 <div v-if="item.completedChips.length > 0 || item.currentTool" class="nb-tool-activity">
                   <div
@@ -141,6 +148,7 @@
                       type="button"
                       class="nb-tool-chip-head"
                       :aria-expanded="expandedChips.has(chip.id)"
+                      :aria-controls="`nb-chip-${chip.id}`"
                       @click="toggleChip(chip.id)"
                     >
                       <span class="nb-tool-tool">{{ chip.tool }}</span>
@@ -149,7 +157,7 @@
                         {{ chip.ok ? 'ok' : 'error' }}
                       </span>
                     </button>
-                    <pre v-if="expandedChips.has(chip.id)" class="nb-tool-preview">{{ chip.preview }}</pre>
+                    <pre v-show="expandedChips.has(chip.id)" :id="`nb-chip-${chip.id}`" class="nb-tool-preview">{{ chip.preview }}</pre>
                   </div>
                   <div v-if="item.currentTool" class="nb-tool-chip nb-tool-chip-running">
                     <div class="nb-tool-chip-head">
@@ -214,6 +222,7 @@
                       type="button"
                       class="nb-tool-chip-head"
                       :aria-expanded="expandedChips.has(chip.id)"
+                      :aria-controls="`nb-chip-${chip.id}`"
                       @click="toggleChip(chip.id)"
                     >
                       <span class="nb-tool-tool">{{ chip.tool }}</span>
@@ -222,7 +231,7 @@
                         {{ chip.ok ? 'ok' : 'error' }}
                       </span>
                     </button>
-                    <pre v-if="expandedChips.has(chip.id)" class="nb-tool-preview">{{ chip.preview }}</pre>
+                    <pre v-show="expandedChips.has(chip.id)" :id="`nb-chip-${chip.id}`" class="nb-tool-preview">{{ chip.preview }}</pre>
                   </div>
                 </div>
                 <!-- Step 6: completed turn keeps its collapsed "Thinking" block -->
@@ -300,12 +309,12 @@
           </div>
 
           <!-- Turn error banner with retry -->
-          <div v-if="state.error" class="nb-error-strip">
+          <div v-if="state.error" class="nb-error-strip" role="alert">
             <div class="nb-error-strip-msg">
               <ion-icon aria-hidden="true" :icon="alertCircleOutline" />
-              <span>Turn failed: {{ state.error }}</span>
+              <span>{{ state.error }}</span>
             </div>
-            <ion-button size="small" fill="outline" @click="retryLast">Retry</ion-button>
+            <ion-button size="small" fill="outline" title="Puts your last message back in the composer" @click="retryLast">Retry</ion-button>
           </div>
 
           <!-- Composer: bordered group (C3) — textarea + hint/send foot inside one surface -->
@@ -323,7 +332,7 @@
               />
               <div class="nb-composer-foot">
                 <span class="nb-composer-hint">⏎ Send · ⇧⏎ Newline</span>
-                <ion-button class="nb-send-btn" :disabled="!canSend" fill="solid" @click="send">
+                <ion-button class="nb-send-btn" :disabled="!canSend" :title="state.draft.trim() === '' ? 'Type a message to enable send' : undefined" fill="solid" @click="send">
                   <ion-spinner v-if="state.pending" name="crescent" />
                   <template v-else>Send</template>
                 </ion-button>
@@ -402,13 +411,17 @@ import {
 import { notifyClient, errorText } from '@/services/notifyClient';
 import { usePolling } from '@/composables/usePolling';
 import {
+  clearStoredDraft,
   formatBubbleTime,
   formatTurnElapsed,
   initialChatState,
   isIpcTimeout,
+  readStoredDraft,
   reduceChat,
   smoothProgressPreview,
   toolSummaryFromChips,
+  turnFailedErrorText,
+  writeStoredDraft,
   type ChatBubble,
   type ChatEvent,
   type ChatState
@@ -577,7 +590,7 @@ async function loadSession(sessionId: string): Promise<void> {
     const detail = await notifyClient.getAgentSession(sessionId);
     dispatch({ type: 'session-loaded', sessionId, records: detail.records });
   } catch (err) {
-    dispatch({ type: 'turn-failed', error: errorText(err) });
+    dispatch({ type: 'turn-failed', error: `Turn failed: ${errorText(err)}` });
   }
 }
 
@@ -628,8 +641,17 @@ async function focusComposer(): Promise<void> {
 /** Composer keystrokes keep the VM draft in sync (send-on-enter stays view-side). */
 type IonValueEvent = CustomEvent<{ value?: string | null }>;
 
+/** Draft autosave: debounce typing so localStorage writes stay rare. */
+const DRAFT_SAVE_DEBOUNCE_MS = 300;
+let draftSaveTimer: number | null = null;
+
 function onDraftInput(event: IonValueEvent): void {
   dispatch({ type: 'draft-changed', text: String(event.detail?.value ?? '') });
+  if (draftSaveTimer !== null) window.clearTimeout(draftSaveTimer);
+  draftSaveTimer = window.setTimeout(() => {
+    draftSaveTimer = null;
+    writeStoredDraft(state.value.draft);
+  }, DRAFT_SAVE_DEBOUNCE_MS);
 }
 
 function onComposerKeydown(event: KeyboardEvent): void {
@@ -687,12 +709,13 @@ async function send(): Promise<void> {
   if (!message || state.value.pending) return;
   lastMessage.value = message;
   dispatch({ type: 'send', message });
+  clearStoredDraft();
   try {
     const response = await notifyClient.postAgentTurn(state.value.sessionId, message);
     dispatch({ type: 'turn-succeeded', response });
     void loadSessions();
   } catch (err) {
-    dispatch({ type: 'turn-failed', error: errorText(err) });
+    dispatch({ type: 'turn-failed', error: turnFailedErrorText(err) });
     // IPC proxy timeout recovery: the python handler thread may still have
     // finished the turn — the session jsonl is the source of truth.
     if (isIpcTimeout(err) && state.value.sessionId) {
@@ -704,6 +727,15 @@ async function send(): Promise<void> {
       }
     }
   }
+}
+
+/** Stop the live wait without claiming a server cancel: the turn may still
+ * finish server-side, so the copy points at reopening the session. */
+function stopWaiting(): void {
+  dispatch({
+    type: 'turn-failed',
+    error: 'Stopped waiting — the turn may still finish. Reopen this session to check.',
+  });
 }
 
 function retryLast(): void {
@@ -776,6 +808,10 @@ function goStatus(): void {
 }
 
 onMounted(() => {
+  const storedDraft = readStoredDraft();
+  if (storedDraft !== '') {
+    dispatch({ type: 'draft-changed', text: storedDraft });
+  }
   void loadSessions(true);
   daemonPoller.start();
 });
@@ -783,6 +819,7 @@ onMounted(() => {
 onUnmounted(() => {
   daemonPoller.stop();
   turnPoller.stop();
+  if (draftSaveTimer !== null) window.clearTimeout(draftSaveTimer);
 });
 </script>
 
@@ -814,7 +851,8 @@ onUnmounted(() => {
   width: 9px;
   height: 9px;
   flex: none;
-  padding: 0;
+  padding: var(--nb-space-2);
+  margin: calc(-1 * var(--nb-space-2));
   border: none;
   border-radius: var(--nb-radius-full);
   cursor: pointer;
@@ -886,6 +924,13 @@ onUnmounted(() => {
   padding: 0 var(--nb-space-3);
   font-size: var(--nb-fs-secondary);
   --highlight-color-focused: transparent;
+}
+
+/* Long session labels truncate inside the pill instead of clipping the header. */
+.nb-session-select::part(text) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .nb-session-select:focus:not(:focus-visible) {
@@ -1176,6 +1221,23 @@ onUnmounted(() => {
   min-width: 0;
   color: var(--nb-text-secondary);
   overflow-wrap: anywhere;
+}
+
+/* Quiet stop-waiting control: sits at the end of the status row, hover uses
+   the same elevated surface as the header quiet buttons. */
+.nb-progress-stop {
+  --background-hover: var(--nb-bg-hover);
+  --background-activated: var(--nb-bg-hover);
+  --background-focused: var(--nb-bg-hover);
+  --background-focused-opacity: 1;
+  --color: var(--nb-text-muted);
+  --color-hover: var(--nb-text-primary);
+  --color-activated: var(--nb-text-primary);
+  --color-focused: var(--nb-text-primary);
+  --padding-start: var(--nb-space-2);
+  --padding-end: var(--nb-space-2);
+  margin-left: auto;
+  font-size: var(--nb-fs-micro);
 }
 
 /* Step 6: collapsible Thinking body (live stream + completed turns) */

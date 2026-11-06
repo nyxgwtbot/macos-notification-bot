@@ -5,6 +5,8 @@
  * mapping helpers.
  */
 
+import { errorText } from '@/services/notifyClient';
+
 import type {
   AgentActiveTurnPhase,
   AgentActiveTurnResponse,
@@ -125,6 +127,14 @@ export function isIpcTimeout(err: unknown): boolean {
   return /timeout|timed out/i.test(message);
 }
 
+/** Turn-failure copy: the IPC-timeout case is recoverable (the session is
+ * reopened to check), so it reads differently from a plain failure. */
+export function turnFailedErrorText(err: unknown): string {
+  return isIpcTimeout(err)
+    ? 'The bot API didn\'t respond in time. The turn may have finished — this session is being reopened to check.'
+    : `Turn failed: ${errorText(err)}`;
+}
+
 /** Deterministic node ids from a monotonic counter carried in the state. */
 let seqCounter = 0;
 function nextId(prefix: string): string {
@@ -148,6 +158,39 @@ export function formatBubbleTime(ts: string | null | undefined): string {
   if (Number.isNaN(date.getTime())) return '';
   const two = (n: number) => String(n).padStart(2, '0');
   return `${two(date.getHours())}:${two(date.getMinutes())}`;
+}
+
+const CHAT_DRAFT_STORAGE_KEY = 'nb:chat.draft';
+const CHAT_DRAFT_MAX_LENGTH = 10_000;
+
+/** Composer draft persistence: localStorage can throw in privacy modes, so
+ * every access degrades to session-only (LogsView R7 pattern). */
+export function readStoredDraft(): string {
+  try {
+    return window.localStorage.getItem(CHAT_DRAFT_STORAGE_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+export function writeStoredDraft(text: string): void {
+  try {
+    if (text.trim() === '') {
+      window.localStorage.removeItem(CHAT_DRAFT_STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(CHAT_DRAFT_STORAGE_KEY, text.slice(0, CHAT_DRAFT_MAX_LENGTH));
+    }
+  } catch {
+    /* session-only */
+  }
+}
+
+export function clearStoredDraft(): void {
+  try {
+    window.localStorage.removeItem(CHAT_DRAFT_STORAGE_KEY);
+  } catch {
+    /* session-only */
+  }
 }
 
 /** First string value of a tool-args record, skipping 'html', sliced to 24
@@ -395,13 +438,17 @@ export function reduceChat(state: ChatState, event: ChatEvent): ChatState {
       ) {
         return state;
       }
-      const completedChips = (progress.completed_tools ?? []).map((step, index) => toToolChip(step, index));
+      const progressId = existing?.id ?? nextId('progress');
+      const completedChips = (progress.completed_tools ?? []).map((step, index) => ({
+        ...toToolChip(step, index),
+        id: `${progressId}-${index}`,
+      }));
       const currentTool = progress.current_tool
         ? { tool: progress.current_tool.tool, target: extractToolTarget(progress.current_tool.args) }
         : null;
       const progressItem: ChatProgressItem = {
         kind: 'progress',
-        id: existing?.id ?? nextId('progress'),
+        id: progressId,
         // Do not mutate state.sessionId: POST /api/agent/turn owns it. The item
         // only carries the id so the view can scope polling on first turn.
         sessionId: existing?.sessionId ?? progress.session_id ?? state.sessionId ?? null,

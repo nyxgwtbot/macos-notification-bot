@@ -1,6 +1,7 @@
-import { describe, expect, test, afterEach, vi } from 'vitest';
+import { describe, expect, test, beforeEach, afterEach, vi } from 'vitest';
 
 import {
+  clearStoredDraft,
   extractToolTarget,
   formatBubbleTime,
   formatTurnElapsed,
@@ -8,11 +9,14 @@ import {
   iframeUrlFrom,
   initialChatState,
   isIpcTimeout,
+  readStoredDraft,
   reduceChat,
   smoothProgressPreview,
   toToolChip,
   toolSummaryFromChips,
   transcriptFromRecords,
+  turnFailedErrorText,
+  writeStoredDraft,
   type ChatState,
   type ChatTranscriptItem
 } from '../../src/viewModels/chatViewModel';
@@ -420,6 +424,56 @@ describe('formatBubbleTime maps ts to local HH:MM', () => {
   });
 });
 
+// ---- composer draft persistence -------------------------------------------
+
+describe('composer draft persistence helpers', () => {
+  beforeEach(() => {
+    clearStoredDraft();
+  });
+
+  afterEach(() => {
+    clearStoredDraft();
+  });
+
+  test('writeStoredDraft -> readStoredDraft roundtrips the draft', () => {
+    writeStoredDraft('half typed');
+    expect(readStoredDraft()).toBe('half typed');
+  });
+
+  test('empty and whitespace-only writes remove the stored key', () => {
+    writeStoredDraft('something');
+    writeStoredDraft('   \n  ');
+    expect(readStoredDraft()).toBe('');
+    writeStoredDraft('something else');
+    writeStoredDraft('');
+    expect(readStoredDraft()).toBe('');
+  });
+
+  test('writes longer than 10k chars are truncated to exactly 10000', () => {
+    writeStoredDraft('x'.repeat(12_345));
+    expect(readStoredDraft()).toHaveLength(10_000);
+  });
+
+  test('clearStoredDraft removes the stored key', () => {
+    writeStoredDraft('keep?');
+    clearStoredDraft();
+    expect(readStoredDraft()).toBe('');
+  });
+});
+
+describe('turnFailedErrorText', () => {
+  test('IPC-timeout errors explain the reopen-and-check recovery', () => {
+    expect(turnFailedErrorText(new Error('timeout da chamada ao bot API (150s)'))).toBe(
+      'The bot API didn\'t respond in time. The turn may have finished — this session is being reopened to check.'
+    );
+  });
+
+  test('other failures keep the plain Turn failed prefix', () => {
+    expect(turnFailedErrorText(new Error('ECONNREFUSED'))).toBe('Turn failed: ECONNREFUSED');
+    expect(turnFailedErrorText('plain failure')).toBe('Turn failed: plain failure');
+  });
+});
+
 // ---- prefill / composer draft ---------------------------------------------
 
 describe('prefill and composer draft in the VM', () => {
@@ -717,8 +771,40 @@ describe('turn-progress live item', () => {
       ['app.data', 'health'],
       ['dashboard.create', 'Gastos']
     ]);
+    expect(item.id).toMatch(/^progress-seq-\d+$/);
+    expect(item.completedChips.map((chip) => chip.id)).toEqual([`${item.id}-0`, `${item.id}-1`]);
     expect(item.rawPartial).toBe('{"tool":');
     expect(state.pending).toBe(true);
+  });
+
+  test('scopes completed chip ids to the stable progress item id across polls', () => {
+    let state = reduceChat(initialChatState(), { type: 'send', message: 'go' });
+    state = reduceChat(state, {
+      type: 'turn-progress',
+      progress: activeTurn({
+        completed_tools: [{ role: 'assistant', tool: 'app.data', args: {}, result: { ok: true }, ts: 't1' }]
+      })
+    });
+    const first = state.items[1];
+    expect(first.kind).toBe('progress');
+    if (first.kind !== 'progress') throw new Error('expected progress item');
+    const progressId = first.id;
+    expect(first.completedChips.map((chip) => chip.id)).toEqual([`${progressId}-0`]);
+
+    state = reduceChat(state, {
+      type: 'turn-progress',
+      progress: activeTurn({
+        completed_tools: [
+          { role: 'assistant', tool: 'app.data', args: {}, result: { ok: true }, ts: 't1' },
+          { role: 'assistant', tool: 'dashboard.create', args: {}, result: { ok: true }, ts: 't2' }
+        ]
+      })
+    });
+    const second = state.items[1];
+    expect(second.kind).toBe('progress');
+    if (second.kind !== 'progress') throw new Error('expected progress item');
+    expect(second.id).toBe(progressId);
+    expect(second.completedChips.map((chip) => chip.id)).toEqual([`${progressId}-0`, `${progressId}-1`]);
   });
 
   test('backend-redacted html in completed args stays opaque and never becomes the target', () => {
@@ -851,5 +937,25 @@ describe('turn-progress live item', () => {
     expect(outline(state.items)).toEqual(['user']);
     expect(state.pending).toBe(false);
     expect(state.error).toBe('ECONNREFUSED');
+  });
+
+  test('a late turn-succeeded still integrates after a stopped/failed turn', () => {
+    let state = reduceChat(initialChatState(), { type: 'send', message: 'dashboard' });
+    state = reduceChat(state, { type: 'turn-progress', progress: activeTurn() });
+    expect(outline(state.items)).toEqual(['user', 'progress']);
+
+    state = reduceChat(state, { type: 'turn-failed', error: 'stopped' });
+    expect(outline(state.items)).toEqual(['user']);
+    expect(state.pending).toBe(false);
+    expect(state.error).toBe('stopped');
+
+    const response = chainResponse();
+    state = reduceChat(state, { type: 'turn-succeeded', response });
+
+    expect(outline(state.items)).toEqual(['user', response.turn.length, 'assistant']);
+    expect(state.items.some((item) => item.kind === 'progress')).toBe(false);
+    expect(state.items[1].kind).toBe('tools');
+    expect(state.pending).toBe(false);
+    expect(state.error).toBeNull();
   });
 });

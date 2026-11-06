@@ -54,3 +54,122 @@ describe('ChatView narrow rail policy (L5-R4)', () => {
     expect(narrowBlock).toContain('z-index: 10;');
   });
 });
+
+describe('ChatView stop-waiting affordance', () => {
+  test('progress status carries a quiet stop button wired to stopWaiting', () => {
+    const status = CHAT_VIEW_SOURCE.match(/<div class="nb-progress-status">[\s\S]*?<\/div>/);
+    expect(status).not.toBeNull();
+    expect(status?.[0]).toContain('class="nb-progress-stop"');
+    expect(status?.[0]).toContain(
+      `:title="'Stop waiting — the turn may still finish and appear here'"`
+    );
+    expect(status?.[0]).toContain('@click="stopWaiting"');
+  });
+
+  test('stopWaiting fails the turn with the exact stop sentence', () => {
+    expect(CHAT_VIEW_SOURCE).toContain(
+      `error: 'Stopped waiting — the turn may still finish. Reopen this session to check.'`
+    );
+  });
+});
+
+describe('ChatView live progress announcements', () => {
+  test('phase span is the only polite live region inside the progress bubble', () => {
+    const bubble = CHAT_VIEW_SOURCE.match(/<div v-else-if="item\.kind === 'progress'"[^>]*>/);
+    expect(bubble).not.toBeNull();
+    expect(bubble?.[0]).toContain('aria-live="off"');
+    expect(CHAT_VIEW_SOURCE).toContain(
+      '<span class="nb-progress-phase" aria-live="polite">{{ item.phaseLabel }}</span>'
+    );
+  });
+});
+
+describe('ChatView error strip and send affordances', () => {
+  test('turn failure strip is an alert and no longer prefixes its copy', () => {
+    expect(CHAT_VIEW_SOURCE).toContain('<div v-if="state.error" class="nb-error-strip" role="alert">');
+    expect(CHAT_VIEW_SOURCE).toContain('<span>{{ state.error }}</span>');
+    expect(CHAT_VIEW_SOURCE).not.toContain('<span>Turn failed: {{ state.error }}</span>');
+  });
+
+  test('retry explains its composer refill; send explains why it is disabled', () => {
+    expect(CHAT_VIEW_SOURCE).toContain(
+      'title="Puts your last message back in the composer"'
+    );
+    expect(CHAT_VIEW_SOURCE).toContain(
+      `:title="state.draft.trim() === '' ? 'Type a message to enable send' : undefined"`
+    );
+  });
+
+  test('send catch uses the shared turnFailedErrorText helper', () => {
+    expect(CHAT_VIEW_SOURCE).toContain(
+      `dispatch({ type: 'turn-failed', error: turnFailedErrorText(err) });`
+    );
+  });
+});
+
+describe('ChatView session pill truncation', () => {
+  test('select text part ellipsizes long session labels', () => {
+    const rule = CHAT_VIEW_SOURCE.match(/\.nb-session-select::part\(text\)\s*\{[^}]*\}/);
+    expect(rule).not.toBeNull();
+    expect(rule?.[0]).toContain('overflow: hidden;');
+    expect(rule?.[0]).toContain('text-overflow: ellipsis;');
+    expect(rule?.[0]).toContain('white-space: nowrap;');
+  });
+});
+
+describe('ChatView tool chip disclosure wiring', () => {
+  test('both live and transcript chips link head buttons to their preview ids', () => {
+    const controls = CHAT_VIEW_SOURCE.split(':aria-controls="`nb-chip-${chip.id}`"').length - 1;
+    const previews = CHAT_VIEW_SOURCE.split(':id="`nb-chip-${chip.id}`"').length - 1;
+    expect(controls).toBe(2);
+    expect(previews).toBe(2);
+  });
+});
+
+describe('ChatView daemon dot hit area', () => {
+  test('keeps the 9px visual dot but grows the click target via negative margin', () => {
+    const rule = CHAT_VIEW_SOURCE.match(/\.nb-daemon-dot\s*\{[^}]*\}/);
+    expect(rule).not.toBeNull();
+    expect(rule?.[0]).toContain('width: 9px;');
+    expect(rule?.[0]).toContain('height: 9px;');
+    expect(rule?.[0]).toContain('padding: var(--nb-space-2);');
+    expect(rule?.[0]).toContain('margin: calc(-1 * var(--nb-space-2));');
+  });
+});
+
+describe('ChatView composer draft persistence', () => {
+  test('onMounted restores the stored draft before loading sessions', () => {
+    const mounted = CHAT_VIEW_SOURCE.indexOf('onMounted(() => {');
+    const restore = CHAT_VIEW_SOURCE.indexOf(
+      `dispatch({ type: 'draft-changed', text: storedDraft });`
+    );
+    const load = CHAT_VIEW_SOURCE.indexOf('void loadSessions(true);');
+    expect(mounted).toBeGreaterThan(-1);
+    expect(restore).toBeGreaterThan(mounted);
+    expect(load).toBeGreaterThan(restore);
+  });
+
+  test('typing debounces a draft write at 300ms', () => {
+    expect(CHAT_VIEW_SOURCE).toContain('const DRAFT_SAVE_DEBOUNCE_MS = 300;');
+    const input = CHAT_VIEW_SOURCE.slice(
+      CHAT_VIEW_SOURCE.indexOf('function onDraftInput'),
+      CHAT_VIEW_SOURCE.indexOf('function onComposerKeydown')
+    );
+    expect(input).toContain('window.clearTimeout(draftSaveTimer);');
+    expect(input).toContain('window.setTimeout(() => {');
+    expect(input).toContain('writeStoredDraft(state.value.draft);');
+  });
+
+  test('sending clears the persisted draft and unmount clears the timer', () => {
+    const sendBlock = CHAT_VIEW_SOURCE.slice(
+      CHAT_VIEW_SOURCE.indexOf('async function send()'),
+      CHAT_VIEW_SOURCE.indexOf('function retryLast')
+    );
+    expect(sendBlock).toContain('clearStoredDraft();');
+    const unmounted = CHAT_VIEW_SOURCE.slice(
+      CHAT_VIEW_SOURCE.indexOf('onUnmounted(() => {'),
+      CHAT_VIEW_SOURCE.indexOf('</script>')
+    );
+    expect(unmounted).toContain('window.clearTimeout(draftSaveTimer);');
+  });
+});
