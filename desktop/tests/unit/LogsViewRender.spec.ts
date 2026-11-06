@@ -244,7 +244,7 @@ describe('LogsView R7 semantics, persistence, highlight', () => {
     await flushPromises();
 
     const newBadge = wrapper
-      .findAll('.nb-log-header-end ion-badge')
+      .findAll('.nb-log-header-end .nb-status-chip')
       .find((b) => b.text().includes('new'));
     expect(newBadge?.text()).toBe('+1 new');
     expect(wrapper.find('.nb-sr-only').text()).toBe('1 new log line');

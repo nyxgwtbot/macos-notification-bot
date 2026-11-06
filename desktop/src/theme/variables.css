@@ -190,6 +190,11 @@
     --nb-border-subtle: #e3e8ee;
     --nb-border-default: #d0d7de;
     --nb-border-strong: #b6bfcc;
+    --nb-teal-light: #0d8a75;
+    --nb-info: #0b6bcb;
+    --nb-green: #1a7f37;
+    --nb-warning: #9a6700;
+    --nb-danger: #d12d20;
   }
 }
 

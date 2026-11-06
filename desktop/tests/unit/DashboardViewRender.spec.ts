@@ -338,4 +338,39 @@ describe('DashboardView feed digest + caption + machine mono (S3, S4, S5)', () =
     expect(modelStrong.attributes('title')).toBe('llama3:8b');
     expect(modelStrong.text()).toBe('llama3:8b');
   });
+
+  test('feed classification chips render as shared nb-status-chip spans', async () => {
+    const wrapper = await mountStatus([notifEvent(1)]);
+    const chips = wrapper.findAll('.nb-chips .nb-status-chip');
+    expect(chips.length).toBeGreaterThan(0);
+    expect(chips.map((chip) => chip.text())).toEqual(
+      expect.arrayContaining(['finance', 'medium'])
+    );
+  });
+
+  test('feed chip tones map urgency and finance status to shared status classes', async () => {
+    const base = notifEvent(1).classification!;
+    const wrapper = await mountStatus([
+      { ...notifEvent(1), classification: { ...base, urgency: 'high' } },
+      { ...notifEvent(2), classification: { ...base, urgency: 'medium' } },
+      { ...notifEvent(3), classification: { ...base, urgency: 'low' } },
+      { ...notifEvent(4), finance: { status: 'error', reason: 'boom' } },
+      { ...notifEvent(5), finance: { status: 'stored' } },
+      { ...notifEvent(6), finance: { status: 'skipped' } }
+    ]);
+    const chips = wrapper.findAll('.nb-chips .nb-status-chip');
+    const byText = (text: string) => chips.find((chip) => chip.text() === text)!;
+    const tone = (text: string) =>
+      byText(text)
+        .classes()
+        .filter((name) => name.startsWith('nb-status-') && name !== 'nb-status-chip');
+
+    expect(tone('high')).toContain('nb-status-bad');
+    expect(tone('medium')).toContain('nb-status-warn');
+    expect(tone('low')).toEqual([]);
+
+    expect(tone('finance error:boom')).toContain('nb-status-bad');
+    expect(tone('finance stored')).toContain('nb-status-ok');
+    expect(tone('finance skipped')).toEqual([]);
+  });
 });

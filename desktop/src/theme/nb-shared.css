@@ -197,6 +197,11 @@
   color: var(--nb-info);
   border-color: transparent;
 }
+.nb-filter-chip:disabled {
+  cursor: default;
+  opacity: 0.6;
+  background: var(--nb-bg-elevated);
+}
 
 /* ========================================
    PAGE HEADER PATTERN (X1) — one shared structure: single-row title at

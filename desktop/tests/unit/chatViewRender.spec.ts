@@ -173,3 +173,23 @@ describe('ChatView composer draft persistence', () => {
     expect(unmounted).toContain('window.clearTimeout(draftSaveTimer);');
   });
 });
+
+describe('ChatView design-consistency pass', () => {
+  test('tool status uses the shared chip geometry (2px inner padding, radius-sm)', () => {
+    const rule = CHAT_VIEW_SOURCE.match(/\.nb-tool-status\s*\{[^}]*\}/);
+    expect(rule).not.toBeNull();
+    expect(rule?.[0]).toContain('padding: 2px var(--nb-space-2);');
+    expect(rule?.[0]).toContain('border-radius: var(--nb-radius-sm);');
+  });
+
+  test('composer focus ring uses the shared info border + 2px glow', () => {
+    const rule = CHAT_VIEW_SOURCE.match(/\.nb-composer-surface:focus-within\s*\{[^}]*\}/);
+    expect(rule).not.toBeNull();
+    expect(rule?.[0]).toContain('border-color: var(--nb-info);');
+    expect(rule?.[0]).toContain('box-shadow: 0 0 0 2px var(--nb-info-muted);');
+  });
+
+  test('suggestion cards rely on the global info focus-visible ring', () => {
+    expect(CHAT_VIEW_SOURCE).not.toContain('.nb-suggestion-card:focus-visible');
+  });
+});

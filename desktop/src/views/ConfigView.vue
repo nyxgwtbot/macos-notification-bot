@@ -215,7 +215,7 @@
             <div v-for="(entry, index) in draft.actions" :key="entry.id || index" class="nb-action-row">
               <div class="nb-action-head">
                 <strong>{{ entry.id }}</strong>
-                <ion-badge color="medium">{{ entry.type }}</ion-badge>
+                <span class="nb-status-chip">{{ entry.type }}</span>
                 <ion-toggle
                   :checked="entry.enabled"
                   :aria-label="'Enable action ' + entry.id"
@@ -335,7 +335,6 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch, type ComponentPublicInstance } from 'vue';
 import { onBeforeRouteLeave } from 'vue-router';
 import {
-  IonBadge,
   IonButton,
   IonButtons,
   alertController,

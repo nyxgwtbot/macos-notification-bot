@@ -69,7 +69,6 @@
                 v-if="item.kind === 'bubble'"
                 class="nb-bubble"
                 :class="item.role === 'user' ? 'nb-bubble-user' : 'nb-bubble-assistant'"
-                tabindex="0"
               >
                 <span v-if="item.role === 'user'" class="nb-bubble-plain">{{ item.text }}</span>
                 <!-- C6: assistant replies render through mdLite (escape-first; uniform
@@ -1394,11 +1393,6 @@ onUnmounted(() => {
   border-color: var(--nb-border-strong);
 }
 
-.nb-suggestion-card:focus-visible {
-  outline: 2px solid var(--nb-teal);
-  outline-offset: 2px;
-}
-
 .nb-suggestion-card ion-icon {
   display: inline-flex;
   align-items: center;
@@ -1504,8 +1498,8 @@ onUnmounted(() => {
 .nb-tool-status {
   font-size: var(--nb-fs-micro);
   font-weight: 600;
-  padding: 1px var(--nb-space-2);
-  border-radius: var(--nb-radius-full);
+  padding: 2px var(--nb-space-2);
+  border-radius: var(--nb-radius-sm);
   line-height: 1.45;
 }
 
@@ -1559,10 +1553,10 @@ onUnmounted(() => {
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 
-/* F4b: focus-visible ring on the container — border-strong + subtle outer glow */
+/* F4b: focus ring on the container — info border + 2px info glow, matches Settings/Logs inputs */
 .nb-composer-surface:focus-within {
-  border-color: var(--nb-border-strong);
-  box-shadow: 0 0 0 3px var(--nb-teal-muted);
+  border-color: var(--nb-info);
+  box-shadow: 0 0 0 2px var(--nb-info-muted);
 }
 
 .nb-composer-input {

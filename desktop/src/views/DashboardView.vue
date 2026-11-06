@@ -276,13 +276,13 @@
             <template v-if="item.kind === 'notification'">
               <div class="nb-event-summary">{{ item.summary }}</div>
               <div class="nb-chips">
-                <ion-chip :color="categoryColor">{{ item.category }}</ion-chip>
-                <ion-chip :color="urgencyColor(item.urgency)">{{ item.urgency }}</ion-chip>
-                <ion-badge v-if="item.layer" :color="layerBadgeColor(item.layer)" class="nb-badge">{{ item.layerLabel }}</ion-badge>
-                <ion-badge v-if="item.ruleMatched" color="secondary" class="nb-badge">rule: {{ item.ruleMatched }}</ion-badge>
-                <ion-badge v-if="item.confidencePct" color="tertiary" class="nb-badge">confidence {{ item.confidencePct }}</ion-badge>
-                <ion-badge v-if="item.telegramStatus" :color="telegramBadgeColor(item.telegramStatus)" class="nb-badge">telegram {{ item.telegramStatus }}</ion-badge>
-                <ion-badge v-if="item.financeStatus" :color="financeBadgeColor(item.financeStatus)" class="nb-badge">finance {{ item.financeStatus }}</ion-badge>
+                <span class="nb-status-chip">{{ item.category }}</span>
+                <span class="nb-status-chip" :class="urgencyTone(item.urgency)">{{ item.urgency }}</span>
+                <span v-if="item.layer" class="nb-status-chip" :class="layerBadgeTone(item.layer)">{{ item.layerLabel }}</span>
+                <span v-if="item.ruleMatched" class="nb-status-chip nb-status-info">rule: {{ item.ruleMatched }}</span>
+                <span v-if="item.confidencePct" class="nb-status-chip">confidence {{ item.confidencePct }}</span>
+                <span v-if="item.telegramStatus" class="nb-status-chip" :class="telegramBadgeTone(item.telegramStatus)">telegram {{ item.telegramStatus }}</span>
+                <span v-if="item.financeStatus" class="nb-status-chip" :class="financeBadgeTone(item.financeStatus)">finance {{ item.financeStatus }}</span>
               </div>
               <div v-if="item.actions.length > 0" class="nb-actions">
                 <span v-for="action in item.actions" :key="action" class="nb-action">{{ action }}</span>
@@ -318,13 +318,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import {
-  IonBadge,
   IonButton,
   IonCard,
   IonCardContent,
   IonCardHeader,
   IonCardTitle,
-  IonChip,
   IonContent,
   IonHeader,
   IonIcon,
@@ -468,30 +466,29 @@ const daemonBadgeText = computed(() => {
   if (store.daemon) return store.daemon.running ? (store.daemon.adopted ? 'running (adopted)' : 'running') : 'stopped';
   return store.daemonError === 'bridge-ausente' ? 'bridge missing' : 'no status';
 });
-const categoryColor = computed(() => 'primary');
-
-function urgencyColor(urgency: string): string {
-  if (urgency === 'high') return 'danger';
-  if (urgency === 'medium') return 'warning';
-  return 'medium';
+/** Feed chips use the shared status-chip species; each mapper returns the
+ *  tone class (or '' for the neutral base) matching the old ion color intent. */
+function urgencyTone(urgency: string): string {
+  if (urgency === 'high') return 'nb-status-bad';
+  if (urgency === 'medium') return 'nb-status-warn';
+  return '';
 }
 
-function layerBadgeColor(layer: string): string {
-  if (layer === 'rule') return 'primary';
-  if (layer === 'llm_router') return 'secondary';
-  return 'warning';
+function layerBadgeTone(layer: string): string {
+  if (layer === 'llm_router') return 'nb-status-info';
+  return '';
 }
 
-function telegramBadgeColor(status: string): string {
-  if (status.startsWith('error')) return 'danger';
-  if (status === 'skipped') return 'medium';
-  return 'success';
+function telegramBadgeTone(status: string): string {
+  if (status.startsWith('error')) return 'nb-status-bad';
+  if (status === 'skipped') return '';
+  return 'nb-status-ok';
 }
 
-function financeBadgeColor(status: string): string {
-  if (status.startsWith('error')) return 'danger';
-  if (status.includes('skipped') || status.includes('ignored')) return 'medium';
-  return 'success';
+function financeBadgeTone(status: string): string {
+  if (status.startsWith('error')) return 'nb-status-bad';
+  if (status.includes('skipped') || status.includes('ignored')) return '';
+  return 'nb-status-ok';
 }
 
 /** Restart double-arm (S6): click 1 arms the button for 3s ("Confirm restart?",
@@ -829,20 +826,12 @@ onUnmounted(() => {
   font-size: var(--nb-fs-secondary);
   margin-top: var(--nb-space-1);
 }
-/* S4: chip rhythm — one step between chip rows, one micro-gap inside;
-   ion-chip's own 4px host margins are neutralized for uniform gaps */
-.nb-chips ion-chip {
-  margin: 0;
-}
 .nb-chips {
   display: flex;
   flex-wrap: wrap;
   gap: var(--nb-space-1);
   margin-top: var(--nb-space-2);
   align-items: center;
-}
-.nb-badge {
-  font-size: var(--nb-fs-micro);
 }
 .nb-actions {
   margin-top: var(--nb-space-2);

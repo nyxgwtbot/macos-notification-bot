@@ -32,9 +32,9 @@
         <ion-button fill="clear" size="small" :disabled="financeDisabled" aria-label="Previous month" @click="gotoMonth(previousMonth(store.financeMonth))">
           <ion-icon aria-hidden="true" :icon="chevronBackOutline" />
         </ion-button>
-        <ion-chip color="primary" :disabled="financeDisabled" @click="gotoMonth(currentMonth())">
+        <button type="button" class="nb-filter-chip" :disabled="financeDisabled" @click="gotoMonth(currentMonth())">
           {{ store.financeMonth || currentMonth() }} · {{ monthLabelEn(store.financeMonth || currentMonth()) }}
-        </ion-chip>
+        </button>
         <ion-button fill="clear" size="small" :disabled="financeDisabled" aria-label="Next month" @click="gotoMonth(nextMonth(store.financeMonth))">
           <ion-icon aria-hidden="true" :icon="chevronForwardOutline" />
         </ion-button>
@@ -144,7 +144,6 @@ import {
   IonCardContent,
   IonCardHeader,
   IonCardTitle,
-  IonChip,
   IonContent,
   IonHeader,
   IonIcon,

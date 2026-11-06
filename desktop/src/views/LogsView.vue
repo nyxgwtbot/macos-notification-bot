@@ -19,7 +19,7 @@
           <div class="nb-log-header-row">
             <span class="nb-muted" aria-live="polite">{{ logTitle }}</span>
             <div class="nb-log-header-end">
-            <ion-badge v-if="!followOn && newCount > 0" color="secondary">+{{ newCount }} new</ion-badge>
+            <span v-if="!followOn && newCount > 0" class="nb-status-chip nb-status-info">+{{ newCount }} new</span>
             <!-- R8: one shared live-badge wording app-wide — "Live" + the
                  real cadence in the tooltip, read from this poller's config
                  (LOG_POLL_MS); the tail-fetch error state flips the tint -->
@@ -147,7 +147,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
-  IonBadge,
   IonButton,
   IonContent,
   IonHeader,
