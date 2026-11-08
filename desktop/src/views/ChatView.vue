@@ -104,7 +104,7 @@
                         :icon="chevronDownOutline"
                       />
                       <span>Thinking</span>
-                      <span v-if="!expandedThinking.has(item.id)" class="nb-thinking-preview-inline">{{ smoothProgressPreview(item.thinking) }}</span>
+                      <span class="nb-thinking-preview-inline">{{ smoothProgressPreview(item.thinking) }}</span>
                     </button>
                     <button
                       type="button"
@@ -181,7 +181,7 @@
                         :icon="chevronDownOutline"
                       />
                       <span>Thinking</span>
-                      <span v-if="!expandedThinking.has(item.id)" class="nb-thinking-preview-inline">{{ smoothProgressPreview(item.rawPartial) }}</span>
+                      <span class="nb-thinking-preview-inline">{{ smoothProgressPreview(item.rawPartial) }}</span>
                     </button>
                     <button
                       type="button"
@@ -249,7 +249,7 @@
                         :icon="chevronDownOutline"
                       />
                       <span>Thinking</span>
-                      <span v-if="!expandedThinking.has(item.id)" class="nb-thinking-preview-inline">{{ smoothProgressPreview(item.thinking) }}</span>
+                      <span class="nb-thinking-preview-inline">{{ smoothProgressPreview(item.thinking) }}</span>
                     </button>
                     <button
                       type="button"
@@ -1255,9 +1255,18 @@ onUnmounted(() => {
 
 .nb-thinking-head-row {
   display: flex;
+  flex-wrap: nowrap;
   align-items: center;
   gap: var(--nb-space-1);
   min-width: 0;
+}
+
+/* word-break inherits 1ch min-content onto the bare label; pin it to avoid the vertical one-letter-per-line wrap */
+.nb-thinking-head > span:not(.nb-thinking-preview-inline) {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  word-break: normal;
+  overflow-wrap: normal;
 }
 
 .nb-thinking-head {
@@ -1292,6 +1301,7 @@ onUnmounted(() => {
 }
 
 .nb-thinking-preview-inline {
+  flex: 0 1 auto;
   min-width: 0;
   font-family: var(--nb-mono);
   font-size: var(--nb-fs-micro);
@@ -1323,17 +1333,22 @@ onUnmounted(() => {
 }
 
 .nb-thinking-pre {
+  width: 100%;
+  box-sizing: border-box;
   min-width: 0;
   margin: 0;
-  padding: 0;
-  max-height: 180px;
+  padding: var(--nb-space-2) var(--nb-space-3);
+  max-height: 200px;
   overflow-y: auto;
-  font-family: var(--nb-mono);
-  font-size: var(--nb-fs-micro);
-  line-height: 1.45;
-  color: var(--nb-text-secondary);
+  overscroll-behavior: contain;
   white-space: pre-wrap;
   word-break: break-word;
+  font-family: inherit;
+  font-size: var(--nb-fs-secondary);
+  line-height: 1.45;
+  color: var(--nb-text-secondary);
+  background: var(--nb-bg-surface);
+  border-radius: var(--nb-radius-md);
 }
 
 .nb-onboarding {

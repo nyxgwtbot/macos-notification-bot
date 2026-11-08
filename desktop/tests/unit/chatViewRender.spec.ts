@@ -193,3 +193,46 @@ describe('ChatView design-consistency pass', () => {
     expect(CHAT_VIEW_SOURCE).not.toContain('.nb-suggestion-card:focus-visible');
   });
 });
+
+describe('ChatView thinking block panel (L5-R8)', () => {
+  test('preview spans render at all 3 sites with no v-if (visible collapsed and expanded)', () => {
+    const previews = CHAT_VIEW_SOURCE.split('<span class="nb-thinking-preview-inline">').length - 1;
+    const conditional =
+      CHAT_VIEW_SOURCE.split('<span v-if="!expandedThinking.has(item.id)" class="nb-thinking-preview-inline">')
+        .length - 1;
+    expect(previews).toBe(3);
+    expect(conditional).toBe(0);
+  });
+
+  test('bare label is pinned against inheriting 1ch min-content wrap', () => {
+    const rule = CHAT_VIEW_SOURCE.match(
+      /\.nb-thinking-head > span:not\(\.nb-thinking-preview-inline\)\s*\{[^}]*\}/
+    );
+    expect(rule).not.toBeNull();
+    expect(rule?.[0]).toContain('flex: 0 0 auto;');
+    expect(rule?.[0]).toContain('white-space: nowrap;');
+    expect(rule?.[0]).toContain('word-break: normal;');
+    expect(rule?.[0]).toContain('overflow-wrap: normal;');
+  });
+
+  test('head row never wraps and the preview is the shrink target', () => {
+    const headRow = CHAT_VIEW_SOURCE.match(/\.nb-thinking-head-row\s*\{[^}]*\}/);
+    expect(headRow).not.toBeNull();
+    expect(headRow?.[0]).toContain('flex-wrap: nowrap;');
+    const preview = CHAT_VIEW_SOURCE.match(/\.nb-thinking-preview-inline\s*\{[^}]*\}/);
+    expect(preview).not.toBeNull();
+    expect(preview?.[0]).toContain('flex: 0 1 auto;');
+  });
+
+  test('expanded body is a recessed prose inset, not bare mono text', () => {
+    const rule = CHAT_VIEW_SOURCE.match(/\.nb-thinking-pre\s*\{[^}]*\}/);
+    expect(rule).not.toBeNull();
+    expect(rule?.[0]).toContain('font-family: inherit;');
+    expect(rule?.[0]).toContain('font-size: var(--nb-fs-secondary);');
+    expect(rule?.[0]).toContain('background: var(--nb-bg-surface);');
+    expect(rule?.[0]).toContain('border-radius: var(--nb-radius-md);');
+    expect(rule?.[0]).toContain('max-height: 200px;');
+    expect(rule?.[0]).toContain('overscroll-behavior: contain;');
+    expect(rule?.[0]).not.toContain('--nb-mono');
+  });
+});
