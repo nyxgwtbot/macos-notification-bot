@@ -12,7 +12,7 @@ source (no f-strings, no shell, no ``run script`` of dynamic text). List
 outputs are joined in-script with ``ASCII character 31`` and split here —
 never comma-split.
 
-Consent model (TCC): reminders/notes actions require ``granted`` state, which
+Consent model (TCC): reminders/notes/calendar/music actions require ``granted`` state, which
 is produced by ``probe()`` (fired from Settings › Connectors) or self-healed
 by a successful action. Actions that come back denied persist ``denied`` and
 raise the PT-BR consent error. ``system`` is ungated (no consent). Probes are
@@ -47,7 +47,7 @@ Outcome classification (actions and probes share it):
                                                         stderr (English)
 
 Mock hook: with env ``NOTIFYBOT_CONNECTORS_MOCK=1`` the runner seam executes a
-per-process in-memory world (reminders lists, notes, volume, front app, toasts)
+per-process in-memory world (reminders lists, notes, calendar events, music state, volume, front app, toasts)
 so smokes exercise add->list observability and the endpoints WITHOUT osascript.
 """
 
@@ -56,7 +56,7 @@ import os
 import re
 import subprocess
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from notifybot.agent_tools import _write_atomic
@@ -66,18 +66,20 @@ from notifybot.agent_tools import _write_atomic
 # ---------------------------------------------------------------------------
 
 #: Domains exposed by native.call in v1 (order == GET /api/connectors row order).
-CONNECTOR_DOMAINS: Tuple[str, ...] = ("reminders", "notes", "system")
+CONNECTOR_DOMAINS: Tuple[str, ...] = ("reminders", "notes", "calendar", "music", "system")
 
 #: Whitelist: the only (domain, action) pairs dispatch accepts.
 CONNECTOR_ACTIONS: Dict[str, Tuple[str, ...]] = {
     "reminders": ("list_lists", "list_reminders", "add", "complete"),
     "notes": ("search", "read", "create"),
+    "calendar": ("list_calendars", "list_events", "add_event", "delete_event"),
+    "music": ("status", "play", "pause", "next", "previous", "play_playlist", "search_store", "volume"),
     "system": ("volume", "front_app", "open", "toast"),
 }
 
 #: Domains that require granted consent state before ANY action runs
 #: (AppleScript automation of these apps triggers macOS TCC consent).
-GATED_DOMAINS: Tuple[str, ...] = ("reminders", "notes")
+GATED_DOMAINS: Tuple[str, ...] = ("reminders", "notes", "calendar", "music")
 
 #: Hard per-call timeout (also enforced by subprocess.run's timeout kwarg).
 CONNECTORS_TIMEOUT_S = 8.0
@@ -93,6 +95,8 @@ LIST_LIMIT_MAX = 50
 LIST_LIMIT_DEFAULT = 20
 LIST_NAME_MAX_CHARS = 256
 QUERY_MAX_CHARS = 256
+DATERANGE_MAX_DAYS = 30
+DATERANGE_DEFAULT_DAYS = 7
 
 #: In-script list delimiter: ASCII character 31 (unit separator). AppleScript
 #: joins list results with it; Python splits on the same byte below.
@@ -120,12 +124,15 @@ _URL_TARGET_RE = re.compile(r"^https?://")
 _APP_TARGET_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,64}$")
 
 # English (ToolFailure-style) whitelist/validation error strings.
-ERR_UNKNOWN_DOMAIN = "unknown domain: {domain!r} (valid: reminders, notes, system)"
+ERR_UNKNOWN_DOMAIN = "unknown domain: {domain!r} (valid: reminders, notes, calendar, music, system)"
 ERR_UNKNOWN_ACTION = "unknown action {action!r} for domain {domain!r} (valid: {actions})"
 ERR_PARAMS_DICT = "params must be a JSON object"
 
 # Display names used inside PT-BR user-facing error strings.
-_DISPLAY_NAMES: Dict[str, str] = {"reminders": "Reminders", "notes": "Notes", "system": "System"}
+_DISPLAY_NAMES: Dict[str, str] = {
+    "reminders": "Reminders", "notes": "Notes", "calendar": "Calendar",
+    "music": "Music", "system": "System",
+}
 
 # Structured in-script error marker: NOTES_CREATE raises this AppleScript error
 # literal when no Notes account exists (count of accounts is 0); the Python
@@ -290,6 +297,270 @@ on run argv
 end run
 """
 
+CALENDAR_LIST_CALENDARS = """
+on run argv
+	set _names to {}
+	tell application id "com.apple.iCal"
+		set _names to name of every calendar
+	end tell
+	set AppleScript's text item delimiters to ASCII character 31
+	return (_names as text)
+end run
+"""
+
+CALENDAR_LIST_EVENTS = """
+on run argv
+	set _calName to (item 1 of argv) as text
+	set _days to (item 2 of argv) as integer
+	set _now to current date
+	set _horizon to _now + (_days * days)
+	set _rows to {}
+	tell application id "com.apple.iCal"
+		repeat with _cal in calendars
+			if _calName is "" or (name of _cal is _calName) then
+				repeat with _ev in (every event of _cal whose start date is greater than or equal to _now and start date is less than or equal to _horizon)
+					set end of _rows to (summary of _ev)
+					set end of _rows to (my _fmtDate(start date of _ev))
+					set end of _rows to (my _fmtDate(end date of _ev))
+				end repeat
+			end if
+		end repeat
+	end tell
+	set AppleScript's text item delimiters to ASCII character 31
+	return (_rows as text)
+end run
+
+on _fmtDate(_d)
+	set _m to (month of _d as integer) as text
+	set _dd to (day of _d) as text
+	set _h to (hours of _d) as text
+	set _mi to (minutes of _d) as text
+	if length of _m is 1 then set _m to "0" & _m
+	if length of _dd is 1 then set _dd to "0" & _dd
+	if length of _h is 1 then set _h to "0" & _h
+	if length of _mi is 1 then set _mi to "0" & _mi
+	return ((year of _d) as text) & "-" & _m & "-" & _dd & "T" & _h & ":" & _mi
+end _fmtDate
+"""
+
+CALENDAR_ADD_EVENT = """
+on run argv
+	set _summary to (item 1 of argv) as text
+	set _calName to (item 12 of argv) as text
+	set _notes to (item 13 of argv) as text
+	set _alertText to (item 14 of argv) as text
+	set _start to my _buildDate(item 2 of argv, item 3 of argv, item 4 of argv, item 5 of argv, item 6 of argv)
+	set _end to my _buildDate(item 7 of argv, item 8 of argv, item 9 of argv, item 10 of argv, item 11 of argv)
+	tell application id "com.apple.iCal"
+		if _calName is "" then
+			try
+				set _targetCal to first calendar whose writable is true
+			on error
+				set _targetCal to calendar 1
+			end try
+		else
+			set _targetCal to calendar _calName
+		end if
+		tell _targetCal
+			set _ev to make new event with properties {summary:_summary, start date:_start, end date:_end}
+		end tell
+		if _notes is not "" then
+			try
+				set description of _ev to _notes
+			end try
+		end if
+		if _alertText is not "" then
+			try
+				tell _ev
+					make new sound alarm at end of alarms with properties {trigger interval:0 - (_alertText as integer)}
+				end tell
+			end try
+		end if
+	end tell
+	return _summary & (ASCII character 31) & (my _fmtDate(_start))
+end run
+
+on _buildDate(_y, _m, _d, _h, _mi)
+	set _dt to current date
+	set day of _dt to 1
+	set year of _dt to (_y as integer)
+	set month of _dt to (_m as integer)
+	set day of _dt to (_d as integer)
+	set hours of _dt to (_h as integer)
+	set minutes of _dt to (_mi as integer)
+	set seconds of _dt to 0
+	return _dt
+end _buildDate
+
+on _fmtDate(_d)
+	set _m to (month of _d as integer) as text
+	set _dd to (day of _d) as text
+	set _h to (hours of _d) as text
+	set _mi to (minutes of _d) as text
+	if length of _m is 1 then set _m to "0" & _m
+	if length of _dd is 1 then set _dd to "0" & _dd
+	if length of _h is 1 then set _h to "0" & _h
+	if length of _mi is 1 then set _mi to "0" & _mi
+	return ((year of _d) as text) & "-" & _m & "-" & _dd & "T" & _h & ":" & _mi
+end _fmtDate
+"""
+
+CALENDAR_DELETE_EVENT = """
+on run argv
+	set _summary to (item 1 of argv) as text
+	set _calName to (item 5 of argv) as text
+	set _fromText to (item 2 of argv) as text
+	set _count to 0
+	tell application id "com.apple.iCal"
+		if _calName is not "" then
+			set _calList to {calendar _calName}
+		else
+			set _calList to every calendar
+		end if
+		repeat with _cal in _calList
+			if _fromText is "" then
+				set _matches to (every event of _cal whose summary is _summary)
+			else
+				set _from to my _buildDayStart(item 2 of argv, item 3 of argv, item 4 of argv)
+				set _matches to (every event of _cal whose summary is _summary and start date is greater than or equal to _from)
+			end if
+			repeat with _i from (count of _matches) to 1 by -1
+				delete item _i of _matches
+				set _count to _count + 1
+			end repeat
+		end repeat
+	end tell
+	return (_count as text)
+end run
+
+on _buildDayStart(_y, _m, _d)
+	set _dt to current date
+	set day of _dt to 1
+	set year of _dt to (_y as integer)
+	set month of _dt to (_m as integer)
+	set day of _dt to (_d as integer)
+	set hours of _dt to 0
+	set minutes of _dt to 0
+	set seconds of _dt to 0
+	return _dt
+end _buildDayStart
+"""
+
+MUSIC_STATUS = """
+on run argv
+	set _d to (ASCII character 31)
+	tell application id "com.apple.Music"
+		set _state to (player state as text)
+		if current track is missing value then
+			return _state
+		end if
+		set _name to (name of current track) as text
+		set _artist to (artist of current track) as text
+		set _album to (album of current track) as text
+		set _posText to ""
+		try
+			set _posText to ((player position) as integer as text)
+		end try
+		set _durText to ""
+		try
+			set _durText to ((duration of current track) as integer as text)
+		end try
+		return _state & _d & _name & _d & _artist & _d & _album & _d & _posText & _d & _durText
+	end tell
+end run
+"""
+
+MUSIC_PLAY = """
+on run argv
+	tell application id "com.apple.Music"
+		play
+	end tell
+	return "ok"
+end run
+"""
+
+MUSIC_PAUSE = """
+on run argv
+	tell application id "com.apple.Music"
+		pause
+	end tell
+	return "ok"
+end run
+"""
+
+MUSIC_NEXT = """
+on run argv
+	tell application id "com.apple.Music"
+		next track
+	end tell
+	return "ok"
+end run
+"""
+
+MUSIC_PREVIOUS = """
+on run argv
+	tell application id "com.apple.Music"
+		previous track
+	end tell
+	return "ok"
+end run
+"""
+
+MUSIC_PLAY_LIST = """
+on run argv
+	set _name to (item 1 of argv) as text
+	tell application id "com.apple.Music"
+		set _matches to (every playlist whose name is _name)
+		if (count of _matches) is 0 then
+			return "not_found"
+		end if
+		play (item 1 of _matches)
+	end tell
+	return "ok"
+end run
+"""
+
+MUSIC_SEARCH_STORE = """
+on run argv
+	set _query to (item 1 of argv) as text
+	set _maxCount to (item 2 of argv) as integer
+	set _rows to {}
+	tell application id "com.apple.Music"
+		with timeout of 6 seconds
+			try
+				set _found to (search for _query)
+				repeat with _tr in _found
+					if (count of _rows) is greater than or equal to (_maxCount * 3) then exit repeat
+					set end of _rows to (name of _tr)
+					set end of _rows to (artist of _tr)
+					set end of _rows to (album of _tr)
+				end repeat
+			end try
+		end timeout
+	end tell
+	set AppleScript's text item delimiters to ASCII character 31
+	return (_rows as text)
+end run
+"""
+
+MUSIC_VOLUME_GET = """
+on run argv
+	tell application id "com.apple.Music"
+		return ((sound volume) as text)
+	end tell
+end run
+"""
+
+MUSIC_VOLUME_SET = """
+on run argv
+	set _level to (item 1 of argv) as integer
+	tell application id "com.apple.Music"
+		set sound volume to _level
+		return ((sound volume) as text)
+	end tell
+end run
+"""
+
 #: Static script source per (domain, action) — the model can never influence
 #: these bytes; its strings ride strictly in argv. (system.volume splits into
 #: get/set script variants at argv-build time.)
@@ -301,6 +572,19 @@ SCRIPTS: Dict[Tuple[str, str], str] = {
     ("notes", "search"): NOTES_SEARCH,
     ("notes", "read"): NOTES_READ,
     ("notes", "create"): NOTES_CREATE,
+    ("calendar", "list_calendars"): CALENDAR_LIST_CALENDARS,
+    ("calendar", "list_events"): CALENDAR_LIST_EVENTS,
+    ("calendar", "add_event"): CALENDAR_ADD_EVENT,
+    ("calendar", "delete_event"): CALENDAR_DELETE_EVENT,
+    ("music", "status"): MUSIC_STATUS,
+    ("music", "play"): MUSIC_PLAY,
+    ("music", "pause"): MUSIC_PAUSE,
+    ("music", "next"): MUSIC_NEXT,
+    ("music", "previous"): MUSIC_PREVIOUS,
+    ("music", "play_playlist"): MUSIC_PLAY_LIST,
+    ("music", "search_store"): MUSIC_SEARCH_STORE,
+    ("music", "volume"): MUSIC_VOLUME_GET,
+    ("music", "volume_set"): MUSIC_VOLUME_SET,
     ("system", "volume"): SYSTEM_VOLUME_GET,
     ("system", "volume_set"): SYSTEM_VOLUME_SET,
     ("system", "front_app"): SYSTEM_FRONT_APP,
@@ -323,6 +607,30 @@ on run argv
 	end tell
 end run
 """,
+    "calendar": """
+on run argv
+	tell application id "com.apple.iCal"
+		return (count calendars as text)
+	end tell
+end run
+""",
+    # Music's probe is try-wrapped only to survive "no current track": TCC
+    # denials (-1743) are re-raised so probe() classifies them as `denied`
+    # instead of a ghost `granted`. Consent is still triggered by the `tell`.
+    "music": """
+on run argv
+	tell application id "com.apple.Music"
+		try
+			return ((name of current track is missing value) as text)
+		on error errMsg number errNum
+			-- re-raise TCC denials: probe() maps a -1743 exit to "denied";
+			-- swallow ONLY benign misses (e.g. no current track, -1728).
+			if errNum is -1743 then error errMsg number errNum
+			return "false"
+		end try
+	end tell
+end run
+""",
     # system needs no consent; the volume read is a harmless osascript sanity probe.
     "system": SYSTEM_VOLUME_GET,
 }
@@ -332,6 +640,8 @@ end run
 BUNDLE_IDS: Dict[str, str] = {
     "reminders": "com.apple.reminders",
     "notes": "com.apple.Notes",
+    "calendar": "com.apple.iCal",
+    "music": "com.apple.Music",
     "system": "com.apple.systemevents",
 }
 
@@ -395,6 +705,39 @@ def _parse_level_stdout(stdout: str) -> int:
         return int((stdout or "").strip())
     except ValueError:
         raise ConnectorError("volume result was not an integer (osascript output changed)") from None
+
+
+def _parse_count_stdout(stdout: str) -> int:
+    try:
+        return int((stdout or "").strip())
+    except ValueError:
+        raise ConnectorError("delete count was not an integer (osascript output changed)") from None
+
+
+def _parse_status_stdout(stdout: str) -> dict:
+    """state\x1fname\x1fartist\x1falbum\x1fposition\x1fduration -> normalized dict.
+    RAW .split on the delimiter (NOT _split_delimited: empty track fields must
+    keep their positions). Missing track -> state only, defaults elsewhere."""
+    parts = (stdout or "").strip().split(_DELIM)
+
+    def field(i: int) -> str:
+        return parts[i] if len(parts) > i else ""
+
+    def int_field(i: int) -> int:
+        try:
+            return int(field(i))
+        except ValueError:
+            return 0
+
+    state = parts[0] if parts and parts[0] else "stopped"
+    return {
+        "state": state,
+        "name": field(1),
+        "artist": field(2),
+        "album": field(3),
+        "position": int_field(4),
+        "duration": int_field(5),
+    }
 
 
 class ConnectorError(Exception):
@@ -510,22 +853,94 @@ def _as_limit(value: Any) -> int:
     return min(limit, LIST_LIMIT_MAX)
 
 
-def _parse_due(value: Any) -> Optional[Tuple[int, int, int]]:
-    """``YYYY-MM-DD`` -> (year, month, day); None/'' -> None (no due date)."""
+def _parse_date(value: Any, field: str) -> Optional[Tuple[int, int, int]]:
+    """``YYYY-MM-DD`` -> (year, month, day); None/'' -> None (no date)."""
     if value is None:
         return None
     if isinstance(value, (bool, dict, list)):
-        raise ConnectorError("'due' must be a string formatted YYYY-MM-DD")
+        raise ConnectorError(f"'{field}' must be a string formatted YYYY-MM-DD")
     text = str(value).strip()
     if text == "":
         return None
     match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", text)
     if not match:
-        raise ConnectorError("'due' must be a string formatted YYYY-MM-DD")
+        raise ConnectorError(f"'{field}' must be a string formatted YYYY-MM-DD")
     year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
     if not (1 <= year <= 9999 and 1 <= month <= 12 and 1 <= day <= 31):
-        raise ConnectorError("'due' month must be 01-12 and day 01-31")
+        raise ConnectorError(f"'{field}' month must be 01-12 and day 01-31")
     return year, month, day
+
+
+def _parse_due(value: Any) -> Optional[Tuple[int, int, int]]:
+    """``YYYY-MM-DD`` -> (year, month, day); None/'' -> None (no due date)."""
+    return _parse_date(value, "due")
+
+
+def _parse_datetime_arg(value: Any, field: str) -> Tuple[int, int, int, int, int]:
+    """``YYYY-MM-DD HH:MM`` -> (year, month, day, hour, minute)."""
+    if value is None or isinstance(value, (bool, dict, list)):
+        raise ConnectorError(f"'{field}' must be a string formatted YYYY-MM-DD HH:MM")
+    text = str(value).strip()
+    match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})", text)
+    if not match:
+        raise ConnectorError(f"'{field}' must be a string formatted YYYY-MM-DD HH:MM")
+    year, month, day, hour, minute = (int(g) for g in match.groups())
+    if not (1 <= year <= 9999 and 1 <= month <= 12 and 1 <= day <= 31):
+        raise ConnectorError(f"'{field}' month must be 01-12 and day 01-31")
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ConnectorError(f"'{field}' hour must be 00-23 and minute 00-59")
+    return year, month, day, hour, minute
+
+
+def _as_days(value: Any) -> int:
+    """days: default 7, VALID 1..30 (error, NOT clamp: >30 is a validation failure)."""
+    if value is None:
+        return DATERANGE_DEFAULT_DAYS
+    if isinstance(value, bool):
+        raise ConnectorError(f"'days' must be an integer between 1 and {DATERANGE_MAX_DAYS}")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ConnectorError(f"'days' must be an integer between 1 and {DATERANGE_MAX_DAYS}")
+        value = int(value)
+    if isinstance(value, int):
+        days = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        days = int(value.strip())
+    else:
+        raise ConnectorError(f"'days' must be an integer between 1 and {DATERANGE_MAX_DAYS}")
+    if not (1 <= days <= DATERANGE_MAX_DAYS):
+        raise ConnectorError(f"'days' must be an integer between 1 and {DATERANGE_MAX_DAYS}")
+    return days
+
+
+def _as_positive_int(value: Any, field: str) -> Optional[int]:
+    """alert_minutes: None -> None; otherwise a positive integer (bool rejected)."""
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return None
+    if isinstance(value, bool):
+        raise ConnectorError(f"'{field}' must be a positive integer")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ConnectorError(f"'{field}' must be a positive integer")
+        value = int(value)
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        number = int(value.strip())
+    else:
+        raise ConnectorError(f"'{field}' must be a positive integer")
+    if number < 1:
+        raise ConnectorError(f"'{field}' must be a positive integer")
+    return number
+
+
+def _chunk_rows(items: List[str], fields: Tuple[str, ...]) -> List[Dict[str, str]]:
+    """Chunk a flat delimiter-split list into dicts; incomplete trailing rows dropped."""
+    step = len(fields)
+    rows: List[Dict[str, str]] = []
+    for i in range(0, len(items) - step + 1, step):
+        rows.append(dict(zip(fields, items[i:i + step])))
+    return rows
 
 
 def _as_level(value: Any) -> int:
@@ -570,11 +985,12 @@ class _ArgvPlan(NamedTuple):
     how to normalize the runner's stdout into the tool result."""
 
     cmd: List[str]
-    kind: str = "ok"  # ok | split | complete | read | raw | level_get | level_set
+    kind: str = "ok"  # ok | split | complete | read | raw | level_get | level_set | playlist | count | status
     post: Optional[Callable[[dict], dict]] = None
     complete_list: str = ""
     complete_query: str = ""
     read_name: str = ""
+    playlist_name: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +1028,13 @@ class ConnectorManager:
         self._mock_volume = 50
         self._mock_front_app = "Finder"
         self._mock_last_toast: Optional[Tuple[str, str]] = None
+        self._mock_calendars: List[str] = ["Pessoal", "Trabalho"]
+        self._mock_events: List[Dict[str, str]] = []
+        self._mock_music: Dict[str, Any] = {
+            "state": "paused", "name": "", "artist": "", "album": "",
+            "position": 0, "duration": 0, "volume": 50,
+            "playlists": ["Foco", "Treino"],
+        }
 
     # ---- public API -------------------------------------------------------
 
@@ -703,7 +1126,11 @@ class ConnectorManager:
         """One dispatch of the runner seam (mock-aware), normalized to _Outcome
         or classified as _ScriptFailure. Never returns a failing outcome."""
         if self._mock_mode:
-            return self._mock_runner(cmd, CONNECTORS_TIMEOUT_S)
+            outcome = self._mock_runner(cmd, CONNECTORS_TIMEOUT_S)
+            if outcome.returncode != 0:
+                kind = "denied" if _is_denial_stderr(outcome.stderr) else "error"
+                raise _ScriptFailure(kind, outcome.returncode, outcome.stderr)
+            return outcome
         try:
             outcome = self._runner(cmd, CONNECTORS_TIMEOUT_S)
         except subprocess.TimeoutExpired as exc:
@@ -766,6 +1193,12 @@ class ConnectorManager:
         if plan.kind == "level_set":
             level = _parse_level_stdout(outcome.stdout)
             return {"ok": True, "level": level}
+        if plan.kind == "playlist":
+            return ConnectorManager._parse_playlist_stdout(outcome.stdout, plan.playlist_name)
+        if plan.kind == "count":
+            return {"ok": True, "deleted": _parse_count_stdout(outcome.stdout)}
+        if plan.kind == "status":
+            return _parse_status_stdout(outcome.stdout)
         if plan.kind == "split":
             assert plan.post is not None
             return plan.post({"items": _split_delimited(outcome.stdout)})
@@ -798,6 +1231,14 @@ class ConnectorManager:
             )
         return {"name": name, "body": _truncate_bytes((stdout or "").strip(), READ_MAX_BYTES)}
 
+    @staticmethod
+    def _parse_playlist_stdout(stdout: str, name: str) -> dict:
+        if (stdout or "").strip() == "not_found":
+            raise ConnectorError(
+                f"Playlist '{name}' não encontrada (verifique o nome exato)."
+            )
+        return {"ok": True, "playlist": name}
+
     # ---- argv builders (validate + freeze the exact command) ------------------
 
     def _build_argv(self, domain: str, action: str, params: Dict[str, Any]) -> _ArgvPlan:
@@ -805,6 +1246,10 @@ class ConnectorManager:
             return self._build_reminders(action, params)
         if domain == "notes":
             return self._build_notes(action, params)
+        if domain == "calendar":
+            return self._build_calendar(action, params)
+        if domain == "music":
+            return self._build_music(action, params)
         return self._build_system(action, params)
 
     def _build_reminders(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
@@ -892,6 +1337,108 @@ class ConnectorManager:
 
         return _ArgvPlan(["osascript", "-e", NOTES_CREATE, title, body], kind="ok", post=post)
 
+    def _build_calendar(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
+        if action == "list_calendars":
+            return _ArgvPlan(
+                ["osascript", "-e", CALENDAR_LIST_CALENDARS],
+                kind="split",
+                post=lambda raw: {"calendars": raw["items"]},
+            )
+        if action == "list_events":
+            calendar_name = ""
+            if params.get("calendar") not in (None, ""):
+                calendar_name = _as_string(params.get("calendar"), "calendar", LIST_NAME_MAX_CHARS)
+            days = _as_days(params.get("days"))
+
+            def post(raw: dict, _cal: str = calendar_name) -> dict:
+                events = _chunk_rows(raw["items"], ("summary", "start", "end"))
+                result = {"events": events}
+                if _cal:
+                    result["calendar"] = _cal
+                return result
+
+            return _ArgvPlan(
+                ["osascript", "-e", CALENDAR_LIST_EVENTS, calendar_name, str(days)],
+                kind="split",
+                post=post,
+            )
+        if action == "add_event":
+            _required_params(params, ("summary", "start", "end"))
+            summary = _as_string(params.get("summary"), "summary", LIST_NAME_MAX_CHARS)
+            start_y, start_m, start_d, start_h, start_mi = _parse_datetime_arg(params.get("start"), "start")
+            end_y, end_m, end_d, end_h, end_mi = _parse_datetime_arg(params.get("end"), "end")
+            calendar_name = ""
+            if params.get("calendar") not in (None, ""):
+                calendar_name = _as_string(params.get("calendar"), "calendar", LIST_NAME_MAX_CHARS)
+            notes = ""
+            if params.get("notes") not in (None, ""):
+                notes = _as_string(params.get("notes"), "notes", TITLE_MAX_CHARS)
+            alert = _as_positive_int(params.get("alert_minutes"), "alert_minutes")
+            alert_text = "" if alert is None else str(alert)
+            start_text = "%04d-%02d-%02d %02d:%02d" % (start_y, start_m, start_d, start_h, start_mi)
+
+            def post(raw: dict, _summary: str = summary, _start: str = start_text,
+                     _cal: str = calendar_name) -> dict:
+                del raw
+                result = {"ok": True, "summary": _summary, "start": _start}
+                if _cal:
+                    result["calendar"] = _cal
+                return result
+
+            return _ArgvPlan(
+                [
+                    "osascript", "-e", CALENDAR_ADD_EVENT,
+                    summary,
+                    str(start_y), "%02d" % start_m, "%02d" % start_d, "%02d" % start_h, "%02d" % start_mi,
+                    str(end_y), "%02d" % end_m, "%02d" % end_d, "%02d" % end_h, "%02d" % end_mi,
+                    calendar_name, notes, alert_text,
+                ],
+                kind="ok",
+                post=post,
+            )
+        # delete_event — EXACT summary match, optional from-date + calendar
+        _required_params(params, ("summary",))
+        summary = _as_string(params.get("summary"), "summary", LIST_NAME_MAX_CHARS)
+        from_date = _parse_date(params.get("from"), "from") if params.get("from") not in (None, "") else None
+        calendar_name = ""
+        if params.get("calendar") not in (None, ""):
+            calendar_name = _as_string(params.get("calendar"), "calendar", LIST_NAME_MAX_CHARS)
+        if from_date is None:
+            from_argv = ["", "", ""]
+        else:
+            from_argv = [str(from_date[0]), "%02d" % from_date[1], "%02d" % from_date[2]]
+        return _ArgvPlan(
+            ["osascript", "-e", CALENDAR_DELETE_EVENT, summary, *from_argv, calendar_name],
+            kind="count",
+        )
+
+    def _build_music(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
+        if action == "status":
+            return _ArgvPlan(["osascript", "-e", MUSIC_STATUS], kind="status")
+        if action in ("play", "pause", "next", "previous"):
+            return _ArgvPlan(["osascript", "-e", SCRIPTS[("music", action)]], kind="ok")
+        if action == "play_playlist":
+            _required_params(params, ("name",))
+            name = _as_string(params.get("name"), "name", QUERY_MAX_CHARS)
+            return _ArgvPlan(
+                ["osascript", "-e", MUSIC_PLAY_LIST, name],
+                kind="playlist",
+                playlist_name=name,
+            )
+        if action == "search_store":
+            _required_params(params, ("query",))
+            query = _as_string(params.get("query"), "query", QUERY_MAX_CHARS)
+            return _ArgvPlan(
+                ["osascript", "-e", MUSIC_SEARCH_STORE, query, "5"],
+                kind="split",
+                post=lambda raw: {"results": _chunk_rows(raw["items"], ("name", "artist", "album"))},
+            )
+        # volume (get/set split follows the system.volume precedent)
+        if params.get("level") in (None, ""):
+            return _ArgvPlan(["osascript", "-e", MUSIC_VOLUME_GET], kind="level_get")
+        level = _as_level(params.get("level"))
+        return _ArgvPlan(["osascript", "-e", MUSIC_VOLUME_SET, str(level)], kind="level_set")
+
     def _build_system(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
         if action == "volume":
             if params.get("level") in (None, ""):
@@ -940,6 +1487,13 @@ class ConnectorManager:
             self._mock_volume = 50
             self._mock_front_app = "Finder"
             self._mock_last_toast = None
+            self._mock_calendars = ["Pessoal", "Trabalho"]
+            self._mock_events = []
+            self._mock_music = {
+                "state": "paused", "name": "", "artist": "", "album": "",
+                "position": 0, "duration": 0, "volume": 50,
+                "playlists": ["Foco", "Treino"],
+            }
 
     def _mock_runner(self, cmd: List[str], timeout: float) -> _Outcome:
         """In-process osascript replacement: interprets the SAME frozen scripts
@@ -1006,5 +1560,94 @@ class ConnectorManager:
             if script == SYSTEM_TOAST:
                 self._mock_last_toast = (argv[0], argv[1] if len(argv) > 1 else "")
                 return _Outcome(0, "ok", "")
+            if script == CALENDAR_LIST_CALENDARS:
+                return _Outcome(0, _DELIM.join(self._mock_calendars), "")
+            if script == CALENDAR_LIST_EVENTS:
+                _cal, _days = argv[0], int(argv[1])
+                now = datetime.now()
+                horizon = now + timedelta(days=_days)
+                rows = []
+                for ev in self._mock_events:
+                    start = datetime.strptime(ev["start"], "%Y-%m-%d %H:%M")
+                    # mock simplification: events added with an empty calendar
+                    # only list under the all-calendars view.
+                    if _cal in ("", ev["calendar"]) and now <= start <= horizon:
+                        rows += [ev["summary"], ev["start"].replace(" ", "T"),
+                                 ev["end"].replace(" ", "T")]
+                return _Outcome(0, _DELIM.join(rows), "")
+            if script == CALENDAR_ADD_EVENT:
+                parts = (argv + [""] * 14)[:14]
+                summary, calendar_name, notes, alert = parts[0], parts[11], parts[12], parts[13]
+                if calendar_name and calendar_name not in self._mock_calendars:
+                    return _Outcome(
+                        1, "",
+                        'execution error: Calendar got an error: Can\'t get calendar "%s".'
+                        % calendar_name,
+                    )
+                self._mock_events.append({
+                    "summary": summary, "start": "%s-%s-%s %s:%s" % (parts[1], parts[2], parts[3], parts[4], parts[5]),
+                    "end": "%s-%s-%s %s:%s" % (parts[6], parts[7], parts[8], parts[9], parts[10]),
+                    "calendar": calendar_name, "notes": notes, "alert": alert,
+                })
+                return _Outcome(0, "ok", "")
+            if script == CALENDAR_DELETE_EVENT:
+                parts = (argv + [""] * 5)[:5]
+                summary, calendar_name = parts[0], parts[4]
+                if calendar_name and calendar_name not in self._mock_calendars:
+                    return _Outcome(
+                        1, "",
+                        'execution error: Calendar got an error: Can\'t get calendar "%s".'
+                        % calendar_name,
+                    )
+                from_dt = None
+                if parts[1]:
+                    from_dt = datetime.strptime(
+                        "%s-%s-%s 00:00" % (parts[1], parts[2], parts[3]), "%Y-%m-%d %H:%M"
+                    )
+                keep, deleted = [], 0
+                for ev in self._mock_events:
+                    if ev["summary"] != summary:  # EXACT match
+                        keep.append(ev)
+                        continue
+                    if calendar_name and ev["calendar"] != calendar_name:
+                        keep.append(ev)
+                        continue
+                    if from_dt is not None:
+                        if datetime.strptime(ev["start"], "%Y-%m-%d %H:%M") < from_dt:
+                            keep.append(ev)
+                            continue
+                    deleted += 1
+                self._mock_events = keep
+                return _Outcome(0, str(deleted), "")
+            if script == MUSIC_STATUS:
+                m = self._mock_music
+                return _Outcome(0, _DELIM.join([
+                    m["state"], m["name"], m["artist"], m["album"],
+                    str(m["position"]), str(m["duration"]),
+                ]), "")
+            if script == MUSIC_PLAY:
+                self._mock_music["state"] = "playing"
+                return _Outcome(0, "ok", "")
+            if script == MUSIC_PAUSE:
+                self._mock_music["state"] = "paused"
+                return _Outcome(0, "ok", "")
+            if script in (MUSIC_NEXT, MUSIC_PREVIOUS):
+                return _Outcome(0, "ok", "")
+            if script == MUSIC_PLAY_LIST:
+                playlists = self._mock_music["playlists"]
+                if argv and argv[0] in playlists:
+                    self._mock_music["state"] = "playing"
+                    # playlist playback surfaces as a track with the playlist name
+                    self._mock_music["name"] = argv[0]
+                    return _Outcome(0, "ok", "")
+                return _Outcome(0, "not_found", "")
+            if script == MUSIC_SEARCH_STORE:
+                rows = ["Track A", "Artist A", "Album A", "Track B", "Artist B", "Album B"]
+                return _Outcome(0, _DELIM.join(rows), "")
+            if script == MUSIC_VOLUME_GET:
+                return _Outcome(0, str(self._mock_music["volume"]), "")
+            if script == MUSIC_VOLUME_SET:
+                self._mock_music["volume"] = int(argv[0])
+                return _Outcome(0, str(self._mock_music["volume"]), "")
             # Probe scripts (and anything else): trivial success.
             return _Outcome(0, "0", "")

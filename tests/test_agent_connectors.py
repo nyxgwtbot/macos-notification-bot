@@ -550,6 +550,8 @@ class TestInjectionBattery(unittest.TestCase):
         self.assertIn("com.apple.reminders", SCRIPTS[("reminders", "list_lists")])
         self.assertIn("com.apple.Notes", SCRIPTS[("notes", "search")])
         self.assertIn("com.apple.systemevents", SCRIPTS[("system", "front_app")])
+        self.assertIn("com.apple.iCal", SCRIPTS[("calendar", "list_calendars")])
+        self.assertIn("com.apple.Music", SCRIPTS[("music", "status")])
 
     def test_delimiter_never_comma_split(self):
         self.runner.register(
@@ -612,7 +614,8 @@ class TestStateStoreConcurrency(unittest.TestCase):
             rows = manager.state.read()
             self.assertEqual(
                 {domain: rows[domain]["status"] for domain in CONNECTOR_DOMAINS},
-                {"reminders": "unknown", "notes": "unknown", "system": "unknown"},
+                {"reminders": "unknown", "notes": "unknown", "calendar": "unknown",
+                 "music": "unknown", "system": "unknown"},
             )
 
     def test_single_flight_probe_busy_then_free(self):
@@ -647,8 +650,8 @@ class TestConnectorEndpoints(unittest.TestCase):
         status, body = self.fixture.request("GET", "/api/connectors")
         self.assertEqual(status, 200)
         connectors = body["connectors"]
-        self.assertEqual(set(connectors), {"reminders", "notes", "system"})
-        for domain in ("reminders", "notes"):
+        self.assertEqual(set(connectors), {"reminders", "notes", "calendar", "music", "system"})
+        for domain in ("reminders", "notes", "calendar", "music"):
             row = connectors[domain]
             self.assertEqual(row["status"], "unknown")
             self.assertFalse(row["granted"])
@@ -865,6 +868,608 @@ class TestAgentNativeCallSmoke(unittest.TestCase):
         # PT-BR consent error relayed VERBATIM as the final answer.
         self.assertEqual(response["answer"], response["turn"][0]["error"])
         self.assertIn("conecte notes em Settings › Connectors", response["answer"])
+
+
+# ---- calendar domain: dispatch + argv + normalization --------------------------------
+# Imports for the calendar/music suites below: appended here (not merged into
+# the top block) so this change stays a pure addition to the file.
+
+from datetime import datetime, timedelta
+
+from notifybot.connectors import (
+    CALENDAR_DELETE_EVENT,
+    CALENDAR_LIST_CALENDARS,
+    DATERANGE_DEFAULT_DAYS,
+    DATERANGE_MAX_DAYS,
+    LIST_NAME_MAX_CHARS,
+    MUSIC_STATUS,
+    QUERY_MAX_CHARS,
+    TITLE_MAX_CHARS,
+)
+
+
+class TestCalendarDispatchActions(unittest.TestCase):
+    """Per-action argv layout, \\x1f triplet parsing, caps, and validation for
+    the native calendar actions."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runner = RecordingRunner()
+        self.manager = ConnectorManager(self.tmp.name, runner=self.runner)
+
+    def test_list_calendars_argv_shape_and_delimiter_parsing(self):
+        self.manager.state.record("calendar", "granted")
+        self.runner.register(
+            SCRIPTS[("calendar", "list_calendars")],
+            Outcome(0, _DELIM.join(["Pessoal", "Trabalho", "", "Foco"]), ""),
+        )
+        result = self.manager.run_action("calendar", "list_calendars", {})
+        self.assertEqual(result, {"calendars": ["Pessoal", "Trabalho", "Foco"]})
+        cmd = self.runner.calls[-1]
+        self.assertEqual(cmd[:3], ["osascript", "-e", CALENDAR_LIST_CALENDARS])
+        self.assertEqual(cmd[3:], [])  # argv ends after the script constant
+        self.assertEqual(self.runner.timeout_seen, 8.0)
+
+    def test_list_events_argv_layout_default_and_explicit_days_triplet_rows(self):
+        self.manager.state.record("calendar", "granted")
+        rows = []
+        expected = []
+        for index in range(4):
+            start_text = "2026-05-%02dT09:00" % (index + 1)
+            end_text = "2026-05-%02dT10:00" % (index + 1)
+            rows += ["Evento %d" % index, start_text, end_text]
+            expected.append({"summary": "Evento %d" % index, "start": start_text, "end": end_text})
+        self.runner.register(SCRIPTS[("calendar", "list_events")], Outcome(0, _DELIM.join(rows), ""))
+        # default days: no calendar given -> argv ["", 7]; NO "calendar" in result
+        default_result = self.manager.run_action("calendar", "list_events", {})
+        self.assertEqual(default_result, {"events": expected})
+        self.assertEqual(self.runner.last_argv(), ["", str(DATERANGE_DEFAULT_DAYS)])
+        # explicit days + calendar: echoed result, exact argv, string days coerce
+        explicit = self.manager.run_action("calendar", "list_events", {"calendar": "Trabalho", "days": 3})
+        self.assertEqual(explicit, {"events": expected, "calendar": "Trabalho"})
+        self.assertEqual(self.runner.last_argv(), ["Trabalho", "3"])
+        string_days = self.manager.run_action("calendar", "list_events", {"days": "7"})
+        self.assertEqual(self.runner.last_argv(), ["", "7"])
+        self.assertEqual(len(string_days["events"]), 4)  # 4 full triplets -> exactly 4 rows
+
+    def test_days_validation_failures_all_rejected_not_clamped(self):
+        self.manager.state.record("calendar", "granted")
+        for bad in (0, -1, 31, 100, 2.5, True, "abc"):
+            with self.assertRaises(ConnectorError) as ctx:
+                self.manager.run_action("calendar", "list_events", {"days": bad})
+            self.assertIn(
+                "between 1 and %d" % DATERANGE_MAX_DAYS, str(ctx.exception), bad
+            )
+        # upper boundary is VALID: DATERANGE_MAX_DAYS passes, DATERANGE_MAX_DAYS+1
+        # above already failed — a validation failure, NOT a clamp.
+        self.runner.register(SCRIPTS[("calendar", "list_events")], Outcome(0, "", ""))
+        result = self.manager.run_action("calendar", "list_events", {"days": DATERANGE_MAX_DAYS})
+        self.assertEqual(result, {"events": []})
+        self.assertEqual(self.runner.last_argv(), ["", str(DATERANGE_MAX_DAYS)])
+
+    def test_add_event_fourteen_item_argv_layout_and_result_echo(self):
+        self.manager.state.record("calendar", "granted")
+        self.runner.register(SCRIPTS[("calendar", "add_event")], Outcome(0, "ok", ""))
+        result = self.manager.run_action(
+            "calendar",
+            "add_event",
+            {
+                "summary": "Pão da tarde",
+                "start": "2026-05-05 10:00",
+                "end": "2026-05-05 11:30",
+                "calendar": "Trabalho",
+                "notes": "Trazer pão",
+                "alert_minutes": 15,
+            },
+        )
+        self.assertEqual(
+            result,
+            {"ok": True, "summary": "Pão da tarde", "start": "2026-05-05 10:00", "calendar": "Trabalho"},
+        )
+        self.assertEqual(self.runner.last_argv(), [
+            "Pão da tarde",
+            "2026", "05", "05", "10", "00",
+            "2026", "05", "05", "11", "30",
+            "Trabalho", "Trazer pão", "15",
+        ])
+        self.assertEqual(len(self.runner.last_argv()), 14)
+        # all-optional-absent variant: zero-padded components, three empty tails
+        result2 = self.manager.run_action(
+            "calendar", "add_event",
+            {"summary": "S", "start": "2026-12-31 00:05", "end": "2027-01-01 23:59"},
+        )
+        self.assertEqual(result2, {"ok": True, "summary": "S", "start": "2026-12-31 00:05"})
+        self.assertEqual(
+            self.runner.last_argv(),
+            ["S", "2026", "12", "31", "00", "05", "2027", "01", "01", "23", "59", "", "", ""],
+        )
+
+    def test_add_event_datetime_alert_and_cap_validation_failures(self):
+        self.manager.state.record("calendar", "granted")
+        self.runner.register(SCRIPTS[("calendar", "add_event")], Outcome(0, "ok", ""))
+        base = {"summary": "S", "start": "2026-05-05 10:00", "end": "2026-05-05 11:00"}
+        for bad_start in ("2026-05-05", "05-05-2026 10:00", "2026-13-05 10:00",
+                          "2026-05-05 24:00", "2026-05-05 10:60", "not-a-date"):
+            with self.assertRaises(ConnectorError):
+                self.manager.run_action("calendar", "add_event", {**base, "start": bad_start})
+        for bad_alert in (0, -5, 2.5, True):
+            with self.assertRaises(ConnectorError):
+                self.manager.run_action("calendar", "add_event", {**base, "alert_minutes": bad_alert})
+        # caps: summary bounded by LIST_NAME_MAX_CHARS (256 boundary is valid),
+        # notes bounded by TITLE_MAX_CHARS.
+        self.manager.run_action("calendar", "add_event", {**base, "summary": "x" * LIST_NAME_MAX_CHARS})
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("calendar", "add_event", {**base, "summary": "x" * (LIST_NAME_MAX_CHARS + 1)})
+        self.assertIn("limited to %d" % LIST_NAME_MAX_CHARS, str(ctx.exception))
+        self.manager.run_action("calendar", "add_event", {**base, "notes": "n" * TITLE_MAX_CHARS})
+        with self.assertRaises(ConnectorError):
+            self.manager.run_action("calendar", "add_event", {**base, "notes": "n" * (TITLE_MAX_CHARS + 1)})
+
+    def test_delete_event_argv_layout_and_count_semantics(self):
+        self.manager.state.record("calendar", "granted")
+        self.runner.register(SCRIPTS[("calendar", "delete_event")], Outcome(0, "0", ""))
+        self.assertEqual(
+            self.manager.run_action(
+                "calendar", "delete_event",
+                {"summary": "Reunião", "from": "2026-05-01", "calendar": "Trabalho"},
+            ),
+            {"ok": True, "deleted": 0},  # "0" is a valid count, not an error
+        )
+        self.assertEqual(self.runner.last_argv(), ["Reunião", "2026", "05", "01", "Trabalho"])
+        self.assertEqual(
+            self.manager.run_action("calendar", "delete_event", {"summary": "Compras"}),
+            {"ok": True, "deleted": 0},
+        )
+        self.assertEqual(self.runner.last_argv(), ["Compras", "", "", "", ""])
+        self.assertEqual(
+            self.manager.run_action("calendar", "delete_event", {"summary": "X", "from": "2026-05-01"}),
+            {"ok": True, "deleted": 0},
+        )
+        self.assertEqual(self.runner.last_argv(), ["X", "2026", "05", "01", ""])
+        self.runner.register(SCRIPTS[("calendar", "delete_event")], Outcome(0, "2", ""))
+        self.assertEqual(
+            self.manager.run_action(
+                "calendar", "delete_event", {"summary": "Reunião", "calendar": "Trabalho"}
+            ),
+            {"ok": True, "deleted": 2},
+        )
+        self.assertEqual(self.runner.last_argv(), ["Reunião", "", "", "", "Trabalho"])
+        # non-integer stdout and out-of-range from-date both fail closed
+        self.runner.register(SCRIPTS[("calendar", "delete_event")], Outcome(0, "zero", ""))
+        with self.assertRaises(ConnectorError):
+            self.manager.run_action("calendar", "delete_event", {"summary": "Reunião"})
+        with self.assertRaises(ConnectorError):
+            self.manager.run_action("calendar", "delete_event", {"summary": "Reunião", "from": "2026-13-01"})
+
+    def test_delete_summary_payload_arrives_verbatim_argv_only(self):
+        """Injection parity (TestInjectionBattery style): the model-controlled
+        summary rides argv verbatim; the script source stays frozen bytes."""
+        payload = '" & (do shell script "touch /tmp/pwned") & "'
+        self.manager.state.record("calendar", "granted")
+        self.runner.register(SCRIPTS[("calendar", "delete_event")], Outcome(0, "0", ""))
+        self.manager.run_action("calendar", "delete_event", {"summary": payload})
+        cmd = self.runner.calls[-1]
+        self.assertEqual(cmd[3], payload)  # verbatim delivery, argv item 0
+        self.assertEqual(cmd[2], CALENDAR_DELETE_EVENT)  # byte-identical script source
+        self.assertNotIn(payload, cmd[2])
+        self.assertNotIn("do shell script", cmd[2])
+
+
+# ---- music domain: dispatch + argv + normalization ------------------------------------
+
+
+class TestMusicDispatchActions(unittest.TestCase):
+    """Per-action argv layout, status parsing, and validation for the native
+    music actions."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runner = RecordingRunner()
+        self.manager = ConnectorManager(self.tmp.name, runner=self.runner)
+
+    def test_status_full_parse_bare_state_and_bad_numerics(self):
+        self.manager.state.record("music", "granted")
+        self.runner.register(
+            SCRIPTS[("music", "status")],
+            Outcome(0, _DELIM.join(["playing", "Pão de forma", "Artista X", "Álbum Y", "93", "210"]), ""),
+        )
+        result = self.manager.run_action("music", "status", {})
+        self.assertEqual(
+            result,
+            {"state": "playing", "name": "Pão de forma", "artist": "Artista X",
+             "album": "Álbum Y", "position": 93, "duration": 210},
+        )
+        cmd = self.runner.calls[-1]
+        self.assertEqual(cmd[:3], ["osascript", "-e", MUSIC_STATUS])
+        self.assertEqual(cmd[3:], [])  # status carries no argv
+        # bare state (no current track): track fields default to empty/zero
+        self.runner.register(SCRIPTS[("music", "status")], Outcome(0, "paused", ""))
+        self.assertEqual(
+            self.manager.run_action("music", "status", {}),
+            {"state": "paused", "name": "", "artist": "", "album": "", "position": 0, "duration": 0},
+        )
+        # non-numeric position/duration degrade to 0
+        self.runner.register(
+            SCRIPTS[("music", "status")],
+            Outcome(0, _DELIM.join(["playing", "N", "", "", "abc", "xyz"]), ""),
+        )
+        self.assertEqual(
+            self.manager.run_action("music", "status", {}),
+            {"state": "playing", "name": "N", "artist": "", "album": "", "position": 0, "duration": 0},
+        )
+
+    def test_stateless_verbs_ok_with_empty_argv(self):
+        self.manager.state.record("music", "granted")
+        for action in ("play", "pause", "next", "previous"):
+            self.runner.register(SCRIPTS[("music", action)], Outcome(0, "ok", ""))
+            self.assertEqual(self.manager.run_action("music", action, {}), {"ok": True})
+            cmd = self.runner.calls[-1]
+            self.assertEqual(cmd[:3], ["osascript", "-e", SCRIPTS[("music", action)]])
+            self.assertEqual(cmd[3:], [])
+
+    def test_play_playlist_ok_not_found_and_cap(self):
+        self.manager.state.record("music", "granted")
+        self.runner.register(SCRIPTS[("music", "play_playlist")], Outcome(0, "ok", ""))
+        result = self.manager.run_action("music", "play_playlist", {"name": "Treino"})
+        self.assertEqual(result, {"ok": True, "playlist": "Treino"})
+        self.assertEqual(self.runner.last_argv(), ["Treino"])
+        self.runner.register(SCRIPTS[("music", "play_playlist")], Outcome(0, "not_found", ""))
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("music", "play_playlist", {"name": "Treino"})
+        self.assertEqual(
+            str(ctx.exception), "Playlist 'Treino' não encontrada (verifique o nome exato)."
+        )
+        self.assertEqual(self.runner.last_argv(), ["Treino"])  # argv recorded even on normalize failure
+        with self.assertRaises(ConnectorError):
+            self.manager.run_action("music", "play_playlist", {"name": "a" * (QUERY_MAX_CHARS + 1)})
+
+    def test_search_store_argv_and_triplet_dicts(self):
+        self.manager.state.record("music", "granted")
+        self.runner.register(
+            SCRIPTS[("music", "search_store")],
+            Outcome(0, _DELIM.join(["Track A", "Artist A", "Album A", "Track B", "Artist B", "Album B"]), ""),
+        )
+        result = self.manager.run_action("music", "search_store", {"query": "pão de forma"})
+        self.assertEqual(
+            result,
+            {"results": [
+                {"name": "Track A", "artist": "Artist A", "album": "Album A"},
+                {"name": "Track B", "artist": "Artist B", "album": "Album B"},
+            ]},
+        )
+        self.assertEqual(self.runner.last_argv(), ["pão de forma", "5"])
+
+    def test_volume_get_set_and_invalid_levels(self):
+        self.manager.state.record("music", "granted")
+        self.runner.register(SCRIPTS[("music", "volume")], Outcome(0, "50", ""))
+        self.assertEqual(self.manager.run_action("music", "volume", {}), {"level": 50})
+        self.assertEqual(self.runner.last_argv(), [])
+        self.runner.register(SCRIPTS[("music", "volume_set")], Outcome(0, "70", ""))
+        self.assertEqual(
+            self.manager.run_action("music", "volume", {"level": 70}), {"ok": True, "level": 70}
+        )
+        self.assertEqual(self.runner.last_argv(), ["70"])
+        # 0 is a VALID set level (falsy must not bounce into the get path)
+        self.runner.register(SCRIPTS[("music", "volume_set")], Outcome(0, "0", ""))
+        self.assertEqual(
+            self.manager.run_action("music", "volume", {"level": 0}), {"ok": True, "level": 0}
+        )
+        self.assertEqual(self.runner.last_argv(), ["0"])
+        for bad in (True, -1, 101, "abc", 1.5):
+            with self.assertRaises(ConnectorError):
+                self.manager.run_action("music", "volume", {"level": bad})
+
+
+# ---- gating + probe + mock world (calendar + music) ------------------------------------
+
+
+class TestCalendarMusicGatingProbeAndMockWorld(unittest.TestCase):
+    """Consent gating (calendar/music are gated), probe grant flow, and the
+    env-gated mock world observability."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_ungranted_gates_never_reach_runner_then_probe_grants_and_actions_run(self):
+        runner = RecordingRunner()
+        runner.register(PROBE_SCRIPTS["calendar"], Outcome(0, "2", ""))
+        runner.register(PROBE_SCRIPTS["music"], Outcome(0, "true", ""))
+        runner.register(
+            SCRIPTS[("calendar", "list_calendars")],
+            Outcome(0, _DELIM.join(["Pessoal", "Trabalho"]), ""),
+        )
+        runner.register(SCRIPTS[("music", "status")], Outcome(0, "paused", ""))
+        manager = ConnectorManager(self.tmp.name, runner=runner)
+        for domain, action, needle in (
+            ("calendar", "list_calendars", "Calendar ainda não está conectado"),
+            ("music", "status", "Music ainda não está conectado"),
+        ):
+            for status in ("unknown", "denied", "needs_consent"):
+                manager.state.record(domain, status)
+                self.assertEqual(runner.calls, [])
+                with self.assertRaises(ConnectorError) as ctx:
+                    manager.run_action(domain, action, {})
+                self.assertIn(needle, str(ctx.exception))
+                self.assertIn("Settings › Connectors", str(ctx.exception))
+                self.assertEqual(runner.calls, [])  # runner never invoked on the gate
+        # probe flow: granted status persists, then the action really runs
+        self.assertEqual(manager.probe("calendar")["status"], "granted")
+        self.assertEqual(manager.state.read()["calendar"]["status"], "granted")
+        self.assertEqual(
+            manager.run_action("calendar", "list_calendars", {}),
+            {"calendars": ["Pessoal", "Trabalho"]},
+        )
+        self.assertEqual(manager.probe("music")["status"], "granted")
+        self.assertEqual(manager.state.read()["music"]["status"], "granted")
+        self.assertEqual(
+            manager.run_action("music", "status", {}),
+            {"state": "paused", "name": "", "artist": "", "album": "", "position": 0, "duration": 0},
+        )
+
+    def test_probe_scripts_registration_sanity(self):
+        """Probe coverage battery (TestInjectionBattery style): the new domains
+        keep an executable-safe probe targeting the right bundle id."""
+        self.assertTrue({"calendar", "music"} <= set(PROBE_SCRIPTS))
+        for domain in ("calendar", "music"):
+            source = PROBE_SCRIPTS[domain]
+            self.assertIn("on run argv", source, domain)  # multi-line const: containment, not position
+            self.assertNotIn("do shell script", source, domain)
+            self.assertNotIn("run script", source, domain)
+        self.assertIn("com.apple.iCal", PROBE_SCRIPTS["calendar"])
+        self.assertIn("com.apple.Music", PROBE_SCRIPTS["music"])
+
+    def test_mock_calendar_add_list_delete_observability(self):
+        """Mock world keeps add -> list -> delete observable; events use
+        future dates computed from now() so the range filter is deterministic.
+        An unknown-calendar add must never yield an observable event."""
+        try:
+            os.environ["NOTIFYBOT_CONNECTORS_MOCK"] = "1"
+        finally:
+            pass
+        try:
+            manager = ConnectorManager(self.tmp.name)  # env mock runner active
+            manager.state.record("calendar", "granted")
+            self.assertEqual(
+                manager.run_action("calendar", "list_calendars", {}),
+                {"calendars": ["Pessoal", "Trabalho"]},
+            )
+            start = (datetime.now() + timedelta(days=3)).replace(
+                hour=10, minute=0, second=0, microsecond=0
+            )
+            end = start + timedelta(hours=1)
+            start_text = start.strftime("%Y-%m-%d %H:%M")
+            end_text = end.strftime("%Y-%m-%d %H:%M")
+            added = manager.run_action(
+                "calendar", "add_event",
+                {"summary": "Reunião de equipe", "start": start_text, "end": end_text,
+                 "calendar": "Trabalho", "notes": "Trazer pão", "alert_minutes": 10},
+            )
+            self.assertEqual(
+                added,
+                {"ok": True, "summary": "Reunião de equipe", "start": start_text, "calendar": "Trabalho"},
+            )
+            listing = manager.run_action("calendar", "list_events", {"calendar": "Trabalho", "days": 30})
+            self.assertEqual(
+                listing,
+                {"calendar": "Trabalho", "events": [
+                    {"summary": "Reunião de equipe",
+                     "start": start_text.replace(" ", "T"),
+                     "end": end_text.replace(" ", "T")},
+                ]},
+            )
+            # unknown calendar: the mock exit-1 failure now classifies through
+            # the SAME _ScriptFailure/_action_failure_error path as the real
+            # runner (no silent ghost-success), and delete fails the same way
+            # — never via a misleading "delete count" parse of empty stdout.
+            with self.assertRaises(ConnectorError) as ghost_ctx:
+                manager.run_action(
+                    "calendar", "add_event",
+                    {"summary": "Evento Fantasma", "start": start_text, "end": end_text,
+                     "calendar": "Nope"},
+                )
+            self.assertIn("Can't get calendar", str(ghost_ctx.exception))
+            with self.assertRaises(ConnectorError) as ghost_del_ctx:
+                manager.run_action(
+                    "calendar", "delete_event",
+                    {"summary": "Evento Fantasma", "calendar": "Nope"},
+                )
+            self.assertIn("Calendar action failed", str(ghost_del_ctx.exception))
+            self.assertNotIn("delete count was not an integer", str(ghost_del_ctx.exception))
+            # the ghost event must not appear in ANY view; the real one must
+            self.assertEqual(
+                manager.run_action("calendar", "list_events", {}),
+                {"events": [{"summary": "Reunião de equipe",
+                             "start": start_text.replace(" ", "T"),
+                             "end": end_text.replace(" ", "T")}]},
+            )
+            self.assertEqual(
+                manager.run_action("calendar", "list_events", {"calendar": "Nope", "days": 30}),
+                {"calendar": "Nope", "events": []},
+            )
+            self.assertEqual(
+                manager.run_action("calendar", "list_events", {"calendar": "Trabalho", "days": 30}),
+                {"calendar": "Trabalho", "events": [
+                    {"summary": "Reunião de equipe",
+                     "start": start_text.replace(" ", "T"),
+                     "end": end_text.replace(" ", "T")},
+                ]},
+            )
+            # EXACT match semantics: a substring summary deletes NOTHING.
+            self.assertEqual(
+                manager.run_action(
+                    "calendar", "delete_event",
+                    {"summary": "Reunião", "calendar": "Trabalho"},
+                ),
+                {"ok": True, "deleted": 0},
+            )
+            self.assertEqual(
+                manager.run_action(
+                    "calendar", "delete_event",
+                    {"summary": "Reunião de equipe", "calendar": "Trabalho"},
+                ),
+                {"ok": True, "deleted": 1},
+            )
+            self.assertEqual(
+                manager.run_action(
+                    "calendar", "delete_event",
+                    {"summary": "Reunião de equipe", "calendar": "Trabalho"},
+                ),
+                {"ok": True, "deleted": 0},  # second identical delete: nothing left
+            )
+            self.assertEqual(
+                manager.run_action("calendar", "list_events", {"calendar": "Trabalho", "days": 30}),
+                {"calendar": "Trabalho", "events": []},
+            )
+        finally:
+            os.environ.pop("NOTIFYBOT_CONNECTORS_MOCK", None)
+
+    def test_mock_music_playback_volume_search_observability(self):
+        """Mock world: playback state transitions, playlist not-found copy,
+        volume get/set round-trip, and search rows stay observable."""
+        try:
+            os.environ["NOTIFYBOT_CONNECTORS_MOCK"] = "1"
+        finally:
+            pass
+        try:
+            manager = ConnectorManager(self.tmp.name)  # env mock runner active
+            manager.state.record("music", "granted")
+            self.assertEqual(
+                manager.run_action("music", "status", {}),
+                {"state": "paused", "name": "", "artist": "", "album": "", "position": 0, "duration": 0},
+            )
+            self.assertEqual(manager.run_action("music", "play", {}), {"ok": True})
+            self.assertEqual(manager.run_action("music", "status", {})["state"], "playing")
+            self.assertEqual(manager.run_action("music", "pause", {}), {"ok": True})
+            self.assertEqual(manager.run_action("music", "status", {})["state"], "paused")
+            self.assertEqual(
+                manager.run_action("music", "play_playlist", {"name": "Foco"}),
+                {"ok": True, "playlist": "Foco"},
+            )
+            playing = manager.run_action("music", "status", {})
+            self.assertEqual(playing["state"], "playing")
+            self.assertEqual(playing["name"], "Foco")
+            with self.assertRaises(ConnectorError) as ctx:
+                manager.run_action("music", "play_playlist", {"name": "Nope"})
+            self.assertEqual(
+                str(ctx.exception), "Playlist 'Nope' não encontrada (verifique o nome exato)."
+            )
+            self.assertEqual(manager.run_action("music", "volume", {}), {"level": 50})
+            self.assertEqual(
+                manager.run_action("music", "volume", {"level": 70}), {"ok": True, "level": 70}
+            )
+            self.assertEqual(manager.run_action("music", "volume", {}), {"level": 70})
+            self.assertEqual(
+                manager.run_action("music", "search_store", {"query": "qualquer"}),
+                {"results": [
+                    {"name": "Track A", "artist": "Artist A", "album": "Album A"},
+                    {"name": "Track B", "artist": "Artist B", "album": "Album B"},
+                ]},
+            )
+        finally:
+            os.environ.pop("NOTIFYBOT_CONNECTORS_MOCK", None)
+
+    def test_reset_mock_world_reseeds_calendar_and_music(self):
+        """After reset the world returns to the per-manager seeded state:
+        calendars back to seed order, no stray events, paused music at 50."""
+        try:
+            os.environ["NOTIFYBOT_CONNECTORS_MOCK"] = "1"
+        finally:
+            pass
+        try:
+            manager = ConnectorManager(self.tmp.name)  # env mock runner active
+            manager.state.record("calendar", "granted")
+            manager.state.record("music", "granted")
+            event_start = (datetime.now() + timedelta(days=3)).replace(
+                hour=10, minute=0, second=0, microsecond=0
+            )
+            event_end = event_start + timedelta(hours=1)
+            manager.run_action(
+                "calendar", "add_event",
+                {"summary": "Evento X", "start": event_start.strftime("%Y-%m-%d %H:%M"),
+                 "end": event_end.strftime("%Y-%m-%d %H:%M"), "calendar": "Pessoal"},
+            )
+            manager.run_action("music", "play_playlist", {"name": "Foco"})
+            manager.run_action("music", "volume", {"level": 70})
+            manager.reset_mock_world()
+            self.assertEqual(
+                manager.run_action("calendar", "list_calendars", {}),
+                {"calendars": ["Pessoal", "Trabalho"]},
+            )
+            self.assertEqual(
+                manager.run_action("calendar", "list_events", {"calendar": "Pessoal", "days": 30}),
+                {"calendar": "Pessoal", "events": []},
+            )
+            self.assertEqual(
+                manager.run_action("music", "status", {}),
+                {"state": "paused", "name": "", "artist": "", "album": "", "position": 0, "duration": 0},
+            )
+            self.assertEqual(manager.run_action("music", "volume", {}), {"level": 50})
+        finally:
+            os.environ.pop("NOTIFYBOT_CONNECTORS_MOCK", None)
+
+    def test_mock_failure_outcomes_classify_denied_and_error(self):
+        """Seam regression: mock outcomes with rc != 0 flow through the SAME
+        _ScriptFailure classification as the real runner. A -1743 stderr is a
+        TCC denial -> persists denied; a plain error never downgrades state."""
+        try:
+            os.environ["NOTIFYBOT_CONNECTORS_MOCK"] = "1"
+        finally:
+            pass
+        try:
+            manager = ConnectorManager(self.tmp.name)  # env mock runner active
+            manager.state.record("calendar", "granted")
+            # denial path: -1743 stderr classifies "denied" AND persists it
+            manager._mock_runner = lambda cmd, timeout: Outcome(
+                1, "", "Not authorized to send Apple events (-1743)"
+            )
+            with self.assertRaises(ConnectorError) as denied_ctx:
+                manager.run_action("calendar", "list_calendars", {})
+            self.assertIn("-1743", str(denied_ctx.exception))
+            self.assertIn("Settings › Connectors", str(denied_ctx.exception))
+            self.assertEqual(manager.state.read()["calendar"]["status"], "denied")
+            # generic error path: rc != 0 without denial markers stays "error" —
+            # the copy says "action failed" and the granted state is NOT flipped
+            manager.state.record("calendar", "granted")
+            manager._mock_runner = lambda cmd, timeout: Outcome(3, "", "boom")
+            with self.assertRaises(ConnectorError) as error_ctx:
+                manager.run_action("calendar", "list_calendars", {})
+            self.assertIn("action failed", str(error_ctx.exception))
+            self.assertIn("(exit 3)", str(error_ctx.exception))
+            self.assertEqual(manager.state.read()["calendar"]["status"], "granted")
+        finally:
+            os.environ.pop("NOTIFYBOT_CONNECTORS_MOCK", None)
+
+    def test_music_probe_classification_denied_timeout_and_granted(self):
+        """Music probe classification via the runner seam: a catchable -1743
+        reaching the probe script must classify "denied" (NOT granted); the
+        healthy no-track path is "granted"; a hang is "needs_consent"."""
+        runner = RecordingRunner()
+        runner.register(
+            PROBE_SCRIPTS["music"], Outcome(1, "", "Not authorized to send Apple events (-1743)")
+        )
+        runner.register(PROBE_SCRIPTS["calendar"], Outcome(0, "5", ""))
+        manager = ConnectorManager(self.tmp.name, runner=runner)
+        self.assertEqual(manager.probe("music")["status"], "denied")
+        self.assertEqual(manager.state.read()["music"]["status"], "denied")
+        # healthy no-track path: rc 0 -> granted (state re-recorded unknown first)
+        manager.state.record("music", "unknown")
+        runner.register(PROBE_SCRIPTS["music"], Outcome(0, "false", ""))
+        self.assertEqual(manager.probe("music")["status"], "granted")
+        self.assertEqual(manager.state.read()["music"]["status"], "granted")
+        # calendar rides the same machinery, unguarded: rc 0 -> granted
+        self.assertEqual(manager.probe("calendar")["status"], "granted")
+        # timeout -> needs_consent (persisted), like the reminders probe split
+        manager.state.record("music", "unknown")
+
+        def timeout_runner(cmd, timeout):
+            raise subprocess.TimeoutExpired(cmd, timeout)
+
+        manager._runner = timeout_runner
+        self.assertEqual(manager.probe("music")["status"], "needs_consent")
+        self.assertEqual(manager.state.read()["music"]["status"], "needs_consent")
 
 
 if __name__ == "__main__":

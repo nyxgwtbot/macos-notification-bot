@@ -69,6 +69,18 @@ Domain/action whitelist (server-side enforced; unknown pairs are rejected):
 | notes | search | `{"query", "limit?"}` (limit default 20, cap 50) | `{notes: [names]}` |
 | notes | read | `{"name"}` | `{name, body}` |
 | notes | create | `{"title", "body?"}` (default folder) | `{ok, name}` |
+| calendar | list_calendars | `{}` | `{calendars: ["Pessoal", ...]}` |
+| calendar | list_events | `{"calendar?", "days?"}` (days 1-30, default 7; upcoming events) | `{events: [{summary, start, end}, ...]}` |
+| calendar | add_event | `{"summary", "start", "end", "calendar?", "notes?", "alert_minutes?"}` (dates = `YYYY-MM-DD HH:MM`) | `{ok, summary, start, calendar?}` |
+| calendar | delete_event | `{"summary", "calendar?", "from?"}` (EXACT summary match; from = `YYYY-MM-DD`) | `{ok, deleted}` |
+| music | status | `{}` | `{state, name, artist, album, position, duration}` |
+| music | play | `{}` | `{ok}` |
+| music | pause | `{}` | `{ok}` |
+| music | next | `{}` | `{ok}` |
+| music | previous | `{}` | `{ok}` |
+| music | play_playlist | `{"name"}` (exact playlist name) | `{ok, playlist}` |
+| music | search_store | `{"query"}` (top 5 store results) | `{results: [{name, artist, album}, ...]}` |
+| music | volume | `{}` to read, or `{"level": 0-100}` (Music app volume, not system) | `{level}` / `{ok, level}` |
 | system | volume | `{}` to read, or `{"level": 0-100}` to set | `{level}` / `{ok, level}` |
 | system | front_app | `{}` | `{app}` |
 | system | open | `{"target"}` (http(s) URL, or an app name) | `{ok, target}` |

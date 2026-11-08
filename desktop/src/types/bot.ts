@@ -267,6 +267,8 @@ export interface ConnectorsResponse {
   connectors: {
     reminders: ConnectorRow;
     notes: ConnectorRow;
+    calendar: ConnectorRow;
+    music: ConnectorRow;
     system: ConnectorRow;
   };
 }

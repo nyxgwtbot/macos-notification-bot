@@ -72,6 +72,7 @@ from notifybot.agent_tools import (
 )
 from notifybot.connectors import (
     CONNECTOR_DOMAINS,
+    ERR_UNKNOWN_DOMAIN,
     ConnectorError,
     ConnectorManager,
     ProbeBusy,
@@ -939,7 +940,7 @@ class BotApiRuntime:
         if domain not in CONNECTOR_DOMAINS:
             raise ApiError(
                 400,
-                "unknown domain: {!r} (valid: reminders, notes, system)".format(domain),
+                ERR_UNKNOWN_DOMAIN.format(domain=domain),
             )
         manager = self.ensure_connector_manager()
         try:
