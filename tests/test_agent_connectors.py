@@ -637,6 +637,7 @@ class TestStateStoreConcurrency(unittest.TestCase):
             {domain: rows[domain]["status"] for domain in CONNECTOR_DOMAINS},
             {"reminders": "unknown", "notes": "unknown", "calendar": "unknown",
              "music": "unknown", "shortcuts": "unknown", "mail": "unknown",
+             "contacts": "unknown", "messages": "unknown",
              "system": "unknown"},
         )
 
@@ -674,9 +675,11 @@ class TestConnectorEndpoints(unittest.TestCase):
         connectors = body["connectors"]
         self.assertEqual(
             set(connectors),
-            {"reminders", "notes", "calendar", "music", "shortcuts", "mail", "system"},
+            {"reminders", "notes", "calendar", "music", "shortcuts", "mail",
+             "contacts", "messages", "system"},
         )
-        for domain in ("reminders", "notes", "calendar", "music", "mail"):
+        for domain in ("reminders", "notes", "calendar", "music", "mail",
+                       "contacts", "messages"):
             row = connectors[domain]
             self.assertEqual(row["status"], "unknown")
             self.assertFalse(row["granted"])
@@ -1847,7 +1850,7 @@ class TestShortcutsMailGatingProbeAndMockWorld(unittest.TestCase):
         self.assertIn("mail", CONNECTOR_DOMAINS)
         self.assertEqual(CONNECTOR_DOMAINS.index("shortcuts"), 4)
         self.assertEqual(CONNECTOR_DOMAINS.index("mail"), 5)
-        self.assertEqual(CONNECTOR_DOMAINS[6], "system")
+        self.assertEqual(CONNECTOR_DOMAINS[8], "system")
         self.assertIn("mail", GATED_DOMAINS)
         self.assertNotIn("shortcuts", GATED_DOMAINS)
         self.assertEqual(CONNECTOR_ACTIONS["shortcuts"], ("list", "run"))
@@ -1894,7 +1897,8 @@ class TestShortcutsMailGatingProbeAndMockWorld(unittest.TestCase):
         rows = manager.rows()["connectors"]
         self.assertEqual(
             set(rows),
-            {"reminders", "notes", "calendar", "music", "shortcuts", "mail", "system"},
+            {"reminders", "notes", "calendar", "music", "shortcuts", "mail",
+             "contacts", "messages", "system"},
         )
         self.assertEqual(
             rows["shortcuts"],
@@ -2087,6 +2091,591 @@ class TestShortcutsMailGatingProbeAndMockWorld(unittest.TestCase):
             self.assertIn("Nenhuma conta configurada", str(ctx.exception))
         finally:
             os.environ.pop("NOTIFYBOT_CONNECTORS_MOCK", None)
+
+
+# ---- contacts + messages domains: dispatch, gating, probe, mock world --------------------
+# Imports for the contacts/messages suites below: appended here (not merged into
+# the top block) so this change stays a pure addition to the file (FASE 1/2
+# precedent above).
+
+from notifybot.connectors import (
+    BODY_MAX_BYTES,  # noqa: F811  (re-import with the FASE-3 family for locality)
+    CONTACTS_CREATE,
+    CONTACTS_EMAILS_MAX_COUNT,
+    CONTACTS_GET,
+    CONTACTS_LIST_LIMIT_DEFAULT,
+    CONTACTS_NOT_FOUND_MARKER,
+    CONTACTS_PHONES_MAX_COUNT,
+    CONTACTS_SEARCH,
+    CONNECTOR_ACTIONS,  # noqa: F811
+    ConnectorError,  # noqa: F811
+    ConnectorManager,  # noqa: F811
+    GATED_DOMAINS,  # noqa: F811
+    LIST_NAME_MAX_CHARS,  # noqa: F811
+    MESSAGES_LIST_THREADS,
+    MESSAGES_SEND_CONTACT,
+    MESSAGES_SEND_HANDLE,
+    MESSAGES_TEXT_MAX_CHARS,
+    MESSAGES_THREADS_MAX_COUNT,
+    MESSAGES_TO_MAX_CHARS,
+    MESSAGES_UNKNOWN_RECIPIENT_MARKER,
+    PROBE_SCRIPTS,  # noqa: F811
+    QUERY_MAX_CHARS,
+    SCRIPTS,  # noqa: F811
+    LIST_LIMIT_MAX,  # noqa: F811
+    ERR_UNKNOWN_RECIPIENT,
+    _DELIM,  # noqa: F811
+)
+
+
+class TestContactsDispatchActions(unittest.TestCase):
+    """Contacts dispatch: argv layout, split_keep row parsing (empty fields
+    KEEP positions), marker remap, validation caps, and list caps."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runner = RecordingRunner()
+        self.manager = ConnectorManager(self.tmp.name, runner=self.runner)
+        self.manager.state.record("contacts", "granted")
+
+    def test_search_default_limit_argv_and_row_parsing(self):
+        self.runner.register(
+            CONTACTS_SEARCH,
+            Outcome(0, _DELIM.join([
+                "Marina Duarte", "Imaginária Ltda", "marina@imaginaria.test", "+5511922220001",
+                "Bruno Tanaka", "", "bruno@tanaka.test", "",
+            ]), ""),
+        )
+        result = self.manager.run_action("contacts", "search", {"query": "Marina"})
+        self.assertEqual(
+            result,
+            {"contacts": [
+                {"name": "Marina Duarte", "org": "Imaginária Ltda",
+                 "email": "marina@imaginaria.test", "phone": "+5511922220001"},
+                {"name": "Bruno Tanaka", "org": "",  # empty field KEEPS its position (split_keep)
+                 "email": "bruno@tanaka.test", "phone": ""},
+            ]},
+        )
+        self.assertEqual(self.runner.calls[-1][2], CONTACTS_SEARCH)
+        self.assertEqual(self.runner.last_argv(), ["Marina", "10"])  # default limit 10
+
+    def test_search_limit_param_and_validation(self):
+        self.runner.register(CONTACTS_SEARCH, Outcome(0, "", ""))
+        self.manager.run_action("contacts", "search", {"query": "x", "limit": 3})
+        self.assertEqual(self.runner.last_argv(), ["x", "3"])
+        self.manager.run_action("contacts", "search", {"query": "x", "limit": 50})
+        self.assertEqual(self.runner.last_argv(), ["x", "50"])  # boundary 50 is VALID
+        valid_calls = list(self.runner.calls)  # the two valid probes (never re-run)
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("contacts", "search", {"query": "x", "limit": 51})
+        self.assertEqual(str(ctx.exception), "limit accepts at most 50 contacts.")  # above the cap ERRORS
+        for bad in (0, -1, 2.5, True, "abc"):
+            with self.assertRaises(ConnectorError) as pos_ctx:
+                self.manager.run_action("contacts", "search", {"query": "x", "limit": bad})
+            self.assertEqual(str(pos_ctx.exception), "'limit' must be a positive integer", bad)
+        with self.assertRaises(ConnectorError) as q_ctx:
+            self.manager.run_action("contacts", "search", {"query": "q" * (QUERY_MAX_CHARS + 1)})
+        self.assertEqual(str(q_ctx.exception), "'query' is limited to 256 characters")
+        with self.assertRaises(ConnectorError) as req_ctx:
+            self.manager.run_action("contacts", "search", {"limit": 5})
+        self.assertEqual(str(req_ctx.exception), "'query' is required")
+        # every rejection predates dispatch — the call list never grew
+        self.assertEqual(self.runner.calls, valid_calls)
+
+    def test_get_full_record_parse_and_note_cap(self):
+        self.runner.register(
+            CONTACTS_GET,
+            Outcome(0, _DELIM.join([
+                "Marina Duarte", "Imaginária Ltda",
+                "marina@imaginaria.test, outro@x.test",
+                "+5511922220001, +5511922220002",
+                "Prefere contato por e-mail.",
+            ]), ""),
+        )
+        result = self.manager.run_action("contacts", "get", {"name": "Marina Duarte"})
+        self.assertEqual(
+            result,
+            {"contact": {
+                "name": "Marina Duarte", "org": "Imaginária Ltda",
+                "emails": ["marina@imaginaria.test", "outro@x.test"],
+                "phones": ["+5511922220001", "+5511922220002"],
+                "notes": "Prefere contato por e-mail.",
+            }},
+        )
+        # second case: the note field capped at BODY_MAX_BYTES (16384) exactly
+        # ("ç" = 2 UTF-8 bytes; "ç" * 9000 = 18000 bytes).
+        big_note = "ç" * 9000
+        self.runner.register(
+            CONTACTS_GET, Outcome(0, _DELIM.join(["Pessoa", "", "", "", big_note]), "")
+        )
+        capped = self.manager.run_action("contacts", "get", {"name": "Pessoa"})
+        self.assertEqual(len(capped["contact"]["notes"].encode("utf-8")), BODY_MAX_BYTES)
+        self.assertEqual(len(capped["contact"]["notes"].encode("utf-8")), 16384)
+
+    def test_get_not_found_marker_clean_ptbr_copy(self):
+        self.runner.register(CONTACTS_GET, Outcome(0, CONTACTS_NOT_FOUND_MARKER, ""))
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("contacts", "get", {"name": "Fantasma"})
+        self.assertEqual(
+            str(ctx.exception),
+            'Contato não encontrado — use a ação "search" para ver os nomes disponíveis.',
+        )
+        self.assertEqual(self.runner.last_argv(), ["Fantasma"])  # argv still recorded (mirror mail)
+
+    def test_create_argv_layout_result_and_list_caps(self):
+        self.runner.register(CONTACTS_CREATE, Outcome(0, "created", ""))
+        result = self.manager.run_action(
+            "contacts", "create",
+            {"name": "Nova Pessoa", "org": "Imaginária Ltda",
+             "emails": ["e1@exemplo.test"],
+             "phones": ["+5511000000001", "+5511000000002"]},
+        )
+        self.assertEqual(result, {"ok": True, "created": "Nova Pessoa"})
+        self.assertEqual(
+            self.runner.last_argv(),
+            ["Nova Pessoa", "Imaginária Ltda",
+             "e1@exemplo.test", "", "",
+             "+5511000000001", "+5511000000002", ""],  # ""-padding for absent items
+        )
+        # boundary: 3 emails + 3 phones is VALID
+        full = self.manager.run_action(
+            "contacts", "create",
+            {"name": "Cheia",
+             "emails": ["a@a.test", "b@b.test", "c@c.test"],
+             "phones": ["+5511000000011", "+5511000000012", "+5511000000013"]},
+        )
+        self.assertEqual(full, {"ok": True, "created": "Cheia"})
+        self.assertEqual(
+            self.runner.last_argv(),
+            ["Cheia", "", "a@a.test", "b@b.test", "c@c.test",
+             "+5511000000011", "+5511000000012", "+5511000000013"],
+        )
+        # caps ERROR above the cap (never clamped/truncated)
+        with self.assertRaises(ConnectorError) as e_ctx:
+            self.manager.run_action(
+                "contacts", "create",
+                {"name": "Cheia", "emails": ["a@a.test", "b@b.test", "c@c.test", "d@d.test"]},
+            )
+        self.assertEqual(str(e_ctx.exception), "'emails' accepts at most 3 values.")
+        with self.assertRaises(ConnectorError) as p_ctx:
+            self.manager.run_action(
+                "contacts", "create",
+                {"name": "Cheia", "phones": ["+5511000000011", "+5511000000012",
+                                             "+5511000000013", "+5511000000014"]},
+            )
+        self.assertEqual(str(p_ctx.exception), "'phones' accepts at most 3 values.")
+        with self.assertRaises(ConnectorError) as req_ctx:
+            self.manager.run_action("contacts", "create", {"emails": ["a@a.test"]})
+        self.assertEqual(str(req_ctx.exception), "'name' is required")
+        with self.assertRaises(ConnectorError) as len_ctx:
+            self.manager.run_action(
+                "contacts", "create", {"name": "n" * (LIST_NAME_MAX_CHARS + 1)}
+            )
+        self.assertEqual(str(len_ctx.exception), "'name' is limited to 256 characters")
+        self.assertEqual(len(self.runner.calls), 2)  # only the two valid creates reached the runner
+
+    def test_create_rejects_delimiter_and_join_collisions(self):
+        """Create-time guards: ", " in an email collides with CONTACTS_GET's
+        ", "-joined list rendering; _DELIM anywhere in a stored field would
+        misalign later split_keep/get parsing. Every rejection predates any
+        dispatch."""
+        with self.assertRaises(ConnectorError) as join_ctx:
+            self.manager.run_action(
+                "contacts", "create", {"name": "N", "emails": ["a@x, b@y"]}
+            )
+        self.assertEqual(str(join_ctx.exception), "'emails' must not contain ', '")
+        with self.assertRaises(ConnectorError) as name_ctx:
+            self.manager.run_action("contacts", "create", {"name": "a\x1fb"})
+        self.assertEqual(
+            str(name_ctx.exception),
+            "'name' must not contain the record delimiter character",
+        )
+        with self.assertRaises(ConnectorError) as phones_ctx:
+            self.manager.run_action(
+                "contacts", "create", {"name": "N", "phones": ["p\x1fq"]}
+            )
+        self.assertEqual(
+            str(phones_ctx.exception),
+            "'phones' must not contain the record delimiter character",
+        )
+        with self.assertRaises(ConnectorError) as join_phones_ctx:
+            self.manager.run_action("contacts", "create", {"name": "N", "phones": ["p, q"]})
+        self.assertEqual(str(join_phones_ctx.exception), "'phones' must not contain ', '")
+        self.assertEqual(self.runner.calls, [])  # nothing valid was registered: zero dispatches
+
+    def test_contacts_unknown_action_copy(self):
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("contacts", "delete", {"name": "x"})
+        self.assertEqual(
+            str(ctx.exception),
+            "unknown action 'delete' for domain 'contacts' (valid: search, get, create)",
+        )
+        self.assertEqual(self.runner.calls, [])
+
+
+class TestMessagesDispatchActions(unittest.TestCase):
+    """Messages dispatch: handle/contact script split, refusal-marker mapping,
+    validation caps, and the date-only thread privacy floor."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runner = RecordingRunner()
+        self.manager = ConnectorManager(self.tmp.name, runner=self.runner)
+        self.manager.state.record("messages", "granted")
+
+    def test_send_email_handle_direct_script(self):
+        self.runner.register(MESSAGES_SEND_HANDLE, Outcome(0, "sent", ""))
+        result = self.manager.run_action(
+            "messages", "send_message", {"to": "fulano@exemplo.com", "text": "oi"}
+        )
+        self.assertEqual(result, {"ok": True, "sent": True, "to": "fulano@exemplo.com"})
+        self.assertEqual(self.runner.calls[-1][2], MESSAGES_SEND_HANDLE)  # raw handle -> direct script
+        self.assertEqual(self.runner.last_argv(), ["fulano@exemplo.com", "oi"])
+
+    def test_send_e164_direct_script(self):
+        self.runner.register(MESSAGES_SEND_HANDLE, Outcome(0, "sent", ""))
+        result = self.manager.run_action(
+            "messages", "send_message", {"to": "+5511987654321", "text": "oi"}
+        )
+        self.assertEqual(result, {"ok": True, "sent": True, "to": "+5511987654321"})
+        self.assertEqual(self.runner.calls[-1][2], MESSAGES_SEND_HANDLE)
+        self.assertEqual(self.runner.last_argv(), ["+5511987654321", "oi"])
+
+    def test_send_contact_name_lookup_script_and_success(self):
+        self.runner.register(MESSAGES_SEND_CONTACT, Outcome(0, "sent", ""))
+        result = self.manager.run_action(
+            "messages", "send_message", {"to": "Marina Duarte", "text": "oi"}
+        )
+        self.assertEqual(result, {"ok": True, "sent": True, "to": "Marina Duarte"})
+        self.assertEqual(self.runner.calls[-1][2], MESSAGES_SEND_CONTACT)  # name -> lookup script
+        self.assertEqual(self.runner.last_argv(), ["Marina Duarte", "oi"])
+
+    def test_send_ambiguous_junk_routes_to_contact_lookup(self):
+        self.runner.register(MESSAGES_SEND_CONTACT, Outcome(0, "sent", ""))
+        result = self.manager.run_action(
+            "messages", "send_message", {"to": "5511-9876", "text": "oi"}
+        )
+        self.assertEqual(result, {"ok": True, "sent": True, "to": "5511-9876"})
+        self.assertEqual(self.runner.calls[-1][2], MESSAGES_SEND_CONTACT)  # neither email nor E.164
+
+    def test_send_negative_handle_shapes_route_to_contact_lookup(self):
+        """Hardened handle regex: shapes with whitespace/control chars (incl.
+        NUL) or a leading +0 fail BOTH raw-handle checks and route to the
+        contact-lookup variant — never MESSAGES_SEND_HANDLE (a NUL argv item
+        must fail closed at the lookup, not explode at exec time)."""
+        self.runner.register(MESSAGES_SEND_CONTACT, Outcome(0, "sent", ""))
+        for payload in ("+0", "++1", "a@b c", "a\xa0@b.com", "a\x00@b"):
+            result = self.manager.run_action(
+                "messages", "send_message", {"to": payload, "text": "oi"}
+            )
+            self.assertEqual(result, {"ok": True, "sent": True, "to": payload}, payload)
+            self.assertEqual(self.runner.calls[-1][2], MESSAGES_SEND_CONTACT, payload)
+        self.assertNotIn(MESSAGES_SEND_HANDLE, [cmd[2] for cmd in self.runner.calls])
+
+    def test_send_unknown_recipient_refusal_exact_copy(self):
+        self.runner.register(
+            MESSAGES_SEND_CONTACT, Outcome(0, MESSAGES_UNKNOWN_RECIPIENT_MARKER, "")
+        )
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action(
+                "messages", "send_message", {"to": "Fulano Fantasma", "text": "oi"}
+            )
+        self.assertEqual(
+            str(ctx.exception),
+            ERR_UNKNOWN_RECIPIENT.format(to="Fulano Fantasma"),
+        )
+        self.assertEqual(
+            str(ctx.exception),
+            "unknown recipient: 'Fulano Fantasma' is not a known contact, e-mail address, "
+            "or +E.164 phone",
+        )
+        self.assertEqual(self.runner.last_argv(), ["Fulano Fantasma", "oi"])  # argv still recorded
+
+    def test_send_validation_caps_and_requirement(self):
+        self.runner.register(MESSAGES_SEND_HANDLE, Outcome(0, "sent", ""))
+        self.runner.register(MESSAGES_SEND_CONTACT, Outcome(0, "sent", ""))
+        with self.assertRaises(ConnectorError) as text_ctx:
+            self.manager.run_action(
+                "messages", "send_message", {"to": "fulano@exemplo.com", "text": "x" * 1025}
+            )
+        self.assertEqual(str(text_ctx.exception), "'text' is limited to 1024 characters")
+        with self.assertRaises(ConnectorError) as to_ctx:
+            self.manager.run_action(
+                "messages", "send_message", {"to": "t" * 257, "text": "oi"}
+            )
+        self.assertEqual(str(to_ctx.exception), "'to' is limited to 256 characters")
+        with self.assertRaises(ConnectorError) as text_req_ctx:
+            self.manager.run_action("messages", "send_message", {"to": "fulano@exemplo.com"})
+        self.assertEqual(str(text_req_ctx.exception), "'text' is required")
+        with self.assertRaises(ConnectorError) as to_req_ctx:
+            self.manager.run_action("messages", "send_message", {"text": "oi"})
+        self.assertEqual(str(to_req_ctx.exception), "'to' is required")
+        self.assertEqual(self.runner.calls, [])  # every rejection predates dispatch
+
+    def test_threads_default_cap_argv_and_date_only_rows(self):
+        self.runner.register(
+            MESSAGES_LIST_THREADS,
+            Outcome(0, _DELIM.join([
+                "marina@imaginaria.test", "2026-11-07",
+                "+5511922220001", "2026-11-06",
+            ]), ""),
+        )
+        result = self.manager.run_action("messages", "list_recent_threads", {})
+        self.assertEqual(self.runner.last_argv(), ["10"])  # default == cap == 10
+        self.assertEqual(
+            result,
+            {"threads": [
+                {"handle": "marina@imaginaria.test", "date": "2026-11-07"},
+                {"handle": "+5511922220001", "date": "2026-11-06"},
+            ]},
+        )
+        for row in result["threads"]:  # privacy floor: EVERY row is handle+date ONLY
+            self.assertEqual(set(row), {"handle", "date"})
+        self.manager.run_action("messages", "list_recent_threads", {"count": 5})
+        self.assertEqual(self.runner.last_argv(), ["5"])
+        self.manager.run_action("messages", "list_recent_threads", {"count": 10})
+        self.assertEqual(self.runner.last_argv(), ["10"])  # boundary 10 is VALID
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("messages", "list_recent_threads", {"count": 11})
+        self.assertEqual(str(ctx.exception), "count accepts at most 10 threads.")  # never clamped
+        for bad in (0, -1, 2.5, True, "abc"):
+            with self.assertRaises(ConnectorError) as pos_ctx:
+                self.manager.run_action("messages", "list_recent_threads", {"count": bad})
+            self.assertEqual(str(pos_ctx.exception), "'count' must be a positive integer", bad)
+        self.assertEqual(len(self.runner.calls), 3)  # only the 3 valid reads ran
+
+
+class TestContactsMessagesGatingProbeAndMockWorld(unittest.TestCase):
+    """Membership batteries, gate machinery, probe classification, script
+    hygiene, and the env-gated mock world observability for contacts +
+    messages."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_contacts_messages_membership_and_gate_lists(self):
+        self.assertIn("contacts", CONNECTOR_DOMAINS)
+        self.assertIn("messages", CONNECTOR_DOMAINS)
+        self.assertEqual(CONNECTOR_DOMAINS.index("contacts"), 6)
+        self.assertEqual(CONNECTOR_DOMAINS.index("messages"), 7)
+        self.assertEqual(CONNECTOR_DOMAINS[8], "system")
+        self.assertIn("contacts", GATED_DOMAINS)
+        self.assertIn("messages", GATED_DOMAINS)
+        self.assertEqual(CONNECTOR_ACTIONS["contacts"], ("search", "get", "create"))
+        self.assertEqual(
+            CONNECTOR_ACTIONS["messages"], ("send_message", "list_recent_threads")
+        )
+
+    def test_ungranted_gates_never_reach_runner_exact_copy(self):
+        gate_runner = RecordingRunner()
+        manager = ConnectorManager(self.tmp.name, runner=gate_runner)
+        for domain, action, params, expected in (
+            ("contacts", "search", {"query": "Marina"},
+             "Contacts ainda não está conectado — conecte contacts em Settings › Connectors."),
+            ("messages", "send_message", {"to": "Marina", "text": "oi"},
+             "Messages ainda não está conectado — conecte messages em Settings › Connectors."),
+        ):
+            for status in ("unknown", "denied", "needs_consent"):
+                manager.state.record(domain, status)
+                self.assertEqual(gate_runner.calls, [])
+                with self.assertRaises(ConnectorError) as ctx:
+                    manager.run_action(domain, action, params)
+                # gate copy flows from the existing PT-BR machinery verbatim
+                self.assertEqual(str(ctx.exception), expected)
+                self.assertEqual(gate_runner.calls, [])  # runner NEVER invoked through the gate
+
+    def test_search_validation_predates_gate_and_runner(self):
+        """Param validation fires BEFORE the consent gate (proven FASE-1 seam):
+        with contacts UNgranted, a bad-limit search still raises the
+        validation copy first and never reaches the runner."""
+        gate_runner = RecordingRunner()
+        manager = ConnectorManager(self.tmp.name, runner=gate_runner)
+        self.assertEqual(manager.state.read()["contacts"]["status"], "unknown")
+        with self.assertRaises(ConnectorError) as ctx:
+            manager.run_action("contacts", "search", {"query": "x", "limit": 51})
+        self.assertEqual(str(ctx.exception), "limit accepts at most 50 contacts.")
+        self.assertEqual(gate_runner.calls, [])
+
+    def test_script_hygiene_marker_and_bundle_battery(self):
+        for script in (CONTACTS_SEARCH, CONTACTS_GET, CONTACTS_CREATE,
+                       MESSAGES_SEND_HANDLE, MESSAGES_SEND_CONTACT, MESSAGES_LIST_THREADS):
+            self.assertIn("on run argv", script)  # argv-only input channel
+            self.assertNotIn("do shell script", script)
+            self.assertNotIn("run script", script)
+        for script in (CONTACTS_SEARCH, CONTACTS_GET, CONTACTS_CREATE):
+            self.assertIn("com.apple.AddressBook", script)
+        for script in (MESSAGES_SEND_HANDLE, MESSAGES_SEND_CONTACT, MESSAGES_LIST_THREADS):
+            self.assertIn("com.apple.iChat", script)
+        self.assertIn(CONTACTS_NOT_FOUND_MARKER, CONTACTS_GET)
+        self.assertIn(MESSAGES_UNKNOWN_RECIPIENT_MARKER, MESSAGES_SEND_CONTACT)
+        # F2 ambiguity refusal lives in the frozen script: >1 exact-name
+        # matches return the marker immediately (never guess a recipient).
+        self.assertIn(
+            'is greater than 1 then return "connectors-messages-unknown-recipient"',
+            MESSAGES_SEND_CONTACT,
+        )
+        self.assertIn("count of people", PROBE_SCRIPTS["contacts"])
+        self.assertIn("com.apple.AddressBook", PROBE_SCRIPTS["contacts"])
+        self.assertIn("count of services", PROBE_SCRIPTS["messages"])
+        self.assertIn("com.apple.iChat", PROBE_SCRIPTS["messages"])
+        # SCRIPTS equality across all six registered keys (incl. the
+        # non-whitelisted send_message_contact variant key)
+        self.assertIs(SCRIPTS[("contacts", "search")], CONTACTS_SEARCH)
+        self.assertIs(SCRIPTS[("contacts", "get")], CONTACTS_GET)
+        self.assertIs(SCRIPTS[("contacts", "create")], CONTACTS_CREATE)
+        self.assertIs(SCRIPTS[("messages", "send_message")], MESSAGES_SEND_HANDLE)
+        self.assertIs(SCRIPTS[("messages", "send_message_contact")], MESSAGES_SEND_CONTACT)
+        self.assertIs(SCRIPTS[("messages", "list_recent_threads")], MESSAGES_LIST_THREADS)
+
+    def test_probes_classification_contacts_and_messages(self):
+        granted_runner = RecordingRunner()
+        granted_runner.register(PROBE_SCRIPTS["contacts"], Outcome(0, "2", ""))
+        manager = ConnectorManager(self.tmp.name, runner=granted_runner)
+        self.assertEqual(manager.probe("contacts")["status"], "granted")
+        self.assertEqual(manager.state.read()["contacts"]["status"], "granted")
+        # canned -1743 denial: classified AND persisted (mirror calendar/music/mail)
+        denied_runner = RecordingRunner()
+        denied_runner.register(
+            PROBE_SCRIPTS["messages"],
+            Outcome(1, "", "Not authorized to send Apple events (-1743)"),
+        )
+        manager2 = ConnectorManager(self.tmp.name, runner=denied_runner)
+        self.assertEqual(manager2.probe("messages")["status"], "denied")
+        self.assertEqual(manager2.state.read()["messages"]["status"], "denied")
+        # a hang classifies needs_consent (persisted) — runner-seam split
+        manager2.state.record("messages", "unknown")
+
+        def timeout_runner(cmd, timeout, stdin=None):
+            raise subprocess.TimeoutExpired(cmd, timeout)
+
+        manager2._runner = timeout_runner
+        self.assertEqual(manager2.probe("messages")["status"], "needs_consent")
+        self.assertEqual(manager2.state.read()["messages"]["status"], "needs_consent")
+
+    def test_mock_world_observability_contacts_and_messages(self):
+        """Env-mock world: seeded search hit; create -> search finds -> get
+        full record; send to the created name -> sent; send to an unknown
+        name -> the exact refusal copy; a channel-less contact and an
+        ambiguous (duplicated) name both refuse with the exact copy;
+        threads == the seeded two rows."""
+        try:
+            os.environ["NOTIFYBOT_CONNECTORS_MOCK"] = "1"
+        finally:
+            pass
+        try:
+            manager = ConnectorManager(self.tmp.name)  # env mock runner active
+            manager.state.record("contacts", "granted")
+            manager.state.record("messages", "granted")
+            # seeded search hit (empty org keeps position — split_keep)
+            found = manager.run_action("contacts", "search", {"query": "Marina"})
+            self.assertEqual(
+                found,
+                {"contacts": [
+                    {"name": "Marina Duarte", "org": "Imaginária Ltda",
+                     "email": "marina@imaginaria.test", "phone": "+5511922220001"},
+                ]},
+            )
+            # create -> search finds -> get full record (note "" for created)
+            manager.run_action(
+                "contacts", "create",
+                {"name": "Dora Prista", "emails": ["dora@prista.test"]},
+            )
+            found2 = manager.run_action("contacts", "search", {"query": "Dora"})
+            self.assertEqual([row["name"] for row in found2["contacts"]], ["Dora Prista"])
+            got = manager.run_action("contacts", "get", {"name": "Dora Prista"})
+            self.assertEqual(
+                got,
+                {"contact": {
+                    "name": "Dora Prista", "org": "",
+                    "emails": ["dora@prista.test"], "phones": [], "notes": "",
+                }},
+            )
+            # get of a seeded contact shows its note
+            seeded = manager.run_action("contacts", "get", {"name": "Marina Duarte"})
+            self.assertEqual(seeded["contact"]["notes"], "Prefere contato por e-mail.")
+            # send to the created name -> the lookup variant says sent
+            sent = manager.run_action(
+                "messages", "send_message", {"to": "Dora Prista", "text": "oi"}
+            )
+            self.assertEqual(sent, {"ok": True, "sent": True, "to": "Dora Prista"})
+            # send to an unknown name -> the exact refusal copy
+            with self.assertRaises(ConnectorError) as ctx:
+                manager.run_action(
+                    "messages", "send_message", {"to": "Fantasma", "text": "oi"}
+                )
+            self.assertEqual(
+                str(ctx.exception), ERR_UNKNOWN_RECIPIENT.format(to="Fantasma")
+            )
+            # create with NO emails and NO phones (argv rides 8 items with ""
+            # padding — the create test above covers the layout): the lookup
+            # variant resolves no sendable handle -> the exact refusal copy.
+            manager.run_action("contacts", "create", {"name": "Sem Canais"})
+            with self.assertRaises(ConnectorError) as no_channel_ctx:
+                manager.run_action(
+                    "messages", "send_message", {"to": "Sem Canais", "text": "oi"}
+                )
+            self.assertEqual(
+                str(no_channel_ctx.exception),
+                ERR_UNKNOWN_RECIPIENT.format(to="Sem Canais"),
+            )
+            # TWO contacts sharing the exact name: ambiguous -> refuse with
+            # the same copy — the mock mirrors the frozen script's >1-match
+            # guard (never guess a recipient).
+            manager.run_action("contacts", "create", {"name": "Gemeo Silva"})
+            manager.run_action("contacts", "create", {"name": "Gemeo Silva"})
+            with self.assertRaises(ConnectorError) as ambiguous_ctx:
+                manager.run_action(
+                    "messages", "send_message", {"to": "Gemeo Silva", "text": "oi"}
+                )
+            self.assertEqual(
+                str(ambiguous_ctx.exception),
+                ERR_UNKNOWN_RECIPIENT.format(to="Gemeo Silva"),
+            )
+            # threads: the seeded rows verbatim, date-only key sets
+            threads = manager.run_action("messages", "list_recent_threads", {})
+            self.assertEqual(
+                threads,
+                {"threads": [
+                    {"handle": "marina@imaginaria.test", "date": "2026-11-07"},
+                    {"handle": "+5511922220001", "date": "2026-11-06"},
+                ]},
+            )
+            for row in threads["threads"]:
+                self.assertEqual(set(row), {"handle", "date"})
+        finally:
+            os.environ.pop("NOTIFYBOT_CONNECTORS_MOCK", None)
+
+    def test_send_injection_battery_contacts_and_messages(self):
+        """Model-controlled strings ride strictly as argv items against the
+        FROZEN contacts/messages constants — never inside script source.
+        Payloads are never e-mail/E.164-shaped, so each `send_message` trip
+        routes to the contact-lookup variant."""
+        runner = RecordingRunner()
+        runner.register(CONTACTS_CREATE, Outcome(0, "created", ""))
+        runner.register(MESSAGES_SEND_CONTACT, Outcome(0, "sent", ""))
+        manager = ConnectorManager(self.tmp.name, runner=runner)
+        manager.state.record("contacts", "granted")
+        manager.state.record("messages", "granted")
+        for payload in TestInjectionBattery.PAYLOADS:
+            manager.run_action("contacts", "create", {"name": payload, "emails": [payload]})
+            cmd = runner.calls[-1]
+            script_source = cmd[2]
+            argv = cmd[3:]
+            self.assertIn(payload, argv, payload)  # verbatim argv delivery
+            self.assertEqual(script_source, CONTACTS_CREATE)
+            self.assertNotIn(payload, script_source, payload)  # absent from source
+            manager.run_action("messages", "send_message", {"to": payload, "text": payload})
+            cmd = runner.calls[-1]
+            script_source = cmd[2]
+            self.assertIn(payload, cmd[3:], payload)  # verbatim argv delivery
+            self.assertEqual(script_source, MESSAGES_SEND_CONTACT)
+            self.assertNotIn(payload, script_source, payload)  # absent from source
+            self.assertNotIn(payload, MESSAGES_SEND_HANDLE, payload)  # never in either variant
+        for cmd in runner.calls:  # shape holds for EVERY payload
+            self.assertEqual(cmd[:2], ["osascript", "-e"])
 
 
 if __name__ == "__main__":

@@ -456,7 +456,7 @@ class ToolRegistry:
         """
         domain = args.get("domain")
         if not isinstance(domain, str) or domain.strip() == "":
-            raise ToolFailure("native.call requires a 'domain' string (reminders, notes, calendar, music, shortcuts, mail, system)")
+            raise ToolFailure("native.call requires a 'domain' string (reminders, notes, calendar, music, shortcuts, mail, contacts, messages, system)")
         action = args.get("action")
         if not isinstance(action, str) or action.strip() == "":
             raise ToolFailure("native.call requires an 'action' string for the domain")

@@ -86,6 +86,11 @@ Domain/action whitelist (server-side enforced; unknown pairs are rejected):
 | mail | unread_count | `{"mailbox?", "account?"}` (empty mailbox = INBOX of every account; gated — connect in Settings first; read-only, no bodies; destructive ops are not available) | `{unread}` |
 | mail | mailboxes | `{}` | `{mailboxes: ["INBOX", ...]}` |
 | mail | list_recent | `{"mailbox?", "count?"}` (count 1-20, default 20) | `{messages: [{subject, from, received}, ...]}` |
+| contacts | search | `{"query", "limit?"}` (limit default 10, cap 50) | `{contacts: [{name, org, email, phone}, ...]}` |
+| contacts | get | `{"name"}` (EXACT contact name; shows notes too) | `{contact: {name, org, emails, phones, notes}}` |
+| contacts | create | `{"name", "org?", "emails?" (max 3), "phones?" (max 3)}` (no delete/update) | `{ok, created}` |
+| messages | send_message | `{"to", "text"}` (to = contact name in Contacts, e-mail, or +E.164; text ≤ 1024; SEND-ONLY and irreversible — unknown recipients are refused) | `{ok, sent, to}` |
+| messages | list_recent_threads | `{"count?"}` (count 1-10, default 10) | `{threads: [{handle, date}, ...]}` (dates only, never message text) |
 | system | volume | `{}` to read, or `{"level": 0-100}` to set | `{level}` / `{ok, level}` |
 | system | front_app | `{}` | `{app}` |
 | system | open | `{"target"}` (http(s) URL, or an app name) | `{ok, target}` |
@@ -96,6 +101,7 @@ Rules:
 - For a reminder list name, call `list_lists` FIRST and pass the name back EXACTLY as returned (do not invent or translate list names).
 - `notes.create`/`reminders.add` return `{ok}` without re-checking (iCloud sync may lag for a few seconds) — do NOT call `search`/`list_reminders` to verify a create.
 - CONSENT RULE: when a `native.call` result is an error that mentions Settings or Connectors (the domain is not connected — e.g. "Reminders ainda não está conectado — conecte reminders em Settings › Connectors."), relay that error text to the user in PT-BR and do NOT retry that domain during this turn. The user connects domains in Settings › Connectors.
+- `messages.send_message` is SEND-ONLY and irreversible: confirm the recipient AND the exact text with the user before calling; a refusal copy starting with "unknown recipient" means send_message will NOT send to that recipient (pass the raw e-mail or +E.164 number in `to` when the user confirms it).
 
 ## Recipes
 

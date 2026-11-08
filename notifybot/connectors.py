@@ -12,22 +12,23 @@ source (no f-strings, no shell, no ``run script`` of dynamic text). List
 outputs are joined in-script with ``ASCII character 31`` and split here —
 never comma-split.
 
-Consent model (TCC): reminders/notes/calendar/music/mail actions require
-``granted`` state, which is produced by ``probe()`` (fired from Settings ›
+Consent model (TCC): reminders/notes/calendar/music/mail/contacts/messages
+actions require ``granted`` state, which is produced by ``probe()`` (fired from Settings ›
 Connectors) or self-healed by a successful action. Actions that come back
 denied persist ``denied`` and raise the PT-BR consent error. ``system`` and
 ``shortcuts`` (system CLI) are ungated (no consent). Probes are single-flight
 per domain; concurrent probes raise ``ProbeBusy`` (API maps to 409).
 
-Deferred domains (v1 documentation table — NOT rows of GET /api/connectors;
-zero secrets involved; each is read-sensitive and needs its own design pass):
+Deferred/later domains table (findmy still deferred; contacts/messages are
+implemented in v2 and ARE rows of GET /api/connectors; zero secrets involved;
+PII/read-sensitive):
 
 ==============  =========================  ==================================
 Domain          Example actions            Why deferred to v2
 ==============  =========================  ==================================
 mail            unread/mailboxes/recent    implemented in v1 (read-level-1)
-contacts        list/search people         PII; heavier consent story
-messages        list recent threads        most PII-rich surface on macOS
+contacts        search/get/create          implemented in v2 (same consent gate; no delete/update)
+messages        send_message/thread-dates  implemented in v2 (send-only; date-only threads)
 findmy          locate devices             location + privacy escalation
 ==============  =========================  ==================================
 
@@ -49,7 +50,8 @@ Outcome classification (actions and probes share it):
 Mock hook: with env ``NOTIFYBOT_CONNECTORS_MOCK=1`` the runner seam executes a
 per-process in-memory world (reminders lists, notes, calendar events, music
 state, volume, front app, toasts, shortcut names, mail unread/mailbox/recent
-fixtures) so smokes exercise add->list observability and the endpoints WITHOUT
+fixtures, contacts people, message thread dates) so smokes exercise
+add->list observability and the endpoints WITHOUT
 osascript.
 """
 
@@ -69,7 +71,8 @@ from notifybot.agent_tools import _write_atomic
 
 #: Domains exposed by native.call in v1 (order == GET /api/connectors row order).
 CONNECTOR_DOMAINS: Tuple[str, ...] = (
-    "reminders", "notes", "calendar", "music", "shortcuts", "mail", "system"
+    "reminders", "notes", "calendar", "music", "shortcuts", "mail",
+    "contacts", "messages", "system"
 )
 
 #: Whitelist: the only (domain, action) pairs dispatch accepts.
@@ -80,12 +83,14 @@ CONNECTOR_ACTIONS: Dict[str, Tuple[str, ...]] = {
     "music": ("status", "play", "pause", "next", "previous", "play_playlist", "search_store", "volume"),
     "shortcuts": ("list", "run"),
     "mail": ("unread_count", "mailboxes", "list_recent"),
+    "contacts": ("search", "get", "create"),
+    "messages": ("send_message", "list_recent_threads"),
     "system": ("volume", "front_app", "open", "toast"),
 }
 
 #: Domains that require granted consent state before ANY action runs
 #: (AppleScript automation of these apps triggers macOS TCC consent).
-GATED_DOMAINS: Tuple[str, ...] = ("reminders", "notes", "calendar", "music", "mail")
+GATED_DOMAINS: Tuple[str, ...] = ("reminders", "notes", "calendar", "music", "mail", "contacts", "messages")
 
 #: Hard per-call timeout (also enforced by subprocess.run's timeout kwarg).
 CONNECTORS_TIMEOUT_S = 8.0
@@ -113,6 +118,20 @@ SHORTCUTS_INPUT_MAX_CHARS = 512
 
 #: Mail list_recent cap: 1..20 rows (above the cap ERRORS — _as_days precedent).
 MAIL_LIST_MAX_COUNT = 20
+
+#: Contacts caps: search limit default 10, cap 50 (LIST_LIMIT_MAX, above
+#: the cap ERRORS — _as_days precedent); emails/phones max 3 each;
+#: retrieved note bytes capped like a note body (16 KB).
+CONTACTS_LIST_LIMIT_DEFAULT = 10
+CONTACTS_EMAILS_MAX_COUNT = 3
+CONTACTS_PHONES_MAX_COUNT = 3
+CONTACTS_NOTE_MAX_BYTES = BODY_MAX_BYTES
+
+#: Messages caps: recipient 256 chars, text 1024 chars, thread rows
+#: count 1..10 (default == cap, above the cap ERRORS — mail precedent).
+MESSAGES_TO_MAX_CHARS = 256
+MESSAGES_TEXT_MAX_CHARS = 1024
+MESSAGES_THREADS_MAX_COUNT = 10
 
 #: In-script list delimiter: ASCII character 31 (unit separator). AppleScript
 #: joins list results with it; Python splits on the same byte below.
@@ -144,7 +163,7 @@ _URL_TARGET_RE = re.compile(r"^https?://")
 _APP_TARGET_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,64}$")
 
 # English (ToolFailure-style) whitelist/validation error strings.
-ERR_UNKNOWN_DOMAIN = "unknown domain: {domain!r} (valid: reminders, notes, calendar, music, shortcuts, mail, system)"
+ERR_UNKNOWN_DOMAIN = "unknown domain: {domain!r} (valid: reminders, notes, calendar, music, shortcuts, mail, contacts, messages, system)"
 ERR_UNKNOWN_ACTION = "unknown action {action!r} for domain {domain!r} (valid: {actions})"
 ERR_PARAMS_DICT = "params must be a JSON object"
 
@@ -152,6 +171,7 @@ ERR_PARAMS_DICT = "params must be a JSON object"
 _DISPLAY_NAMES: Dict[str, str] = {
     "reminders": "Reminders", "notes": "Notes", "calendar": "Calendar",
     "music": "Music", "shortcuts": "Shortcuts", "mail": "Mail",
+    "contacts": "Contacts", "messages": "Messages",
     "system": "System",
 }
 
@@ -169,6 +189,22 @@ NO_ACCOUNT_MARKER = "connectors-no-notes-account"
 # constants (kept in sync).
 MAIL_MISSING_MAILBOX_MARKER = "connectors-mail-missing-mailbox"
 MAIL_ERROR_MARKER = "connectors-mail-error"
+
+# Contacts/Messages structured in-script markers (rc-0 stdout route,
+# equality-after-strip — mirrored mail convention): returned by the
+# frozen CONTACTS_GET script when the exact name matched nobody, and by
+# MESSAGES_SEND_CONTACT when the recipient matched no contact, matched
+# MORE than one contact (ambiguous — refuse, never guess a recipient),
+# or resolve produced no sendable handle. Literals live ONLY in the frozen
+# scripts + these constants (kept in sync).
+CONTACTS_NOT_FOUND_MARKER = "connectors-contacts-not-found"
+MESSAGES_UNKNOWN_RECIPIENT_MARKER = "connectors-messages-unknown-recipient"
+
+# English (ToolFailure-style) refusal copy for the messages send guard.
+ERR_UNKNOWN_RECIPIENT = (
+    "unknown recipient: {to!r} is not a known contact, e-mail address, "
+    "or +E.164 phone"
+)
 
 # ---------------------------------------------------------------------------
 # Static AppleScript sources — FROZEN constants; the ONLY input channel is
@@ -698,6 +734,171 @@ on run {mailboxArg, limitArg}
 end run
 """
 
+# ---------------------------------------------------------------------------
+# Contacts + Messages (FASE 3) — frozen scripts, argv-only inputs.
+# Real-Mac grammar, sandbox-unverifiable (same policy as the MAIL_* block).
+# ---------------------------------------------------------------------------
+
+#: Contacts.search: argv[0] = query, argv[1] = limit. Matches people by name
+#: (case-insensitive `contains`), emits up to `limit` flat rows
+#: name\org\primary-email\primary-phone with "" for missing fields.
+CONTACTS_SEARCH = """
+on run argv
+	set _query to (item 1 of argv) as text
+	set _lim to (item 2 of argv) as integer
+	set _fields to {}
+	tell application id "com.apple.AddressBook"
+		repeat with _p in (every person whose name contains _query)
+			if _lim is 0 then exit repeat
+			set _org to ""
+			if (organization of _p) is not missing value then set _org to (organization of _p) as text
+			set _email to ""
+			set _emails to (value of every email of _p)
+			if (count of _emails) is greater than 0 then set _email to (item 1 of _emails) as text
+			set _phone to ""
+			set _phones to (value of every phone of _p)
+			if (count of _phones) is greater than 0 then set _phone to (item 1 of _phones) as text
+			set _fields to _fields & {((name of _p) as text), _org, _email, _phone}
+			set _lim to _lim - 1
+		end repeat
+	end tell
+	set AppleScript's text item delimiters to ASCII character 31
+	return (_fields as text)
+end run
+"""
+
+#: Contacts.get: argv[0] = EXACT contact name. Emits one 5-field record:
+#: name\org\emails ", "-joined\phones ", "-joined\notes. No match -> the
+#: rc-0 stdout marker (mirrored constant above).
+CONTACTS_GET = """
+on run argv
+	set _name to (item 1 of argv) as text
+	tell application id "com.apple.AddressBook"
+		set _people to (every person whose name is _name)
+		if (count of _people) is 0 then return "connectors-contacts-not-found"
+		set _p to (item 1 of _people)
+		set _org to ""
+		if (organization of _p) is not missing value then set _org to (organization of _p) as text
+		set _emails to {}
+		set _elist to (value of every email of _p)
+		if (count of _elist) is greater than 0 then
+			repeat with _e in _elist
+				set _emails to _emails & {(_e as text)}
+			end repeat
+		end if
+		set _phones to {}
+		set _plist to (value of every phone of _p)
+		if (count of _plist) is greater than 0 then
+			repeat with _ph in _plist
+				set _phones to _phones & {(_ph as text)}
+			end repeat
+		end if
+		set _note to ""
+		if (note of _p) is not missing value then set _note to (note of _p) as text
+	end tell
+	set AppleScript's text item delimiters to {", "}
+	set _emails_text to (_emails as text)
+	set _phones_text to (_phones as text)
+	set AppleScript's text item delimiters to ASCII character 31
+	return ({(name of _p as text), _org, _emails_text, _phones_text, _note} as text)
+end run
+"""
+
+#: Contacts.create: argv [name, org, e1, e2, e3, p1, p2, p3] (absent items ride
+#: as ""). Creates the person; non-empty emails/phones are added in order.
+#: (delete/update are intentionally NOT implemented — destrutivos.)
+CONTACTS_CREATE = """
+on run argv
+	set _name to (item 1 of argv) as text
+	set _org to (item 2 of argv) as text
+	tell application id "com.apple.AddressBook"
+		set _p to make new person with properties {first name:_name}
+		if _org is not "" then set organization of _p to _org
+		repeat with _e in {(item 3 of argv) as text, (item 4 of argv) as text, (item 5 of argv) as text}
+			if _e is not "" then
+				make new email at end of emails of _p with properties {label:"outro", value:_e}
+			end if
+		end repeat
+		repeat with _ph in {(item 6 of argv) as text, (item 7 of argv) as text, (item 8 of argv) as text}
+			if _ph is not "" then
+				make new phone at end of phones of _p with properties {label:"outro", value:_ph}
+			end if
+		end repeat
+	end tell
+	return "created"
+end run
+"""
+
+#: Messages.send_message (raw-handle variant): argv [to, text] — `to` is a
+#: pre-validated raw handle (e-mail or +E.164), sent straight through.
+MESSAGES_SEND_HANDLE = """
+on run argv
+	set _to to (item 1 of argv) as text
+	set _msg to (item 2 of argv) as text
+	tell application id "com.apple.iChat"
+		send _msg to participant _to
+	end tell
+	return "sent"
+end run
+"""
+
+#: Messages.send_message (contact-lookup variant): argv [to, text] — `to` is a
+#: contact NAME; the script resolves it via Contacts (a SINGLE exact-name
+#: match -> first email, else first phone) and refuses (rc-0 marker) when the
+#: name is ambiguous (multiple people share it — never guess a recipient) or
+#: the match produces nothing sendable. SEND GUARD lives here; the Python side
+#: validates shapes and maps the marker to the refusal copy.
+MESSAGES_SEND_CONTACT = """
+on run argv
+	set _to to (item 1 of argv) as text
+	set _msg to (item 2 of argv) as text
+	set _handle to ""
+	tell application id "com.apple.AddressBook"
+		set _matches to (every person whose name is _to)
+		-- Ambiguity refusal: more than one exact-name match -> refuse (never
+		-- guess a recipient); exactly one match may resolve a handle.
+		if (count of _matches) is greater than 1 then return "connectors-messages-unknown-recipient"
+		if (count of _matches) is 1 then
+			set _p to (item 1 of _matches)
+			set _elist to (value of every email of _p)
+			if (count of _elist) is greater than 0 then set _handle to (item 1 of _elist) as text
+			if _handle is "" then
+				set _plist to (value of every phone of _p)
+				if (count of _plist) is greater than 0 then set _handle to (item 1 of _plist) as text
+			end if
+		end if
+	end tell
+	if _handle is "" then return "connectors-messages-unknown-recipient"
+	tell application id "com.apple.iChat"
+		send _msg to participant _handle
+	end tell
+	return "sent"
+end run
+"""
+
+#: Messages.list_recent_threads: argv[0] = count (1..10). Emits up to `count`
+#: flat rows handle\last-message-DATE-ONLY (YYYY-MM-DD via integer date
+#: components — locale-proof, mirrors the REMINDERS_ADD integer-argv trick in
+#: reverse). Message TEXT is never read — date-only privacy floor.
+MESSAGES_LIST_THREADS = """
+on run argv
+	set _lim to (item 1 of argv) as integer
+	set _fields to {}
+	tell application id "com.apple.iChat"
+		repeat with _c in (every chat)
+			if _lim is 0 then exit repeat
+			set _d to (date of (last message of _c))
+			set _m to text -2 thru -1 of ("0" & ((month of _d) as integer as text))
+			set _day to text -2 thru -1 of ("0" & ((day of _d) as text))
+			set _fields to _fields & {((id of _c) as text), (((year of _d) as text) & "-" & _m & "-" & _day)}
+			set _lim to _lim - 1
+		end repeat
+	end tell
+	set AppleScript's text item delimiters to ASCII character 31
+	return (_fields as text)
+end run
+"""
+
 #: Static script source per (domain, action) — the model can never influence
 #: these bytes; its strings ride strictly in argv. (system.volume splits into
 #: get/set script variants at argv-build time.)
@@ -725,6 +926,14 @@ SCRIPTS: Dict[Tuple[str, str], str] = {
     ("mail", "unread_count"): MAIL_UNREAD_COUNT,
     ("mail", "mailboxes"): MAIL_MAILBOXES,
     ("mail", "list_recent"): MAIL_LIST_RECENT,
+    ("contacts", "search"): CONTACTS_SEARCH,
+    ("contacts", "get"): CONTACTS_GET,
+    ("contacts", "create"): CONTACTS_CREATE,
+    # send_message splits handle/contact variants at argv-build time (the
+    # system.volume get/set precedent); the _contact key is non-whitelisted.
+    ("messages", "send_message"): MESSAGES_SEND_HANDLE,
+    ("messages", "send_message_contact"): MESSAGES_SEND_CONTACT,
+    ("messages", "list_recent_threads"): MESSAGES_LIST_THREADS,
     ("system", "volume"): SYSTEM_VOLUME_GET,
     ("system", "volume_set"): SYSTEM_VOLUME_SET,
     ("system", "front_app"): SYSTEM_FRONT_APP,
@@ -784,6 +993,22 @@ tell application id "com.apple.mail"
 	end try
 end tell
 """,
+    # Contacts/Messages: trivial consented touches (Automation -> Contacts /
+    # Automation -> Messages); the tells fire macOS TCC consent.
+    "contacts": """
+on run argv
+	tell application id "com.apple.AddressBook"
+		return (count of people as text)
+	end tell
+end run
+""",
+    "messages": """
+on run argv
+	tell application id "com.apple.iChat"
+		return (count of services as text)
+	end tell
+end run
+""",
     # system needs no consent; the volume read is a harmless osascript sanity probe.
     "system": SYSTEM_VOLUME_GET,
 }
@@ -801,6 +1026,8 @@ BUNDLE_IDS: Dict[str, str] = {
     "calendar": "com.apple.iCal",
     "music": "com.apple.Music",
     "mail": "com.apple.mail",
+    "contacts": "com.apple.AddressBook",
+    "messages": "com.apple.iChat",
     "system": "com.apple.systemevents",
 }
 
@@ -1010,6 +1237,33 @@ class ConnectorsStateStore:
 # ---------------------------------------------------------------------------
 
 
+def _is_email_handle(text: str) -> bool:
+    """Raw-handle check for messages.send_message: a loose e-mail shape;
+    control characters (the C0 range plus DEL) are excluded so a NUL argv
+    item fails validation here instead of surfacing as an ugly exec-time
+    ValueError."""
+    return re.fullmatch(r"^[^@\s\x00-\x1f\x7f]+@[^@\s\x00-\x1f\x7f]+$", text) is not None
+
+
+def _is_e164_handle(text: str) -> bool:
+    """Raw-handle check for messages.send_message: strict ITU E.164
+    (+ country code 1-9, 1..14 total digits, nothing else)."""
+    return re.fullmatch(r"^\+[1-9]\d{1,14}$", text) is not None
+
+
+def _optional_capped_int(value: Any, field: str, cap: int, default: int, units: str) -> int:
+    """Optional positive int with a hard cap: absent/None -> default; above the
+    cap ERRORS (the _as_days / mail count precedent — never clamped down)."""
+    if isinstance(value, (dict, list)):
+        raise ConnectorError(f"'{field}' must be a positive integer")
+    number = _as_positive_int(value, field)
+    if number is None:
+        return default
+    if number > cap:
+        raise ConnectorError(f"{field} accepts at most {cap} {units}.")
+    return number
+
+
 def _as_string(value: Any, field: str, field_max: Optional[int] = None) -> str:
     """Coerce a model-supplied JSON value to a validated, non-empty string."""
     if value is None or isinstance(value, (bool, dict, list)):
@@ -1182,7 +1436,7 @@ class _ArgvPlan(NamedTuple):
     pipe validated text through the runner's stdin channel."""
 
     cmd: List[str]
-    kind: str = "ok"  # ok | split | complete | read | raw | level_get | level_set | playlist | count | status | unread | shortcuts_list | shortcuts_run
+    kind: str = "ok"  # ok | split | split_keep | send | complete | read | raw | level_get | level_set | playlist | count | status | unread | shortcuts_list | shortcuts_run
     post: Optional[Callable[[dict], dict]] = None
     complete_list: str = ""
     complete_query: str = ""
@@ -1246,6 +1500,19 @@ class ConnectorManager:
                 ("Re: contratos", "Beltrano <beltrano@exemplo.com>", "01/11/2026 09:15"),
             ],
         }
+        self._mock_contacts = {
+            "people": [
+                {"name": "Marina Duarte", "org": "Imaginária Ltda",
+                 "emails": ["marina@imaginaria.test"],
+                 "phones": ["+5511922220001"], "note": "Prefere contato por e-mail."},
+                {"name": "Bruno Tanaka", "org": "",
+                 "emails": ["bruno@tanaka.test"], "phones": [], "note": ""},
+            ],
+        }
+        self._mock_threads = [
+            ("marina@imaginaria.test", "2026-11-07"),
+            ("+5511922220001", "2026-11-06"),
+        ]
 
     # ---- public API -------------------------------------------------------
 
@@ -1459,6 +1726,24 @@ class ConnectorManager:
             }
         if plan.kind == "unread":
             return {"unread": _parse_unread_stdout(outcome.stdout)}
+        if plan.kind == "split_keep":
+            # split_keep: raw .split keeps EMPTY field positions (contacts
+            # rows have legitimately empty org/email/phone) — _split_delimited
+            # would misalign them. Only osascript's result newline is trimmed
+            # (rstrip("\r\n"), NOT .strip(): Python treats \x1f itself as
+            # whitespace, and a plain strip would erase a row-final empty
+            # field's trailing delimiter. osascript never emits \r, but
+            # stripping both is free and a trailing "\x1f" survives intact —
+            # trailing-empty-field semantics unchanged).
+            assert plan.post is not None
+            return plan.post({"items": (outcome.stdout or "").rstrip("\r\n").split(_DELIM)})
+        if plan.kind == "send":
+            # messages send: the frozen scripts RETURN the unknown-recipient
+            # marker on rc-0 stdout (mirrored mail marker route).
+            if (outcome.stdout or "").strip() == MESSAGES_UNKNOWN_RECIPIENT_MARKER:
+                to = plan.cmd[3] if len(plan.cmd) > 3 else ""
+                raise ConnectorError(ERR_UNKNOWN_RECIPIENT.format(to=to))
+            return dict(plan.post({})) if plan.post is not None else {"ok": True}
         if plan.kind == "split":
             assert plan.post is not None
             return plan.post({"items": _split_delimited(outcome.stdout)})
@@ -1524,6 +1809,10 @@ class ConnectorManager:
             return self._build_shortcuts(action, params)
         if domain == "mail":
             return self._build_mail(action, params)
+        if domain == "contacts":
+            return self._build_contacts(action, params)
+        if domain == "messages":
+            return self._build_messages(action, params)
         return self._build_system(action, params)
 
     def _build_reminders(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
@@ -1769,6 +2058,186 @@ class ConnectorManager:
             )
         )
 
+    @staticmethod
+    def _validated_handle_list(
+        params: Dict[str, Any], field: str, max_items: int,
+        forbidden_substrings: Tuple[str, ...] = (),
+    ) -> List[str]:
+        """Validate an optional list of strings (contacts emails/phones):
+        absent/None/"" -> []; non-list -> error; each item via _as_string;
+        more than max_items ERRORS (never truncated). Each validated item must
+        not contain a forbidden substring: the _DELIM case carries the
+        dedicated delimiter copy (misaligned later split_keep/get parsing);
+        anything else renders its repr (", " -> ', ': collide with
+        CONTACTS_GET's ", "-joined list rendering)."""
+        value = params.get(field)
+        if value is None:
+            return []
+        if isinstance(value, str):
+            if value.strip() == "":
+                return []
+            value = [value]  # tolerate a single bare string
+        if not isinstance(value, list):
+            raise ConnectorError(f"'{field}' must be a list of strings")
+        items = [_as_string(item, field, LIST_NAME_MAX_CHARS) for item in value]
+        for item in items:
+            for forbidden in forbidden_substrings:
+                if forbidden not in item:
+                    continue
+                if forbidden == _DELIM:
+                    raise ConnectorError(
+                        f"'{field}' must not contain the record delimiter character"
+                    )
+                raise ConnectorError(f"'{field}' must not contain {forbidden!r}")
+        if len(items) > max_items:
+            raise ConnectorError(f"'{field}' accepts at most {max_items} values.")
+        return items
+
+    def _build_contacts(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
+        # PII surface: search/get are read-only; create is gated by the same
+        # consent; delete/update are intentionally NOT implemented.
+        if action == "search":
+            _required_params(params, ("query",))
+            query = _as_string(params.get("query"), "query", QUERY_MAX_CHARS)
+            limit = _optional_capped_int(
+                params.get("limit"), "limit", LIST_LIMIT_MAX,
+                CONTACTS_LIST_LIMIT_DEFAULT, "contacts",
+            )
+
+            def post(raw: dict) -> dict:
+                # Raw-split input (rows may carry empty org/email/phone);
+                # incomplete trailing rows dropped by _chunk_rows.
+                return {
+                    "contacts": _chunk_rows(
+                        raw["items"], ("name", "org", "email", "phone")
+                    )
+                }
+
+            return _ArgvPlan(
+                ["osascript", "-e", CONTACTS_SEARCH, query, str(limit)],
+                kind="split_keep",
+                post=post,
+            )
+        if action == "get":
+            _required_params(params, ("name",))
+            name = _as_string(params.get("name"), "name", LIST_NAME_MAX_CHARS)
+
+            def post(raw: dict, _name: str = name) -> dict:
+                items = raw["items"]
+                if len(items) == 1:
+                    # Bare marker or empty stdout on rc 0 -> clean not-found.
+                    raise ConnectorError(
+                        'Contato não encontrado — use a ação "search" para '
+                        "ver os nomes disponíveis."
+                    )
+                fields = (items + ["", "", "", "", ""])[:5]
+                return {"contact": {
+                    "name": fields[0],
+                    "org": fields[1],
+                    "emails": [e for e in fields[2].split(", ") if e != ""],
+                    "phones": [p for p in fields[3].split(", ") if p != ""],
+                    "notes": _truncate_bytes(fields[4], CONTACTS_NOTE_MAX_BYTES),
+                }}
+
+            return _ArgvPlan(
+                ["osascript", "-e", CONTACTS_GET, name],
+                kind="split_keep",
+                post=post,
+            )
+        if action == "create":
+            _required_params(params, ("name",))
+            name = _as_string(params.get("name"), "name", LIST_NAME_MAX_CHARS)
+            # Create-time delimiter guard: _DELIM anywhere in a STORED field
+            # (name/org/emails/phones) would misalign later split_keep/get
+            # parsing (middle-of-string survives _as_string.strip()). Read
+            # paths (search query, get name, send to/text) never feed row
+            # parsing and stay un-blocked.
+            if _DELIM in name:
+                raise ConnectorError(
+                    "'name' must not contain the record delimiter character"
+                )
+            org = ""
+            if params.get("org") not in (None, ""):
+                org = _as_string(params.get("org"), "org", LIST_NAME_MAX_CHARS)
+                if _DELIM in org:
+                    raise ConnectorError(
+                        "'org' must not contain the record delimiter character"
+                    )
+            # emails also reject ", " (CONTACTS_GET joins its email/phone lists
+            # with ", " — a stored collision would split into phantom lists).
+            emails = self._validated_handle_list(
+                params, "emails", CONTACTS_EMAILS_MAX_COUNT,
+                forbidden_substrings=(", ", _DELIM),
+            )
+            phones = self._validated_handle_list(
+                params, "phones", CONTACTS_PHONES_MAX_COUNT,
+                forbidden_substrings=(", ", _DELIM),
+            )
+            email_argv = emails + [""] * (CONTACTS_EMAILS_MAX_COUNT - len(emails))
+            phone_argv = phones + [""] * (CONTACTS_PHONES_MAX_COUNT - len(phones))
+
+            def post(raw: dict, _name: str = name) -> dict:
+                del raw
+                return {"ok": True, "created": _name}
+
+            return _ArgvPlan(
+                ["osascript", "-e", CONTACTS_CREATE, name, org,
+                 *email_argv, *phone_argv],
+                kind="ok",
+                post=post,
+            )
+        raise ConnectorError(
+            ERR_UNKNOWN_ACTION.format(
+                domain=domain, action=action, actions=", ".join(CONNECTOR_ACTIONS[domain])
+            )
+        )
+
+    def _build_messages(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
+        # SEND-ONLY: listing threads exposes handle + last-message DATE ONLY
+        # (never text). A recipient that is neither a raw e-mail nor a +E.164
+        # number rides the contact-lookup script, which refuses unknown names.
+        if action == "send_message":
+            _required_params(params, ("to", "text"))
+            to = _as_string(params.get("to"), "to", MESSAGES_TO_MAX_CHARS)
+            text = _as_string(params.get("text"), "text", MESSAGES_TEXT_MAX_CHARS)
+            if _is_email_handle(to) or _is_e164_handle(to):
+                script = MESSAGES_SEND_HANDLE
+            else:
+                script = MESSAGES_SEND_CONTACT
+
+            def post(raw: dict, _to: str = to) -> dict:
+                del raw
+                return {"ok": True, "sent": True, "to": _to}
+
+            return _ArgvPlan(
+                ["osascript", "-e", script, to, text],
+                kind="send",
+                post=post,
+            )
+        if action == "list_recent_threads":
+            count = _optional_capped_int(
+                params.get("count"), "count", MESSAGES_THREADS_MAX_COUNT,
+                MESSAGES_THREADS_MAX_COUNT, "threads",
+            )
+
+            def post(raw: dict) -> dict:
+                # Privacy floor: handle + date ONLY — message text is absent
+                # from the script output entirely.
+                return {
+                    "threads": _chunk_rows(raw["items"], ("handle", "date"))
+                }
+
+            return _ArgvPlan(
+                ["osascript", "-e", MESSAGES_LIST_THREADS, str(count)],
+                kind="split_keep",
+                post=post,
+            )
+        raise ConnectorError(
+            ERR_UNKNOWN_ACTION.format(
+                domain=domain, action=action, actions=", ".join(CONNECTOR_ACTIONS[domain])
+            )
+        )
+
     def _build_shortcuts(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
         # CLI domain: no osascript source — argv lists start with "shortcuts"
         # (mirror of `open` in _build_system). `-i FILE` is intentionally not
@@ -1910,6 +2379,19 @@ class ConnectorManager:
                     ("Re: contratos", "Beltrano <beltrano@exemplo.com>", "01/11/2026 09:15"),
                 ],
             }
+            self._mock_contacts = {
+                "people": [
+                    {"name": "Marina Duarte", "org": "Imaginária Ltda",
+                     "emails": ["marina@imaginaria.test"],
+                     "phones": ["+5511922220001"], "note": "Prefere contato por e-mail."},
+                    {"name": "Bruno Tanaka", "org": "",
+                     "emails": ["bruno@tanaka.test"], "phones": [], "note": ""},
+                ],
+            }
+            self._mock_threads = [
+                ("marina@imaginaria.test", "2026-11-07"),
+                ("+5511922220001", "2026-11-06"),
+            ]
 
     def _mock_runner(self, cmd: List[str], timeout: float, stdin: Optional[str] = None) -> _Outcome:
         """In-process osascript/CLI replacement: interprets the SAME frozen
@@ -2101,5 +2583,69 @@ class ConnectorManager:
                 for subject, sender, received in self._mock_mail["recent"][:count]:
                     rows += [subject, sender, received]
                 return _Outcome(0, _DELIM.join(rows), "")
+            if script == CONTACTS_SEARCH:
+                query = argv[0] if argv else ""
+                lim = int(argv[1]) if len(argv) > 1 else CONTACTS_LIST_LIMIT_DEFAULT
+                needle = query.lower()
+                rows2 = []
+                for person in self._mock_contacts["people"]:
+                    # Matching mirrors the frozen script: name `contains`, case-insensitive.
+                    haystack = person["name"].lower()
+                    if needle not in haystack:
+                        continue
+                    rows2 += [
+                        person["name"], person.get("org", ""),
+                        person["emails"][0] if person["emails"] else "",
+                        person["phones"][0] if person["phones"] else "",
+                    ]
+                    if len(rows2) >= lim * 4:
+                        break
+                return _Outcome(0, _DELIM.join(rows2), "")
+            if script == CONTACTS_GET:
+                name = argv[0] if argv else ""
+                match = None
+                for person in self._mock_contacts["people"]:
+                    if person["name"] == name:  # EXACT match
+                        match = person
+                        break
+                if match is None:
+                    return _Outcome(0, CONTACTS_NOT_FOUND_MARKER, "")
+                return _Outcome(0, _DELIM.join([
+                    match["name"], match.get("org", ""),
+                    ", ".join(match["emails"]), ", ".join(match["phones"]),
+                    match.get("note", ""),
+                ]), "")
+            if script == CONTACTS_CREATE:
+                parts = (argv + [""] * 8)[:8]
+                self._mock_contacts["people"].append({
+                    "name": parts[0], "org": parts[1],
+                    "emails": [e for e in parts[2:5] if e != ""],
+                    "phones": [p for p in parts[5:8] if p != ""],
+                    "note": "",
+                })
+                return _Outcome(0, "created", "")
+            if script == MESSAGES_SEND_HANDLE:
+                return _Outcome(0, "sent", "")
+            if script == MESSAGES_SEND_CONTACT:
+                # Mirrors the frozen script's send guard: count EXACT-name
+                # matches; >1 is ambiguous -> refuse (never guess a recipient);
+                # exactly one resolves first email, else first phone, else
+                # nothing sendable -> refusal marker.
+                to_name = argv[0] if argv else ""
+                exact = [p for p in self._mock_contacts["people"] if p["name"] == to_name]
+                if len(exact) == 1:
+                    handle = exact[0]["emails"][0] if exact[0]["emails"] else ""
+                    if handle == "":
+                        handle = exact[0]["phones"][0] if exact[0]["phones"] else ""
+                    if handle == "":
+                        return _Outcome(0, MESSAGES_UNKNOWN_RECIPIENT_MARKER, "")
+                    return _Outcome(0, "sent", "")
+                return _Outcome(0, MESSAGES_UNKNOWN_RECIPIENT_MARKER, "")
+            if script == MESSAGES_LIST_THREADS:
+                lim = int(argv[0]) if argv else MESSAGES_THREADS_MAX_COUNT
+                rows3 = []
+                for handle, date in self._mock_threads[:lim]:
+                    rows3 += [handle, date]
+                return _Outcome(0, _DELIM.join(rows3), "")
             # Probe scripts (and anything else): trivial success.
             return _Outcome(0, "0", "")

@@ -271,6 +271,8 @@ export interface ConnectorsResponse {
     music: ConnectorRow;
     shortcuts: ConnectorRow;
     mail: ConnectorRow;
+    contacts: ConnectorRow;
+    messages: ConnectorRow;
     system: ConnectorRow;
   };
 }
