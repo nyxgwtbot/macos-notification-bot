@@ -91,6 +91,15 @@ Domain/action whitelist (server-side enforced; unknown pairs are rejected):
 | contacts | create | `{"name", "org?", "emails?" (max 3), "phones?" (max 3)}` (no delete/update) | `{ok, created}` |
 | messages | send_message | `{"to", "text"}` (to = contact name in Contacts, e-mail, or +E.164; text ≤ 1024; SEND-ONLY and irreversible — unknown recipients are refused) | `{ok, sent, to}` |
 | messages | list_recent_threads | `{"count?"}` (count 1-10, default 10) | `{threads: [{handle, date}, ...]}` (dates only, never message text) |
+| finder | list | `{"path?"}` (defaults to ~/Desktop; paths must live under ~/Desktop, ~/Documents, ~/Downloads, or ~/apps) | `{items: ["Relatório.pdf", ...]}` |
+| finder | reveal | `{"path"}` (shows the item in Finder) | `{ok, path}` |
+| finder | info | `{"path"}` | `{info: {kind, size, extension, created, modified}}` |
+| finder | move | `{"src", "dst_dir"}` (dst_dir must exist; refuses to overwrite) | `{ok, moved, from, to}` |
+| finder | trash | `{"path"}` (moves to the macOS Trash — NOT a void delete; confirm the exact path with the user) | `{ok, trashed}` |
+| quicktime | start_recording | `{"with_audio?"}` (default false; ONE recording at a time) | `{ok, doc_id, with_audio}` |
+| quicktime | stop_recording | `{}` (stops the current recording) | `{ok, path}` (saved file path) |
+| quicktime | new_audio_recording | `{}` | `{ok, doc_id}` |
+| quicktime | play | `{"file"}` (must be an existing file) | `{ok, path}` |
 | system | volume | `{}` to read, or `{"level": 0-100}` to set | `{level}` / `{ok, level}` |
 | system | front_app | `{}` | `{app}` |
 | system | open | `{"target"}` (http(s) URL, or an app name) | `{ok, target}` |
@@ -102,6 +111,7 @@ Rules:
 - `notes.create`/`reminders.add` return `{ok}` without re-checking (iCloud sync may lag for a few seconds) — do NOT call `search`/`list_reminders` to verify a create.
 - CONSENT RULE: when a `native.call` result is an error that mentions Settings or Connectors (the domain is not connected — e.g. "Reminders ainda não está conectado — conecte reminders em Settings › Connectors."), relay that error text to the user in PT-BR and do NOT retry that domain during this turn. The user connects domains in Settings › Connectors.
 - `messages.send_message` is SEND-ONLY and irreversible: confirm the recipient AND the exact text with the user before calling; a refusal copy starting with "unknown recipient" means send_message will NOT send to that recipient (pass the raw e-mail or +E.164 number in `to` when the user confirms it).
+- finder.trash moves an item to the macOS Trash (recoverable, but visible) and quicktime recordings occupy a single slot that resets when the daemon restarts — confirm both with the user before calling.
 
 ## Recipes
 

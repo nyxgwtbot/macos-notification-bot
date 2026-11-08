@@ -638,6 +638,7 @@ class TestStateStoreConcurrency(unittest.TestCase):
             {"reminders": "unknown", "notes": "unknown", "calendar": "unknown",
              "music": "unknown", "shortcuts": "unknown", "mail": "unknown",
              "contacts": "unknown", "messages": "unknown",
+             "finder": "unknown", "quicktime": "unknown",
              "system": "unknown"},
         )
 
@@ -676,10 +677,10 @@ class TestConnectorEndpoints(unittest.TestCase):
         self.assertEqual(
             set(connectors),
             {"reminders", "notes", "calendar", "music", "shortcuts", "mail",
-             "contacts", "messages", "system"},
+             "contacts", "messages", "finder", "quicktime", "system"},
         )
         for domain in ("reminders", "notes", "calendar", "music", "mail",
-                       "contacts", "messages"):
+                       "contacts", "messages", "finder", "quicktime"):
             row = connectors[domain]
             self.assertEqual(row["status"], "unknown")
             self.assertFalse(row["granted"])
@@ -1850,7 +1851,7 @@ class TestShortcutsMailGatingProbeAndMockWorld(unittest.TestCase):
         self.assertIn("mail", CONNECTOR_DOMAINS)
         self.assertEqual(CONNECTOR_DOMAINS.index("shortcuts"), 4)
         self.assertEqual(CONNECTOR_DOMAINS.index("mail"), 5)
-        self.assertEqual(CONNECTOR_DOMAINS[8], "system")
+        self.assertEqual(CONNECTOR_DOMAINS[10], "system")
         self.assertIn("mail", GATED_DOMAINS)
         self.assertNotIn("shortcuts", GATED_DOMAINS)
         self.assertEqual(CONNECTOR_ACTIONS["shortcuts"], ("list", "run"))
@@ -1898,7 +1899,7 @@ class TestShortcutsMailGatingProbeAndMockWorld(unittest.TestCase):
         self.assertEqual(
             set(rows),
             {"reminders", "notes", "calendar", "music", "shortcuts", "mail",
-             "contacts", "messages", "system"},
+             "contacts", "messages", "finder", "quicktime", "system"},
         )
         self.assertEqual(
             rows["shortcuts"],
@@ -2461,7 +2462,7 @@ class TestContactsMessagesGatingProbeAndMockWorld(unittest.TestCase):
         self.assertIn("messages", CONNECTOR_DOMAINS)
         self.assertEqual(CONNECTOR_DOMAINS.index("contacts"), 6)
         self.assertEqual(CONNECTOR_DOMAINS.index("messages"), 7)
-        self.assertEqual(CONNECTOR_DOMAINS[8], "system")
+        self.assertEqual(CONNECTOR_DOMAINS[10], "system")
         self.assertIn("contacts", GATED_DOMAINS)
         self.assertIn("messages", GATED_DOMAINS)
         self.assertEqual(CONNECTOR_ACTIONS["contacts"], ("search", "get", "create"))
@@ -2674,6 +2675,805 @@ class TestContactsMessagesGatingProbeAndMockWorld(unittest.TestCase):
             self.assertEqual(script_source, MESSAGES_SEND_CONTACT)
             self.assertNotIn(payload, script_source, payload)  # absent from source
             self.assertNotIn(payload, MESSAGES_SEND_HANDLE, payload)  # never in either variant
+        for cmd in runner.calls:  # shape holds for EVERY payload
+            self.assertEqual(cmd[:2], ["osascript", "-e"])
+
+
+# ---- finder + quicktime domains: dispatch, gating, probe, mock world --------------------
+# Imports for the finder/quicktime suites below: appended here (not merged into
+# the top block) so this change stays a pure addition to the file (FASE 1-3
+# precedent above).
+
+from notifybot.connectors import (
+    CONNECTOR_ACTIONS,  # noqa: F811
+    CONNECTOR_DOMAINS,  # noqa: F811
+    ConnectorError,  # noqa: F811
+    ConnectorManager,  # noqa: F811
+    ERR_FINDER_DST_DIR_MISSING,  # noqa: F811
+    ERR_FINDER_DST_EXISTS,  # noqa: F811
+    ERR_FINDER_NO_FOLDER,  # noqa: F811
+    ERR_FINDER_NOT_FOUND,  # noqa: F811
+    ERR_NO_RECORDING,  # noqa: F811
+    ERR_PATH_OUTSIDE_ROOTS,  # noqa: F811
+    ERR_QT_ALREADY_RECORDING,  # noqa: F811
+    ERR_QT_DOC_GONE,  # noqa: F811
+    ERR_QT_PLAY_FILE,  # noqa: F811
+    ERR_TRASH_HOME_REFUSED,  # noqa: F811
+    FINDER_DST_DIR_MISSING_MARKER,  # noqa: F811
+    FINDER_DST_EXISTS_MARKER,  # noqa: F811
+    FINDER_INFO,  # noqa: F811
+    FINDER_LIST,  # noqa: F811
+    FINDER_LIST_MAX_ITEMS,  # noqa: F811
+    FINDER_MOVE,  # noqa: F811
+    FINDER_NOT_FOUND_MARKER,  # noqa: F811
+    FINDER_PATH_MAX_CHARS,  # noqa: F811
+    FINDER_TRASH,  # noqa: F811
+    GATED_DOMAINS,  # noqa: F811
+    PROBE_SCRIPTS,  # noqa: F811
+    QUICKTIME_DOC_GONE_MARKER,  # noqa: F811
+    QUICKTIME_FILE_MAX_CHARS,  # noqa: F811
+    QUICKTIME_NEW_AUDIO,  # noqa: F811
+    QUICKTIME_PLAY,  # noqa: F811
+    QUICKTIME_START_SCREEN,  # noqa: F811
+    QUICKTIME_STOP,  # noqa: F811
+    SCRIPTS,  # noqa: F811
+    _DELIM,  # noqa: F811
+)
+
+# Added after the pinned FASE-4 import block (kept verbatim): stdlib + module
+# source access for the trash static-comment assertion below.
+import inspect  # noqa: E402
+import notifybot.connectors  # noqa: E402
+
+_res = lambda p: os.path.realpath(os.path.expanduser(p))
+
+
+class TestFinderDispatchActions(unittest.TestCase):
+    """Finder dispatch: argv layout, argv-only reveal, split_keep info row
+    (empty fields KEEP positions), marker remap, strict path validation under
+    the allowed roots, and the list cap."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runner = RecordingRunner()
+        self.manager = ConnectorManager(self.tmp.name, runner=self.runner)
+        self.manager.state.record("finder", "granted")
+
+    def test_list_argv_layout_and_rows(self):
+        self.runner.register(
+            FINDER_LIST,
+            Outcome(0, _DELIM.join(["Relatório.pdf", "Captura de Tela.png"]), ""),
+        )
+        result = self.manager.run_action("finder", "list", {"path": "~/Desktop"})
+        cmd = self.runner.calls[-1]
+        self.assertEqual(cmd[:2], ["osascript", "-e"])
+        self.assertIs(cmd[2], FINDER_LIST)  # script identity (SCRIPTS-pin precedent)
+        self.assertEqual(cmd[3:], [_res("~/Desktop")])
+        self.assertEqual(result, {"items": ["Relatório.pdf", "Captura de Tela.png"]})
+
+    def test_list_default_path_is_desktop_and_caps_at_100(self):
+        self.runner.register(
+            FINDER_LIST,
+            Outcome(0, _DELIM.join("item %02d" % i for i in range(101)), ""),
+        )
+        result = self.manager.run_action("finder", "list", {})
+        self.assertEqual(self.runner.last_argv(), [_res("~/Desktop")])  # empty params default
+        self.assertEqual(len(result["items"]), FINDER_LIST_MAX_ITEMS)  # hard trim at 100
+        self.assertEqual(
+            result["items"], ["item %02d" % i for i in range(FINDER_LIST_MAX_ITEMS)]
+        )  # the FIRST 100 rows are kept, never reflowed
+
+    def test_reveal_is_argv_only_open_R(self):
+        resolved = _res("~/Desktop/Relatório.pdf")
+        self.runner.register(resolved, Outcome(0, "", ""))  # reveal's cmd[2] IS the path
+        result = self.manager.run_action("finder", "reveal", {"path": "~/Desktop/Relatório.pdf"})
+        self.assertEqual(self.runner.calls[-1][:1], ["open"])  # proves the no-osascript route
+        self.assertEqual(self.runner.calls[-1], ["open", "-R", resolved])
+        self.assertEqual(result, {"ok": True, "path": resolved})
+
+    def test_info_split_keep_row_and_missing_marker(self):
+        self.runner.register(
+            FINDER_INFO,
+            Outcome(
+                0,
+                _DELIM.join(["PDF document", "20480", "", "31/10/2026 18:02", "01/11/2026 09:15"]),
+                "",
+            ),
+        )
+        result = self.manager.run_action("finder", "info", {"path": "~/Desktop/Relatório.pdf"})
+        self.assertEqual(
+            result,
+            {"info": {
+                "kind": "PDF document", "size": "20480", "extension": "",
+                "created": "31/10/2026 18:02", "modified": "01/11/2026 09:15",
+            }},
+        )  # empty extension KEEPS its position (split_keep, whitespace reflection)
+        # bare marker stdout remaps to the clean refusal copy
+        self.runner.register(FINDER_INFO, Outcome(0, FINDER_NOT_FOUND_MARKER, ""))
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("finder", "info", {"path": "~/Desktop/Fantasma"})
+        self.assertEqual(
+            str(ctx.exception), ERR_FINDER_NOT_FOUND.format(path=_res("~/Desktop/Fantasma"))
+        )
+
+    def test_move_marker_mapping_predates_gate(self):
+        self.runner.register(FINDER_MOVE, Outcome(0, FINDER_DST_DIR_MISSING_MARKER, ""))
+        with self.assertRaises(ConnectorError) as dir_ctx:
+            self.manager.run_action(
+                "finder", "move", {"src": "~/Desktop/a.txt", "dst_dir": "~/Downloads"}
+            )
+        self.assertEqual(
+            str(dir_ctx.exception), ERR_FINDER_DST_DIR_MISSING.format(dir=_res("~/Downloads"))
+        )
+        self.runner.register(FINDER_MOVE, Outcome(0, FINDER_DST_EXISTS_MARKER, ""))
+        with self.assertRaises(ConnectorError) as exists_ctx:
+            self.manager.run_action(
+                "finder", "move", {"src": "~/Desktop/a.txt", "dst_dir": "~/Downloads"}
+            )
+        self.assertEqual(str(exists_ctx.exception), ERR_FINDER_DST_EXISTS.format(name="a.txt"))
+        self.runner.register(FINDER_MOVE, Outcome(0, FINDER_NOT_FOUND_MARKER, ""))
+        with self.assertRaises(ConnectorError) as missing_ctx:
+            self.manager.run_action(
+                "finder", "move", {"src": "~/Desktop/a.txt", "dst_dir": "~/Downloads"}
+            )
+        self.assertEqual(
+            str(missing_ctx.exception), ERR_FINDER_NOT_FOUND.format(path=_res("~/Desktop/a.txt"))
+        )
+        # success stdout "moved": the builder post renders the move result
+        self.runner.register(FINDER_MOVE, Outcome(0, "moved", ""))
+        moved = self.manager.run_action(
+            "finder", "move", {"src": "~/Desktop/a.txt", "dst_dir": "~/Downloads"}
+        )
+        self.assertEqual(
+            moved,
+            {"ok": True, "moved": True,
+             "from": _res("~/Desktop/a.txt"),
+             "to": os.path.join(_res("~/Downloads"), "a.txt")},
+        )
+        # pre-gate variant (mirror of the contacts validation seam): with
+        # finder UNgranted, a bad relative src raises the validation copy
+        # FIRST — the gate copy never appears and the runner is never invoked.
+        # A fresh state dir keeps this manager's gate state unknown (setUp
+        # granted finder in self.tmp).
+        with tempfile.TemporaryDirectory() as gate_tmp:
+            gate_runner = RecordingRunner()
+            manager = ConnectorManager(gate_tmp, runner=gate_runner)
+            self.assertEqual(manager.state.read()["finder"]["status"], "unknown")
+            with self.assertRaises(ConnectorError) as pre_ctx:
+                manager.run_action("finder", "move", {"src": "../x", "dst_dir": "~/Downloads"})
+            self.assertEqual(
+                str(pre_ctx.exception),
+                "'src' must be an absolute path or begin with '~' — got '../x'",
+            )
+            self.assertEqual(gate_runner.calls, [])
+
+    def test_path_validation_refusals(self):
+        cases = [
+            (("list", {"path": "/etc"}), ERR_PATH_OUTSIDE_ROOTS.format(path=_res("/etc"))),
+            (("list", {"path": "relative/file.txt"}),
+             "'path' must be an absolute path or begin with '~' — got 'relative/file.txt'"),
+            (("list", {"path": "~/Desktop/../.."}),
+             ERR_PATH_OUTSIDE_ROOTS.format(path=_res("~/Desktop/../.."))),
+            (("reveal", {"path": "/etc"}), ERR_PATH_OUTSIDE_ROOTS.format(path=_res("/etc"))),
+            (("info", {"path": "/etc"}), ERR_PATH_OUTSIDE_ROOTS.format(path=_res("/etc"))),
+            (("move", {"src": "/etc", "dst_dir": "~/Downloads"}),
+             ERR_PATH_OUTSIDE_ROOTS.format(path=_res("/etc"))),
+            (("move", {"src": "~/Desktop/a.txt", "dst_dir": "/etc"}),
+             ERR_PATH_OUTSIDE_ROOTS.format(path=_res("/etc"))),
+            (("list", {"path": "~/Desktop/.."}),
+             ERR_PATH_OUTSIDE_ROOTS.format(path=_res("~/Desktop/.."))),
+            (("trash", {"path": "~"}), ERR_TRASH_HOME_REFUSED.format(path=_res("~"))),
+            # expansion trick landing EXACTLY on the home root is still refused
+            (("trash", {"path": "~/Desktop/.."}),
+             ERR_TRASH_HOME_REFUSED.format(path=_res("~/Desktop/.."))),
+            # two levels up lands ABOVE the home root (/Users): outside-roots
+            (("trash", {"path": "~/Desktop/../.."}),
+             ERR_PATH_OUTSIDE_ROOTS.format(path=_res("~/Desktop/../.."))),
+            (("trash", {"path": "~/Desktop/\x00x"}), "'path' must be a non-empty path"),
+        ]
+        for (action, params), expected in cases:
+            with self.assertRaises(ConnectorError) as ctx:
+                self.manager.run_action("finder", action, params)
+            self.assertEqual(str(ctx.exception), expected, (action, params))
+        self.assertEqual(self.runner.calls, [])  # every refusal predates dispatch
+        # trash outside the roots: a non-existent path refuses, a REAL plain
+        # file passes validation and reaches the runner resolved
+        with tempfile.TemporaryDirectory() as foreign_root:
+            missing = os.path.join(foreign_root, "nao-existe.pdf")
+            with self.assertRaises(ConnectorError) as outside_ctx:
+                self.manager.run_action("finder", "trash", {"path": missing})
+            self.assertEqual(
+                str(outside_ctx.exception), ERR_PATH_OUTSIDE_ROOTS.format(path=_res(missing))
+            )
+            real_file = os.path.join(foreign_root, "forastero.txt")
+            with open(real_file, "w", encoding="utf-8") as f:
+                f.write("conteúdo")
+            self.runner.register(FINDER_TRASH, Outcome(0, "trashed", ""))
+            self.manager.run_action("finder", "trash", {"path": real_file})
+            self.assertEqual(self.runner.last_argv(), [_res(real_file)])  # resolved temp path
+        # the 513-char path hits _as_string BEFORE root validation
+        with self.assertRaises(ConnectorError) as cap_ctx:
+            self.manager.run_action("finder", "list", {"path": "p" * (FINDER_PATH_MAX_CHARS + 1)})
+        self.assertEqual(
+            str(cap_ctx.exception), f"'path' is limited to {FINDER_PATH_MAX_CHARS} characters"
+        )
+
+    def test_trash_is_never_a_void_delete(self):
+        """Finder's `delete` MOVES TO TRASH (recoverable) — never a void
+        delete: the frozen script carries `delete _item`, the constant comment
+        documents the mission line, and an allowed path reaches the runner
+        fully resolved (never a bare `/` or the home root)."""
+        self.assertIn("delete _item", FINDER_TRASH)
+        self.assertIn("MOVES TO TRASH", inspect.getsource(notifybot.connectors))
+        self.runner.register(FINDER_TRASH, Outcome(0, "trashed", ""))
+        result = self.manager.run_action("finder", "trash", {"path": "~/Desktop/trabalho"})
+        resolved = _res("~/Desktop/trabalho")
+        self.assertEqual(self.runner.last_argv(), [resolved])
+        self.assertNotEqual(resolved, "/")
+        self.assertNotEqual(resolved, os.path.realpath(os.path.expanduser("~")))
+        self.assertEqual(result, {"ok": True, "trashed": resolved})
+
+    def test_finder_injection_battery(self):
+        """Model-controlled paths ride strictly as argv items against the
+        FROZEN finder constants — never inside script source (the do-shell-
+        script hygiene loop lives in the gating class, one home per the
+        FASE-3 split)."""
+        self.runner.register(FINDER_LIST, Outcome(0, "x", ""))
+        self.runner.register(FINDER_MOVE, Outcome(0, "moved", ""))
+        self.runner.register(FINDER_TRASH, Outcome(0, "trashed", ""))
+        for payload in TestInjectionBattery.PAYLOADS:
+            under_root = "~/Desktop/" + payload
+            resolved = _res(under_root)
+            self.runner.register(resolved, Outcome(0, "", ""))  # reveal: cmd[2] IS the path
+            self.manager.run_action("finder", "reveal", {"path": under_root})
+            self.assertEqual(self.runner.calls[-1][:1], ["open"], payload)
+            self.assertEqual(self.runner.calls[-1][2:], [resolved], payload)
+            # resolved argv items carry the payload verbatim (substring)
+            self.assertIn(payload, self.runner.calls[-1][2], payload)
+            self.manager.run_action("finder", "list", {"path": under_root})
+            cmd = self.runner.calls[-1]
+            self.assertEqual(cmd[2], FINDER_LIST, payload)
+            self.assertTrue(
+                any(payload in arg for arg in cmd[3:]), (payload, cmd[3:])
+            )  # verbatim argv delivery
+            self.assertNotIn(payload, cmd[2], payload)  # absent from source
+            self.manager.run_action(
+                "finder", "move", {"src": under_root, "dst_dir": "~/Downloads"}
+            )
+            cmd = self.runner.calls[-1]
+            self.assertEqual(cmd[2], FINDER_MOVE, payload)
+            self.assertTrue(
+                any(payload in arg for arg in cmd[3:]), (payload, cmd[3:])
+            )  # verbatim argv delivery
+            self.assertNotIn(payload, cmd[2], payload)
+            self.manager.run_action("finder", "trash", {"path": under_root})
+            cmd = self.runner.calls[-1]
+            self.assertEqual(cmd[2], FINDER_TRASH, payload)
+            self.assertTrue(
+                any(payload in arg for arg in cmd[3:]), (payload, cmd[3:])
+            )  # verbatim argv delivery
+            self.assertNotIn(payload, cmd[2], payload)
+        for cmd in self.runner.calls:  # shape holds for EVERY payload
+            if cmd[0] == "open":
+                self.assertEqual(cmd[1], "-R", cmd)  # the argv-only reveal route
+            else:
+                self.assertEqual(cmd[:2], ["osascript", "-e"], cmd)
+
+
+class TestQuickTimeDispatchActions(unittest.TestCase):
+    """QuickTime dispatch: the single in-process recording slot (start /
+    new_audio occupy it, stop releases it — always, even on doc-gone), the
+    saved-path stop result, play's existing-file rule, and the memory-only
+    restart semantics."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runner = RecordingRunner()
+        self.manager = ConnectorManager(self.tmp.name, runner=self.runner)
+        self.manager.state.record("quicktime", "granted")
+
+    def test_start_recording_states_and_slot(self):
+        self.runner.register(QUICKTIME_START_SCREEN, Outcome(0, "DOC-1", ""))
+        result = self.manager.run_action("quicktime", "start_recording", {"with_audio": True})
+        self.assertEqual(result, {"ok": True, "doc_id": "DOC-1", "with_audio": True})
+        self.assertIs(self.runner.calls[-1][2], QUICKTIME_START_SCREEN)
+        self.assertEqual(self.runner.last_argv(), ["1"])
+        self.assertEqual(self.manager._qt_recording, {"doc_id": "DOC-1", "kind": "screen"})
+        # clear the slot through the stop flow between layouts
+        self.runner.register(QUICKTIME_STOP, Outcome(0, "~/Movies/Screen Recording DOC-1.mov", ""))
+        self.manager.run_action("quicktime", "stop_recording", {})
+        self.assertIsNone(self.manager._qt_recording)
+        # with_audio False rides "0"; absent params default to False
+        result2 = self.manager.run_action("quicktime", "start_recording", {"with_audio": False})
+        self.assertEqual(result2, {"ok": True, "doc_id": "DOC-1", "with_audio": False})
+        self.assertEqual(self.runner.last_argv(), ["0"])
+        self.manager.run_action("quicktime", "stop_recording", {})
+        result3 = self.manager.run_action("quicktime", "start_recording", {})
+        self.assertEqual(result3, {"ok": True, "doc_id": "DOC-1", "with_audio": False})
+        self.assertEqual(self.runner.last_argv(), ["0"])
+        # non-bool with_audio refuses at the builder (no runner trip)
+        calls_before = list(self.runner.calls)
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("quicktime", "start_recording", {"with_audio": "yes"})
+        self.assertEqual(str(ctx.exception), "'with_audio' must be true or false")
+        self.assertEqual(self.runner.calls, calls_before)
+
+    def test_second_start_refused_one_at_a_time(self):
+        self.runner.register(QUICKTIME_START_SCREEN, Outcome(0, "DOC-1", ""))
+        self.manager.run_action("quicktime", "start_recording", {})
+        calls_after_first = list(self.runner.calls)
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("quicktime", "start_recording", {})
+        self.assertEqual(str(ctx.exception), ERR_QT_ALREADY_RECORDING.format(doc_id="DOC-1"))
+        self.assertEqual(self.runner.calls, calls_after_first)  # builder-level refusal
+
+    def test_stop_recording_returns_saved_path_and_clears_slot(self):
+        self.runner.register(QUICKTIME_START_SCREEN, Outcome(0, "DOC-1", ""))
+        self.manager.run_action("quicktime", "start_recording", {})
+        self.runner.register(
+            QUICKTIME_STOP, Outcome(0, "~/Movies/Screen Recording DOC-1.mov", "")
+        )
+        result = self.manager.run_action("quicktime", "stop_recording", {})
+        self.assertEqual(result, {"ok": True, "path": "~/Movies/Screen Recording DOC-1.mov"})
+        self.assertEqual(self.runner.calls[-1][2:], [QUICKTIME_STOP, "DOC-1"])
+        self.assertIsNone(self.manager._qt_recording)  # slot released
+        with self.assertRaises(ConnectorError) as again_ctx:
+            self.manager.run_action("quicktime", "stop_recording", {})
+        self.assertEqual(str(again_ctx.exception), ERR_NO_RECORDING)
+
+    def test_stop_doc_gone_marker_releases_slot(self):
+        self.runner.register(QUICKTIME_START_SCREEN, Outcome(0, "DOC-7", ""))
+        self.manager.run_action("quicktime", "start_recording", {})
+        self.runner.register(QUICKTIME_STOP, Outcome(0, QUICKTIME_DOC_GONE_MARKER, ""))
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("quicktime", "stop_recording", {})
+        self.assertEqual(str(ctx.exception), ERR_QT_DOC_GONE.format(doc_id="DOC-7"))
+        self.assertIsNone(self.manager._qt_recording)  # released FIRST, doc-gone or not
+
+    def test_new_audio_recording_shares_slot(self):
+        self.runner.register(QUICKTIME_NEW_AUDIO, Outcome(0, "DOC-2", ""))
+        result = self.manager.run_action("quicktime", "new_audio_recording", {})
+        self.assertEqual(result, {"ok": True, "doc_id": "DOC-2"})
+        self.assertEqual(self.runner.calls[-1][2:], [QUICKTIME_NEW_AUDIO])  # no argv
+        self.assertEqual(self.manager._qt_recording, {"doc_id": "DOC-2", "kind": "audio"})
+        calls_after_first = list(self.runner.calls)
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("quicktime", "new_audio_recording", {})
+        self.assertEqual(str(ctx.exception), ERR_QT_ALREADY_RECORDING.format(doc_id="DOC-2"))
+        self.assertEqual(self.runner.calls, calls_after_first)
+
+    def test_play_requires_existing_file(self):
+        with self.assertRaises(ConnectorError) as missing_ctx:
+            self.manager.run_action("quicktime", "play", {"file": "~/Movies/missing.mov"})
+        self.assertEqual(
+            str(missing_ctx.exception), ERR_QT_PLAY_FILE.format(path=_res("~/Movies/missing.mov"))
+        )
+        with tempfile.TemporaryDirectory() as root:
+            real_file = os.path.join(root, "demo.mov")
+            with open(real_file, "w", encoding="utf-8") as f:
+                f.write("x")
+            self.runner.register(QUICKTIME_PLAY, Outcome(0, "0", ""))
+            result = self.manager.run_action("quicktime", "play", {"file": real_file})
+            self.assertEqual(result, {"ok": True, "path": _res(real_file)})
+            self.assertEqual(self.runner.calls[-1][2:], [QUICKTIME_PLAY, _res(real_file)])
+        with self.assertRaises(ConnectorError) as rel_ctx:
+            self.manager.run_action("quicktime", "play", {"file": "missing.mov"})
+        self.assertEqual(
+            str(rel_ctx.exception),
+            "'file' must be an absolute path or begin with '~' — got 'missing.mov'",
+        )
+        with self.assertRaises(ConnectorError) as cap_ctx:
+            self.manager.run_action(
+                "quicktime", "play", {"file": "p" * (QUICKTIME_FILE_MAX_CHARS + 1)}
+            )
+        self.assertEqual(
+            str(cap_ctx.exception), f"'file' is limited to {QUICKTIME_FILE_MAX_CHARS} characters"
+        )
+        for bad_params in ({}, {"file": None}, {"file": ""}, {"file": "   "}):
+            with self.assertRaises(ConnectorError) as empty_ctx:
+                self.manager.run_action("quicktime", "play", bad_params)
+            self.assertEqual(
+                str(empty_ctx.exception), "'file' must be a non-empty string", bad_params
+            )
+
+    def test_cross_action_recording_conflicts_and_lifecycle(self):
+        # 1. start_recording (screen) -> new_audio_recording (audio) raises conflict
+        self.runner.register(QUICKTIME_START_SCREEN, Outcome(0, "DOC-SCREEN", ""))
+        self.manager.run_action("quicktime", "start_recording", {})
+        self.assertEqual(self.manager._qt_recording, {"doc_id": "DOC-SCREEN", "kind": "screen"})
+        calls_after_start = list(self.runner.calls)
+        with self.assertRaises(ConnectorError) as conflict_ctx:
+            self.manager.run_action("quicktime", "new_audio_recording", {})
+        self.assertEqual(
+            str(conflict_ctx.exception), ERR_QT_ALREADY_RECORDING.format(doc_id="DOC-SCREEN")
+        )
+        self.assertEqual(self.runner.calls, calls_after_start)
+
+        # clear screen recording slot via stop
+        self.runner.register(QUICKTIME_STOP, Outcome(0, "~/Movies/Screen Recording DOC-SCREEN.mov", ""))
+        self.manager.run_action("quicktime", "stop_recording", {})
+        self.assertIsNone(self.manager._qt_recording)
+
+        # 2. new_audio_recording (audio) -> stop_recording returns saved path and clears slot
+        self.runner.register(QUICKTIME_NEW_AUDIO, Outcome(0, "DOC-AUDIO", ""))
+        audio_res = self.manager.run_action("quicktime", "new_audio_recording", {})
+        self.assertEqual(audio_res, {"ok": True, "doc_id": "DOC-AUDIO"})
+        self.assertEqual(self.manager._qt_recording, {"doc_id": "DOC-AUDIO", "kind": "audio"})
+
+        # (cross-check: audio active -> start_recording raises conflict)
+        calls_after_audio = list(self.runner.calls)
+        with self.assertRaises(ConnectorError) as audio_conflict_ctx:
+            self.manager.run_action("quicktime", "start_recording", {})
+        self.assertEqual(
+            str(audio_conflict_ctx.exception), ERR_QT_ALREADY_RECORDING.format(doc_id="DOC-AUDIO")
+        )
+        self.assertEqual(self.runner.calls, calls_after_audio)
+
+        self.runner.register(
+            QUICKTIME_STOP, Outcome(0, "~/Movies/Audio Recording DOC-AUDIO.m4a", "")
+        )
+        stop_res = self.manager.run_action("quicktime", "stop_recording", {})
+        self.assertEqual(stop_res, {"ok": True, "path": "~/Movies/Audio Recording DOC-AUDIO.m4a"})
+        self.assertEqual(self.runner.calls[-1][2:], [QUICKTIME_STOP, "DOC-AUDIO"])
+        self.assertIsNone(self.manager._qt_recording)
+
+        # slot cleared: subsequent stop raises ERR_NO_RECORDING
+        with self.assertRaises(ConnectorError) as no_rec_ctx:
+            self.manager.run_action("quicktime", "stop_recording", {})
+        self.assertEqual(str(no_rec_ctx.exception), ERR_NO_RECORDING)
+
+    def test_recording_state_lost_on_restart(self):
+        """The recording slot is process memory ONLY: the state file carries
+        domain statuses only (nothing recording-shaped is persisted), and a
+        fresh manager instance starts with a free slot (restart semantics)."""
+        self.runner.register(QUICKTIME_START_SCREEN, Outcome(0, "DOC-1", ""))
+        self.manager.run_action("quicktime", "start_recording", {})
+        self.assertEqual(self.manager._qt_recording, {"doc_id": "DOC-1", "kind": "screen"})
+        state_path = os.path.join(self.tmp.name, "data", "connectors_state.json")
+        with open(state_path, "r", encoding="utf-8") as f:
+            stored = json.load(f)
+        self.assertTrue(set(stored) <= set(CONNECTOR_DOMAINS), sorted(stored))
+        manager2 = ConnectorManager(self.tmp.name, runner=self.runner)
+        self.assertIsNone(manager2._qt_recording)
+        with self.assertRaises(ConnectorError) as ctx:
+            manager2.run_action("quicktime", "stop_recording", {})
+        self.assertEqual(str(ctx.exception), ERR_NO_RECORDING)
+
+
+class TestFinderQuickTimeGatingProbeAndMockWorld(unittest.TestCase):
+    """Membership batteries, gate machinery, probe classification, script
+    hygiene, and the env-gated mock world observability for finder +
+    quicktime."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_membership_and_gate_lists(self):
+        self.assertIn("finder", CONNECTOR_DOMAINS)
+        self.assertIn("quicktime", CONNECTOR_DOMAINS)
+        self.assertEqual(CONNECTOR_DOMAINS.index("finder"), 8)
+        self.assertEqual(CONNECTOR_DOMAINS.index("quicktime"), 9)
+        self.assertEqual(CONNECTOR_DOMAINS[10], "system")
+        self.assertIn("finder", GATED_DOMAINS)
+        self.assertIn("quicktime", GATED_DOMAINS)
+        self.assertEqual(
+            CONNECTOR_ACTIONS["finder"], ("list", "reveal", "info", "move", "trash")
+        )
+        self.assertEqual(
+            CONNECTOR_ACTIONS["quicktime"],
+            ("start_recording", "stop_recording", "new_audio_recording", "play"),
+        )
+
+    def test_ungranted_gates_never_reach_runner_exact_copy(self):
+        gate_runner = RecordingRunner()
+        manager = ConnectorManager(self.tmp.name, runner=gate_runner)
+        for domain, action, params, expected in (
+            ("finder", "list", {"path": "~/Desktop"},
+             "Finder ainda não está conectado — conecte finder em Settings › Connectors."),
+            ("quicktime", "start_recording", {},
+             "QuickTime ainda não está conectado — conecte quicktime em Settings › Connectors."),
+        ):
+            for status in ("unknown", "denied", "needs_consent"):
+                manager.state.record(domain, status)
+                self.assertEqual(gate_runner.calls, [])
+                with self.assertRaises(ConnectorError) as ctx:
+                    manager.run_action(domain, action, params)
+                # gate copy flows from the existing PT-BR machinery verbatim
+                self.assertEqual(str(ctx.exception), expected)
+                self.assertEqual(gate_runner.calls, [])  # runner NEVER invoked through the gate
+
+    def test_script_hygiene_marker_and_bundle_battery(self):
+        self.assertIn("finder", PROBE_SCRIPTS)
+        self.assertIn("quicktime", PROBE_SCRIPTS)
+        for script in (FINDER_LIST, FINDER_INFO, FINDER_MOVE, FINDER_TRASH,
+                       QUICKTIME_START_SCREEN, QUICKTIME_NEW_AUDIO,
+                       QUICKTIME_STOP, QUICKTIME_PLAY):
+            self.assertIn("on run argv", script)  # argv-only input channel
+            self.assertNotIn("do shell script", script)
+            self.assertNotIn("run script", script)
+        for script in (FINDER_LIST, FINDER_INFO, FINDER_MOVE, FINDER_TRASH):
+            self.assertIn("com.apple.finder", script)
+        for script in (QUICKTIME_START_SCREEN, QUICKTIME_NEW_AUDIO,
+                       QUICKTIME_STOP, QUICKTIME_PLAY):
+            self.assertIn("com.apple.QuickTimePlayerX", script)
+        self.assertIn(FINDER_NOT_FOUND_MARKER, FINDER_LIST)
+        self.assertIn(FINDER_NOT_FOUND_MARKER, FINDER_INFO)
+        self.assertIn(FINDER_NOT_FOUND_MARKER, FINDER_MOVE)
+        self.assertIn(FINDER_NOT_FOUND_MARKER, FINDER_TRASH)
+        self.assertIn(FINDER_DST_DIR_MISSING_MARKER, FINDER_MOVE)
+        self.assertIn(FINDER_DST_EXISTS_MARKER, FINDER_MOVE)
+        self.assertIn(QUICKTIME_DOC_GONE_MARKER, QUICKTIME_STOP)
+        # probes: trivial consented touches that fire the TCC prompt
+        self.assertIn("count of desktop items", PROBE_SCRIPTS["finder"])
+        self.assertIn("com.apple.finder", PROBE_SCRIPTS["finder"])
+        self.assertIn("count windows", PROBE_SCRIPTS["quicktime"])
+        self.assertIn("com.apple.QuickTimePlayerX", PROBE_SCRIPTS["quicktime"])
+        # SCRIPTS identity across all eight registered keys
+        self.assertIs(SCRIPTS[("finder", "list")], FINDER_LIST)
+        self.assertIs(SCRIPTS[("finder", "info")], FINDER_INFO)
+        self.assertIs(SCRIPTS[("finder", "move")], FINDER_MOVE)
+        self.assertIs(SCRIPTS[("finder", "trash")], FINDER_TRASH)
+        self.assertIs(SCRIPTS[("quicktime", "start_recording")], QUICKTIME_START_SCREEN)
+        self.assertIs(SCRIPTS[("quicktime", "new_audio_recording")], QUICKTIME_NEW_AUDIO)
+        self.assertIs(SCRIPTS[("quicktime", "stop_recording")], QUICKTIME_STOP)
+        self.assertIs(SCRIPTS[("quicktime", "play")], QUICKTIME_PLAY)
+        # reveal is argv-only (`open -R`): NO SCRIPTS key may exist for it
+        self.assertNotIn(("finder", "reveal"), SCRIPTS)
+
+    def test_probe_classification_finder_and_quicktime(self):
+        granted_runner = RecordingRunner()
+        granted_runner.register(PROBE_SCRIPTS["finder"], Outcome(0, "2", ""))
+        granted_runner.register(PROBE_SCRIPTS["quicktime"], Outcome(0, "0", ""))
+        manager = ConnectorManager(self.tmp.name, runner=granted_runner)
+        self.assertEqual(manager.probe("finder")["status"], "granted")
+        self.assertEqual(manager.state.read()["finder"]["status"], "granted")
+        self.assertEqual(manager.probe("quicktime")["status"], "granted")
+        self.assertEqual(manager.state.read()["quicktime"]["status"], "granted")
+        # canned -1743 denial: classified AND persisted (mirror the FASE-3
+        # contacts/messages probe battery — -1743 is `denied`, never guessed)
+        denied_runner = RecordingRunner()
+        denied_runner.register(
+            PROBE_SCRIPTS["finder"],
+            Outcome(1, "", "Not authorized to send Apple events (-1743)"),
+        )
+        denied_runner.register(
+            PROBE_SCRIPTS["quicktime"],
+            Outcome(1, "", "Not authorized to send Apple events (-1743)"),
+        )
+        manager2 = ConnectorManager(self.tmp.name, runner=denied_runner)
+        self.assertEqual(manager2.probe("finder")["status"], "denied")
+        self.assertEqual(manager2.state.read()["finder"]["status"], "denied")
+        self.assertEqual(manager2.probe("quicktime")["status"], "denied")
+        self.assertEqual(manager2.state.read()["quicktime"]["status"], "denied")
+        # a hang classifies needs_consent (persisted) — runner-seam split
+        manager2.state.record("finder", "unknown")
+        manager2.state.record("quicktime", "unknown")
+
+        def timeout_runner(cmd, timeout, stdin=None):
+            raise subprocess.TimeoutExpired(cmd, timeout)
+
+        manager2._runner = timeout_runner
+        self.assertEqual(manager2.probe("finder")["status"], "needs_consent")
+        self.assertEqual(manager2.state.read()["finder"]["status"], "needs_consent")
+        self.assertEqual(manager2.probe("quicktime")["status"], "needs_consent")
+        self.assertEqual(manager2.state.read()["quicktime"]["status"], "needs_consent")
+
+    def test_single_param_actions_require_non_empty_string(self):
+        """Single-param actions (finder.reveal, finder.info, finder.trash,
+        quicktime.play) refuse missing / None / empty string parameters
+        before any gate or runner execution."""
+        runner = RecordingRunner()
+        manager = ConnectorManager(self.tmp.name, runner=runner)
+        manager.state.record("finder", "granted")
+        manager.state.record("quicktime", "granted")
+        matrix = [
+            ("finder", "reveal", "path"),
+            ("finder", "info", "path"),
+            ("finder", "trash", "path"),
+            ("quicktime", "play", "file"),
+        ]
+        for domain, action, param in matrix:
+            for bad_params in ({}, {param: None}, {param: ""}, {param: "   "}):
+                with self.assertRaises(ConnectorError) as ctx:
+                    manager.run_action(domain, action, bad_params)
+                self.assertEqual(
+                    str(ctx.exception),
+                    f"'{param}' must be a non-empty string",
+                    (domain, action, bad_params),
+                )
+        self.assertEqual(runner.calls, [])
+
+    def test_mock_observability_finder_and_quicktime(self):
+        """Env-mock world: seeded finder folders observed through list
+        (Desktop, Downloads), a file-path list refusal mirror, the dst-exists
+        refusal against the seeded duplicate, a REAL move -> Downloads list
+        shows it, trash -> Desktop list shrinks, a missing trash target and a
+        mock-missing dst_dir both refuse with the exact copies; quicktime runs
+        start -> stop with sequential QT-MOCK ids, the single-slot refusal,
+        slot release, and a real-file play."""
+        try:
+            os.environ["NOTIFYBOT_CONNECTORS_MOCK"] = "1"
+        finally:
+            pass
+        try:
+            manager = ConnectorManager(self.tmp.name)  # env mock runner active
+            manager.state.record("finder", "granted")
+            manager.state.record("quicktime", "granted")
+            _desktop = _res("~/Desktop")
+            _downloads = _res("~/Downloads")
+            # seeded folders verbatim
+            listed = manager.run_action("finder", "list", {"path": "~/Desktop"})
+            self.assertEqual(
+                listed, {"items": ["Relatório.pdf", "Captura de Tela.png", "trabalho"]}
+            )
+            self.assertEqual(
+                manager.run_action("finder", "list", {"path": "~/Downloads"}),
+                {"items": ["Relatório.pdf"]},
+            )
+            # listing a FILE path mirrors the script's failed folder coercion
+            with self.assertRaises(ConnectorError) as no_folder_ctx:
+                manager.run_action("finder", "list", {"path": "~/Desktop/Relatório.pdf"})
+            self.assertEqual(
+                str(no_folder_ctx.exception),
+                ERR_FINDER_NO_FOLDER.format(path=os.path.join(_desktop, "Relatório.pdf")),
+            )
+            # seeded Downloads duplicate: the frozen dst-exists refusal mirrors
+            with self.assertRaises(ConnectorError) as dup_ctx:
+                manager.run_action(
+                    "finder", "move",
+                    {"src": "~/Desktop/Relatório.pdf", "dst_dir": "~/Downloads"},
+                )
+            self.assertEqual(
+                str(dup_ctx.exception), ERR_FINDER_DST_EXISTS.format(name="Relatório.pdf")
+            )
+            # real observability: move -> list shows it in Downloads
+            moved = manager.run_action(
+                "finder", "move",
+                {"src": "~/Desktop/Captura de Tela.png", "dst_dir": "~/Downloads"},
+            )
+            self.assertEqual(
+                moved,
+                {"ok": True, "moved": True,
+                 "from": os.path.join(_desktop, "Captura de Tela.png"),
+                 "to": os.path.join(_downloads, "Captura de Tela.png")},
+            )
+            self.assertEqual(
+                manager.run_action("finder", "list", {"path": "~/Downloads"})["items"],
+                ["Relatório.pdf", "Captura de Tela.png"],
+            )
+            # trash -> list observes the removal
+            trashed = manager.run_action("finder", "trash", {"path": "~/Desktop/trabalho"})
+            self.assertEqual(trashed, {"ok": True, "trashed": os.path.join(_desktop, "trabalho")})
+            self.assertEqual(
+                manager.run_action("finder", "list", {"path": "~/Desktop"})["items"],
+                ["Relatório.pdf"],
+            )
+            # trash of a MISSING under-roots path -> the marker's clean copy
+            with self.assertRaises(ConnectorError) as missing_ctx:
+                manager.run_action("finder", "trash", {"path": "~/Desktop/fantasma.txt"})
+            self.assertEqual(
+                str(missing_ctx.exception),
+                ERR_FINDER_NOT_FOUND.format(path=os.path.join(_desktop, "fantasma.txt")),
+            )
+            # dst_dir outside the MOCK world (but under allowed roots): the
+            # frozen dst-dir-missing refusal mirrors
+            with self.assertRaises(ConnectorError) as dst_ctx:
+                manager.run_action(
+                    "finder", "move",
+                    {"src": "~/Desktop/Relatório.pdf", "dst_dir": "~/Documents"},
+                )
+            self.assertEqual(
+                str(dst_ctx.exception), ERR_FINDER_DST_DIR_MISSING.format(dir=_res("~/Documents"))
+            )
+            # quicktime: start -> single-slot refusal -> stop returns the mock
+            # saved path EXACTLY and clears the slot; start again gets the NEXT
+            # sequential id; new_audio shares the same slot; play rides a real file
+            started = manager.run_action("quicktime", "start_recording", {})
+            self.assertEqual(started, {"ok": True, "doc_id": "QT-MOCK-1", "with_audio": False})
+            with self.assertRaises(ConnectorError) as second_ctx:
+                manager.run_action("quicktime", "start_recording", {})
+            self.assertEqual(
+                str(second_ctx.exception), ERR_QT_ALREADY_RECORDING.format(doc_id="QT-MOCK-1")
+            )
+            with self.assertRaises(ConnectorError) as cross_audio_ctx:
+                manager.run_action("quicktime", "new_audio_recording", {})
+            self.assertEqual(
+                str(cross_audio_ctx.exception), ERR_QT_ALREADY_RECORDING.format(doc_id="QT-MOCK-1")
+            )
+            stopped = manager.run_action("quicktime", "stop_recording", {})
+            self.assertEqual(stopped, {"ok": True, "path": "~/Movies/Screen Recording QT-MOCK-1.mov"})
+            with self.assertRaises(ConnectorError) as no_rec_ctx:
+                manager.run_action("quicktime", "stop_recording", {})
+            self.assertEqual(str(no_rec_ctx.exception), ERR_NO_RECORDING)
+            started2 = manager.run_action("quicktime", "start_recording", {})
+            self.assertEqual(started2, {"ok": True, "doc_id": "QT-MOCK-2", "with_audio": False})
+            manager.run_action("quicktime", "stop_recording", {})
+            audio = manager.run_action("quicktime", "new_audio_recording", {})
+            self.assertEqual(audio, {"ok": True, "doc_id": "QT-MOCK-3"})
+            with self.assertRaises(ConnectorError) as audio_ctx:
+                manager.run_action("quicktime", "new_audio_recording", {})
+            self.assertEqual(
+                str(audio_ctx.exception), ERR_QT_ALREADY_RECORDING.format(doc_id="QT-MOCK-3")
+            )
+            with self.assertRaises(ConnectorError) as cross_screen_ctx:
+                manager.run_action("quicktime", "start_recording", {})
+            self.assertEqual(
+                str(cross_screen_ctx.exception), ERR_QT_ALREADY_RECORDING.format(doc_id="QT-MOCK-3")
+            )
+            stopped_audio = manager.run_action("quicktime", "stop_recording", {})
+            self.assertEqual(
+                stopped_audio, {"ok": True, "path": "~/Movies/Screen Recording QT-MOCK-3.mov"}
+            )
+            self.assertIsNone(manager._qt_recording)
+            play_path = os.path.join(self.tmp.name, "demo.mov")
+            with open(play_path, "w", encoding="utf-8") as f:
+                f.write("x")
+            played = manager.run_action("quicktime", "play", {"file": play_path})
+            self.assertEqual(played, {"ok": True, "path": _res(play_path)})
+        finally:
+            os.environ.pop("NOTIFYBOT_CONNECTORS_MOCK", None)
+
+    def test_injection_battery_finder_quicktime(self):
+        """Model-controlled strings ride strictly as argv items against the
+        FROZEN finder/quicktime constants — never inside script source.
+        quicktime play needs an existing file: each payload embeds in a real
+        tempfile's name where the OS permits; payloads containing `/` cannot
+        name a real file, so those assert play's existing-file refusal."""
+        runner = RecordingRunner()
+        runner.register(FINDER_LIST, Outcome(0, "x", ""))
+        runner.register(FINDER_MOVE, Outcome(0, "moved", ""))
+        runner.register(FINDER_TRASH, Outcome(0, "trashed", ""))
+        runner.register(QUICKTIME_PLAY, Outcome(0, "0", ""))
+        manager = ConnectorManager(self.tmp.name, runner=runner)
+        manager.state.record("finder", "granted")
+        manager.state.record("quicktime", "granted")
+        for payload in TestInjectionBattery.PAYLOADS:
+            under_root = "~/Desktop/" + payload
+            manager.run_action("finder", "list", {"path": under_root})
+            cmd = runner.calls[-1]
+            script_source = cmd[2]
+            self.assertEqual(script_source, FINDER_LIST, payload)
+            self.assertTrue(
+                any(payload in arg for arg in cmd[3:]), (payload, cmd[3:])
+            )  # verbatim argv delivery
+            self.assertNotIn(payload, script_source, payload)  # absent from source
+            manager.run_action("finder", "move", {"src": under_root, "dst_dir": "~/Downloads"})
+            cmd = runner.calls[-1]
+            script_source = cmd[2]
+            self.assertEqual(script_source, FINDER_MOVE, payload)
+            self.assertTrue(
+                any(payload in arg for arg in cmd[3:]), (payload, cmd[3:])
+            )  # verbatim argv delivery
+            self.assertNotIn(payload, script_source, payload)
+            manager.run_action("finder", "trash", {"path": under_root})
+            cmd = runner.calls[-1]
+            script_source = cmd[2]
+            self.assertEqual(script_source, FINDER_TRASH, payload)
+            self.assertTrue(
+                any(payload in arg for arg in cmd[3:]), (payload, cmd[3:])
+            )  # verbatim argv delivery
+            self.assertNotIn(payload, script_source, payload)
+            candidate = os.path.join(self.tmp.name, payload)
+            if "/" not in payload:
+                real_file = os.path.join(self.tmp.name, "play-" + payload)
+                with open(real_file, "w", encoding="utf-8") as f:
+                    f.write("x")
+                manager.run_action("quicktime", "play", {"file": real_file})
+                cmd = runner.calls[-1]
+                self.assertEqual(cmd[2], QUICKTIME_PLAY, payload)
+                self.assertIn(payload, cmd[3], payload)  # verbatim argv delivery (resolved path)
+                self.assertNotIn(payload, cmd[2], payload)  # absent from source
+            else:
+                with self.assertRaises(ConnectorError) as play_ctx:
+                    manager.run_action("quicktime", "play", {"file": candidate})
+                self.assertEqual(
+                    str(play_ctx.exception),
+                    ERR_QT_PLAY_FILE.format(path=_res(candidate)),
+                    payload,
+                )
         for cmd in runner.calls:  # shape holds for EVERY payload
             self.assertEqual(cmd[:2], ["osascript", "-e"])
 

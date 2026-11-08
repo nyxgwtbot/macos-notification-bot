@@ -50,8 +50,9 @@ Outcome classification (actions and probes share it):
 Mock hook: with env ``NOTIFYBOT_CONNECTORS_MOCK=1`` the runner seam executes a
 per-process in-memory world (reminders lists, notes, calendar events, music
 state, volume, front app, toasts, shortcut names, mail unread/mailbox/recent
-fixtures, contacts people, message thread dates) so smokes exercise
-add->list observability and the endpoints WITHOUT
+fixtures, contacts people, message thread dates, finder Desktop + Downloads
+virtual-FS fixtures, quicktime fake doc ids "QT-MOCK-<n>" + fake saved paths)
+so smokes exercise add->list observability and the endpoints WITHOUT
 osascript.
 """
 
@@ -72,7 +73,7 @@ from notifybot.agent_tools import _write_atomic
 #: Domains exposed by native.call in v1 (order == GET /api/connectors row order).
 CONNECTOR_DOMAINS: Tuple[str, ...] = (
     "reminders", "notes", "calendar", "music", "shortcuts", "mail",
-    "contacts", "messages", "system"
+    "contacts", "messages", "finder", "quicktime", "system"
 )
 
 #: Whitelist: the only (domain, action) pairs dispatch accepts.
@@ -85,12 +86,14 @@ CONNECTOR_ACTIONS: Dict[str, Tuple[str, ...]] = {
     "mail": ("unread_count", "mailboxes", "list_recent"),
     "contacts": ("search", "get", "create"),
     "messages": ("send_message", "list_recent_threads"),
+    "finder": ("list", "reveal", "info", "move", "trash"),
+    "quicktime": ("start_recording", "stop_recording", "new_audio_recording", "play"),
     "system": ("volume", "front_app", "open", "toast"),
 }
 
 #: Domains that require granted consent state before ANY action runs
 #: (AppleScript automation of these apps triggers macOS TCC consent).
-GATED_DOMAINS: Tuple[str, ...] = ("reminders", "notes", "calendar", "music", "mail", "contacts", "messages")
+GATED_DOMAINS: Tuple[str, ...] = ("reminders", "notes", "calendar", "music", "mail", "contacts", "messages", "finder", "quicktime")
 
 #: Hard per-call timeout (also enforced by subprocess.run's timeout kwarg).
 CONNECTORS_TIMEOUT_S = 8.0
@@ -133,6 +136,20 @@ MESSAGES_TO_MAX_CHARS = 256
 MESSAGES_TEXT_MAX_CHARS = 1024
 MESSAGES_THREADS_MAX_COUNT = 10
 
+#: Finder caps: path inputs 512 chars (SHORTCUTS_INPUT_MAX_CHARS precedent);
+#: list rows 1..100 (hard trim — LIST_LIMIT_MAX family).
+FINDER_PATH_MAX_CHARS = 512
+FINDER_LIST_MAX_ITEMS = 100
+
+#: QuickTime caps: file/path inputs 512 chars.
+QUICKTIME_FILE_MAX_CHARS = 512
+
+#: Finder allowed roots: model-suggested paths must resolve under ONE of these
+#: (expanduser + realpath, then prefix-compare — no "~" expansion tricks).
+_FINDER_ALLOWED_ROOTS: Tuple[str, ...] = (
+    "~/Desktop", "~/Documents", "~/Downloads", "~/apps",
+)
+
 #: In-script list delimiter: ASCII character 31 (unit separator). AppleScript
 #: joins list results with it; Python splits on the same byte below.
 _DELIM = "\x1f"
@@ -163,7 +180,7 @@ _URL_TARGET_RE = re.compile(r"^https?://")
 _APP_TARGET_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,64}$")
 
 # English (ToolFailure-style) whitelist/validation error strings.
-ERR_UNKNOWN_DOMAIN = "unknown domain: {domain!r} (valid: reminders, notes, calendar, music, shortcuts, mail, contacts, messages, system)"
+ERR_UNKNOWN_DOMAIN = "unknown domain: {domain!r} (valid: reminders, notes, calendar, music, shortcuts, mail, contacts, messages, finder, quicktime, system)"
 ERR_UNKNOWN_ACTION = "unknown action {action!r} for domain {domain!r} (valid: {actions})"
 ERR_PARAMS_DICT = "params must be a JSON object"
 
@@ -171,7 +188,7 @@ ERR_PARAMS_DICT = "params must be a JSON object"
 _DISPLAY_NAMES: Dict[str, str] = {
     "reminders": "Reminders", "notes": "Notes", "calendar": "Calendar",
     "music": "Music", "shortcuts": "Shortcuts", "mail": "Mail",
-    "contacts": "Contacts", "messages": "Messages",
+    "contacts": "Contacts", "messages": "Messages", "finder": "Finder", "quicktime": "QuickTime",
     "system": "System",
 }
 
@@ -205,6 +222,38 @@ ERR_UNKNOWN_RECIPIENT = (
     "unknown recipient: {to!r} is not a known contact, e-mail address, "
     "or +E.164 phone"
 )
+
+# Finder structured in-script markers (rc-0 stdout route, equality-after-strip
+# — mirror contacts/messages convention). Literals live ONLY in the frozen
+# scripts + these constants (kept in sync).
+FINDER_NOT_FOUND_MARKER = "connectors-finder-not-found"
+FINDER_DST_DIR_MISSING_MARKER = "connectors-finder-dst-dir-missing"
+FINDER_DST_EXISTS_MARKER = "connectors-finder-dst-exists"
+
+# QuickTime structured in-script marker: stop_recording may find the remembered
+# document gone (closed externally) — rc-0 stdout refusal route.
+QUICKTIME_DOC_GONE_MARKER = "connectors-qt-doc-gone"
+
+# English (ToolFailure-style) refusal copies: finder + quicktime validation.
+ERR_FINDER_NOT_FOUND = "path not found: {path}"
+ERR_FINDER_NO_FOLDER = "no folder at path: {path}"
+ERR_FINDER_DST_DIR_MISSING = "destination folder not found: {dir}"
+ERR_FINDER_DST_EXISTS = (
+    "destination already contains an item named {name!r} — refusing to overwrite"
+)
+ERR_PATH_OUTSIDE_ROOTS = (
+    "path {path!r} is outside the allowed folders: "
+    "~/Desktop, ~/Documents, ~/Downloads, ~/apps"
+)
+ERR_TRASH_HOME_REFUSED = "refusing to move the home folder to the Trash: {path!r}"
+ERR_NO_RECORDING = "no QuickTime recording is in progress (start one first)"
+ERR_QT_ALREADY_RECORDING = (
+    "a QuickTime recording is already in progress (document {doc_id}) — stop it first"
+)
+ERR_QT_DOC_GONE = (
+    "the QuickTime recording (document {doc_id}) is no longer available — try again"
+)
+ERR_QT_PLAY_FILE = "path is not an existing file: {path}"
 
 # ---------------------------------------------------------------------------
 # Static AppleScript sources — FROZEN constants; the ONLY input channel is
@@ -899,6 +948,183 @@ on run argv
 end run
 """
 
+# ---------------------------------------------------------------------------
+# Finder + QuickTime (FASE 4) — frozen scripts, argv-only inputs.
+# Real-Mac grammar, sandbox-unverifiable (same policy as the MAIL_* block);
+# the QuickTime grammar is sdef-verified on this host (no with-audio param on
+# "new screen recording" — audio rides the document's `current microphone`).
+# ---------------------------------------------------------------------------
+
+#: Finder.list: argv[0] = folder path (already root-validated by the builder).
+#: Emits item NAMES joined with ASCII character 31 (flat list, no empty fields):
+#: the Python post trims to FINDER_LIST_MAX_ITEMS. A missing or non-folder path
+#: (folder coercion of a file errors) returns the not-found marker.
+FINDER_LIST = """
+on run argv
+	set _root to (item 1 of argv) as text
+	tell application id "com.apple.finder"
+		try
+			set _folder to folder (POSIX file _root as alias)
+		on error
+			return "connectors-finder-not-found"
+		end try
+		set _names to (name of items of _folder)
+	end tell
+	set AppleScript's text item delimiters to ASCII character 31
+	return (_names as text)
+end run
+"""
+
+#: Finder.info: argv[0] = item path. Emits ONE row of FIVE fields
+#: kind \x1f size \x1f extension \x1f created \x1f modified ("" for empty size
+#: of a folder / missing name extension). Missing path -> not-found marker.
+FINDER_INFO = """
+on run argv
+	set _path to (item 1 of argv) as text
+	tell application id "com.apple.finder"
+		try
+			set _item to (POSIX file _path as alias)
+		on error
+			return "connectors-finder-not-found"
+		end try
+		set _kind to (kind of _item) as text
+		if (size of _item) is missing value then
+			set _size to ""
+		else
+			set _size to (size of _item) as text
+		end if
+		if (name extension of _item) is missing value then
+			set _ext to ""
+		else
+			set _ext to (name extension of _item) as text
+		end if
+		set _created to (creation date of _item) as text
+		set _modified to (modification date of _item) as text
+	end tell
+	set AppleScript's text item delimiters to ASCII character 31
+	return (_kind & ASCII character 31 & _size & ASCII character 31 & _ext & ASCII character 31 & _created & ASCII character 31 & _modified)
+end run
+"""
+
+#: Finder.move: argv[0] = src path, argv[1] = destination DIRECTORY, argv[2] =
+#: basename(src) (computed Python-side — no shell anywhere). Refuses WITHOUT
+#: moving: destination dir missing or not a directory -> dst-dir-missing marker;
+#: an item of the same name already in dst -> dst-exists marker (never
+#: overwrite); missing source -> not-found marker. `move` = Finder's move
+#: (never a copy+delete of a foreign volume).
+FINDER_MOVE = """
+on run argv
+	set _src to (item 1 of argv) as text
+	set _dstDir to (item 2 of argv) as text
+	set _name to (item 3 of argv) as text
+	tell application id "com.apple.finder"
+		try
+			set _dstFolder to folder (POSIX file _dstDir as alias)
+		on error
+			return "connectors-finder-dst-dir-missing"
+		end try
+		if (exists item _name of _dstFolder) then
+			return "connectors-finder-dst-exists"
+		end if
+		try
+			set _srcItem to (POSIX file _src as alias)
+		on error
+			return "connectors-finder-not-found"
+		end try
+		move _srcItem to _dstFolder
+	end tell
+	return "moved"
+end run
+"""
+
+#: Finder.trash: argv[0] = item path (Python side already refuses the home
+#: root and outside-roots rules). Finder's `delete` MOVES TO TRASH — never a
+#: void delete; the destructive double-arm dialog is UI-level only.
+FINDER_TRASH = """
+on run argv
+	set _path to (item 1 of argv) as text
+	tell application id "com.apple.finder"
+		try
+			set _item to (POSIX file _path as alias)
+		on error
+			return "connectors-finder-not-found"
+		end try
+		delete _item
+	end tell
+	return "trashed"
+end run
+"""
+
+#: QuickTime.start_recording: argv[0] = "1" when with_audio. `new screen
+#: recording` returns NO document (sdef) -> grab `document 1` (the just-created
+#: front doc); with_audio sets the doc's current microphone inside a benign
+#: try (device list empty -> recording still starts, just silent).
+#: Returns the doc id — the Python post REMEMBERS it (process memory).
+QUICKTIME_START_SCREEN = """
+on run argv
+	set _audio to ((item 1 of argv) is "1")
+	tell application id "com.apple.QuickTimePlayerX"
+		activate
+		new screen recording
+		set _doc to document 1
+		if _audio then
+			try
+				set current microphone of _doc to audio recording device 1
+			end try
+		end if
+		start _doc
+		return (id of _doc)
+	end tell
+end run
+"""
+
+#: QuickTime.new_audio_recording: `new audio recording` RETURNS a document (sdef);
+#: start it and return the doc id (same single recording slot as screen).
+QUICKTIME_NEW_AUDIO = """
+on run argv
+	tell application id "com.apple.QuickTimePlayerX"
+		activate
+		set _doc to (new audio recording)
+		start _doc
+		return (id of _doc)
+	end tell
+end run
+"""
+
+#: QuickTime.stop: argv[0] = remembered doc id. Stops the doc and returns the
+#: saved file's POSIX path (QT default save location, e.g. ~/Movies/...). A doc
+#: that no longer exists (closed externally) -> doc-gone marker.
+QUICKTIME_STOP = """
+on run argv
+	set _docId to (item 1 of argv) as text
+	tell application id "com.apple.QuickTimePlayerX"
+		try
+			set _doc to document id _docId
+		on error
+			return "connectors-qt-doc-gone"
+		end try
+		stop _doc
+		if (file of _doc) is missing value then
+			return "connectors-qt-doc-gone"
+		end if
+		return (POSIX path of (file of _doc))
+	end tell
+end run
+"""
+
+#: QuickTime.play: argv[0] = file path (Python side requires an existing file).
+#: `open` returns the document; `play` starts it.
+QUICKTIME_PLAY = """
+on run argv
+	set _path to (item 1 of argv) as text
+	tell application id "com.apple.QuickTimePlayerX"
+		activate
+		set _doc to (open (POSIX file _path))
+		play _doc
+	end tell
+end run
+"""
+
 #: Static script source per (domain, action) — the model can never influence
 #: these bytes; its strings ride strictly in argv. (system.volume splits into
 #: get/set script variants at argv-build time.)
@@ -934,6 +1160,14 @@ SCRIPTS: Dict[Tuple[str, str], str] = {
     ("messages", "send_message"): MESSAGES_SEND_HANDLE,
     ("messages", "send_message_contact"): MESSAGES_SEND_CONTACT,
     ("messages", "list_recent_threads"): MESSAGES_LIST_THREADS,
+    ("finder", "list"): FINDER_LIST,
+    ("finder", "info"): FINDER_INFO,
+    ("finder", "move"): FINDER_MOVE,
+    ("finder", "trash"): FINDER_TRASH,
+    ("quicktime", "start_recording"): QUICKTIME_START_SCREEN,
+    ("quicktime", "new_audio_recording"): QUICKTIME_NEW_AUDIO,
+    ("quicktime", "stop_recording"): QUICKTIME_STOP,
+    ("quicktime", "play"): QUICKTIME_PLAY,
     ("system", "volume"): SYSTEM_VOLUME_GET,
     ("system", "volume_set"): SYSTEM_VOLUME_SET,
     ("system", "front_app"): SYSTEM_FRONT_APP,
@@ -1009,6 +1243,24 @@ on run argv
 	end tell
 end run
 """,
+    # Finder: trivial consented touch (Automation -> Finder); fires TCC consent.
+    "finder": """
+on run argv
+	tell application id "com.apple.finder"
+		return (count of desktop items as text)
+	end tell
+end run
+""",
+    # QuickTime: trivial consented touch (Automation -> QuickTime); the FIRST
+    # screen recording additionally fires Screen Recording TCC, which the
+    # ACTION classifies (the probe stays automation-level, like music's).
+    "quicktime": """
+on run argv
+	tell application id "com.apple.QuickTimePlayerX"
+		return (count windows as text)
+	end tell
+end run
+""",
     # system needs no consent; the volume read is a harmless osascript sanity probe.
     "system": SYSTEM_VOLUME_GET,
 }
@@ -1028,6 +1280,8 @@ BUNDLE_IDS: Dict[str, str] = {
     "mail": "com.apple.mail",
     "contacts": "com.apple.AddressBook",
     "messages": "com.apple.iChat",
+    "finder": "com.apple.finder",
+    "quicktime": "com.apple.QuickTimePlayerX",
     "system": "com.apple.systemevents",
 }
 
@@ -1264,6 +1518,53 @@ def _optional_capped_int(value: Any, field: str, cap: int, default: int, units: 
     return number
 
 
+def _finder_allowed_roots() -> List[str]:
+    """Canonical allowed roots for finder path inputs (expanduser+realpath, no
+    existence requirement — the prefix compare is string-based)."""
+    return [os.path.realpath(os.path.expanduser(root)) for root in _FINDER_ALLOWED_ROOTS]
+
+
+def _safe_expand_resolved(raw_path: str, field: str) -> str:
+    """expanduser + realpath with the NUL/relative guards the handle validators
+    use (_is_email_handle control-char precedent): os.path raises uncaught
+    ValueError on embedded NULs, and CWD-relative paths would make the allowed-
+    roots compare process-state dependent — both refuse as clean ConnectorError
+    validation copies instead."""
+    if raw_path.strip() == "" or "\x00" in raw_path:
+        raise ConnectorError(f"'{field}' must be a non-empty path")
+    expanded = os.path.expanduser(raw_path)
+    if not os.path.isabs(expanded):
+        raise ConnectorError(
+            f"'{field}' must be an absolute path or begin with '~' — got {raw_path!r}"
+        )
+    return os.path.realpath(expanded)
+
+
+def _resolve_under_allowed_root(raw_path: str, field: str) -> str:
+    """finder list/info/reveal/move paths: expanduser -> realtime-resolve
+    (kills '~/..' and symlink tricks) -> require one allowed-root prefix."""
+    resolved = _safe_expand_resolved(raw_path, field)
+    for root in _finder_allowed_roots():
+        if resolved == root or resolved.startswith(root + os.sep):
+            return resolved
+    raise ConnectorError(ERR_PATH_OUTSIDE_ROOTS.format(path=resolved))
+
+
+def _resolve_trash_path(raw_path: str) -> str:
+    """finder.trash rule (mission): refuse the home root; refuse anything
+    outside the allowed roots UNLESS it exists and is a plain file."""
+    resolved = _safe_expand_resolved(raw_path, "path")
+    home = os.path.realpath(os.path.expanduser("~"))
+    if resolved == home:
+        raise ConnectorError(ERR_TRASH_HOME_REFUSED.format(path=resolved))
+    for root in _finder_allowed_roots():
+        if resolved == root or resolved.startswith(root + os.sep):
+            return resolved
+    if os.path.isfile(resolved):
+        return resolved
+    raise ConnectorError(ERR_PATH_OUTSIDE_ROOTS.format(path=resolved))
+
+
 def _as_string(value: Any, field: str, field_max: Optional[int] = None) -> str:
     """Coerce a model-supplied JSON value to a validated, non-empty string."""
     if value is None or isinstance(value, (bool, dict, list)):
@@ -1436,7 +1737,7 @@ class _ArgvPlan(NamedTuple):
     pipe validated text through the runner's stdin channel."""
 
     cmd: List[str]
-    kind: str = "ok"  # ok | split | split_keep | send | complete | read | raw | level_get | level_set | playlist | count | status | unread | shortcuts_list | shortcuts_run
+    kind: str = "ok"  # ok | split | split_keep | send | complete | read | raw | level_get | level_set | playlist | count | status | unread | shortcuts_list | shortcuts_run | finder
     post: Optional[Callable[[dict], dict]] = None
     complete_list: str = ""
     complete_query: str = ""
@@ -1473,6 +1774,9 @@ class ConnectorManager:
         else:
             self._runner = _default_runner
         self._probe_locks: Dict[str, threading.Lock] = {d: threading.Lock() for d in CONNECTOR_DOMAINS}
+        # QuickTime recording slot: process memory ONLY (lost on daemon
+        # restart — safe by design); one recording at a time.
+        self._qt_recording: Optional[Dict[str, str]] = None
         # In-memory mock world (per manager == per server process; tests get a
         # fresh world per manager instance).
         self._mock_lock = threading.Lock()
@@ -1513,6 +1817,33 @@ class ConnectorManager:
             ("marina@imaginaria.test", "2026-11-07"),
             ("+5511922220001", "2026-11-06"),
         ]
+        _desktop = os.path.realpath(os.path.expanduser("~/Desktop"))
+        _downloads = os.path.realpath(os.path.expanduser("~/Downloads"))
+        self._mock_finder = {
+            "folders": {
+                _desktop: ["Relatório.pdf", "Captura de Tela.png", "trabalho"],
+                _downloads: ["Relatório.pdf"],
+            },
+            "items": {
+                os.path.join(_desktop, "Relatório.pdf"): {
+                    "kind": "PDF document", "size": "20480", "extension": "pdf",
+                    "created": "31/10/2026 18:02", "modified": "01/11/2026 09:15",
+                },
+                os.path.join(_desktop, "Captura de Tela.png"): {
+                    "kind": "PNG image", "size": "512000", "extension": "png",
+                    "created": "01/11/2026 08:00", "modified": "01/11/2026 08:00",
+                },
+                os.path.join(_desktop, "trabalho"): {
+                    "kind": "Folder", "size": "", "extension": "",
+                    "created": "30/10/2026 12:00", "modified": "02/11/2026 10:30",
+                },
+                os.path.join(_downloads, "Relatório.pdf"): {
+                    "kind": "PDF document", "size": "1024", "extension": "pdf",
+                    "created": "02/11/2026 10:00", "modified": "02/11/2026 10:00",
+                },
+            },
+        }
+        self._mock_qt_seq = 0
 
     # ---- public API -------------------------------------------------------
 
@@ -1747,6 +2078,18 @@ class ConnectorManager:
         if plan.kind == "split":
             assert plan.post is not None
             return plan.post({"items": _split_delimited(outcome.stdout)})
+        if plan.kind == "finder":
+            # finder move/trash: the frozen scripts RETURN structured refusal
+            # markers on rc-0 stdout (mirrored messages send route); the argv
+            # positions map each marker back to its clean English copy.
+            stdout = (outcome.stdout or "").strip()
+            if stdout == FINDER_DST_DIR_MISSING_MARKER:
+                raise ConnectorError(ERR_FINDER_DST_DIR_MISSING.format(dir=plan.cmd[4]))
+            if stdout == FINDER_DST_EXISTS_MARKER:
+                raise ConnectorError(ERR_FINDER_DST_EXISTS.format(name=plan.cmd[5]))
+            if stdout == FINDER_NOT_FOUND_MARKER:
+                raise ConnectorError(ERR_FINDER_NOT_FOUND.format(path=plan.cmd[3]))
+            return dict(plan.post({})) if plan.post is not None else {"ok": True}
         if plan.kind == "complete":
             return ConnectorManager._parse_complete_stdout(outcome.stdout, plan.complete_query, plan.complete_list)
         if plan.kind == "read":
@@ -1813,6 +2156,10 @@ class ConnectorManager:
             return self._build_contacts(action, params)
         if domain == "messages":
             return self._build_messages(action, params)
+        if domain == "finder":
+            return self._build_finder(action, params)
+        if domain == "quicktime":
+            return self._build_quicktime(action, params)
         return self._build_system(action, params)
 
     def _build_reminders(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
@@ -2238,6 +2585,183 @@ class ConnectorManager:
             )
         )
 
+    def _build_finder(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
+        # File-surface policy: paths are validated server-side against the
+        # allowed roots (expanduser + realpath + prefix compare); trash is
+        # NOT delete (Finder `delete` moves to Trash); no overwrite on move.
+        if action == "list":
+            if params.get("path") in (None, ""):
+                path = os.path.realpath(os.path.expanduser("~/Desktop"))
+            else:
+                path = _resolve_under_allowed_root(
+                    _as_string(params.get("path"), "path", FINDER_PATH_MAX_CHARS), "path"
+                )
+
+            def post(raw: dict, _path: str = path) -> dict:
+                items = raw["items"]
+                if items and items[0] == FINDER_NOT_FOUND_MARKER:
+                    raise ConnectorError(ERR_FINDER_NO_FOLDER.format(path=_path))
+                return {"items": items[:FINDER_LIST_MAX_ITEMS]}
+
+            return _ArgvPlan(
+                ["osascript", "-e", FINDER_LIST, path],
+                kind="split",
+                post=post,
+            )
+        if action == "reveal":
+            path = _resolve_under_allowed_root(
+                _as_string(params.get("path"), "path", FINDER_PATH_MAX_CHARS), "path"
+            )
+
+            def post(raw: dict, _path: str = path) -> dict:
+                del raw
+                return {"ok": True, "path": _path}
+
+            # argv-only (system.open precedent): ["open", "-R", path], no osascript.
+            return _ArgvPlan(["open", "-R", path], kind="ok", post=post)
+        if action == "info":
+            path = _resolve_under_allowed_root(
+                _as_string(params.get("path"), "path", FINDER_PATH_MAX_CHARS), "path"
+            )
+
+            def post(raw: dict, _path: str = path) -> dict:
+                items = raw["items"]
+                if items and items[0] == FINDER_NOT_FOUND_MARKER:
+                    raise ConnectorError(ERR_FINDER_NOT_FOUND.format(path=_path))
+                rows = _chunk_rows(items, ("kind", "size", "extension", "created", "modified"))
+                if not rows:
+                    raise ConnectorError(ERR_FINDER_NOT_FOUND.format(path=_path))
+                return {"info": rows[0]}
+
+            return _ArgvPlan(
+                ["osascript", "-e", FINDER_INFO, path],
+                kind="split_keep",
+                post=post,
+            )
+        if action == "move":
+            _required_params(params, ("src", "dst_dir"))
+            src = _resolve_under_allowed_root(
+                _as_string(params.get("src"), "src", FINDER_PATH_MAX_CHARS), "src"
+            )
+            dst_dir = _resolve_under_allowed_root(
+                _as_string(params.get("dst_dir"), "dst_dir", FINDER_PATH_MAX_CHARS), "dst_dir"
+            )
+            name = os.path.basename(src)
+
+            def post(raw: dict, _src: str = src, _dst_dir: str = dst_dir, _name: str = name) -> dict:
+                del raw
+                return {"ok": True, "moved": True, "from": _src, "to": os.path.join(_dst_dir, _name)}
+
+            return _ArgvPlan(
+                ["osascript", "-e", FINDER_MOVE, src, dst_dir, name],
+                kind="finder",
+                post=post,
+            )
+        if action == "trash":
+            path = _resolve_trash_path(
+                _as_string(params.get("path"), "path", FINDER_PATH_MAX_CHARS)
+            )
+
+            def post(raw: dict, _path: str = path) -> dict:
+                del raw
+                return {"ok": True, "trashed": _path}
+
+            return _ArgvPlan(
+                ["osascript", "-e", FINDER_TRASH, path],
+                kind="finder",
+                post=post,
+            )
+        raise ConnectorError(
+            ERR_UNKNOWN_ACTION.format(
+                domain=domain, action=action, actions=", ".join(CONNECTOR_ACTIONS[domain])
+            )
+        )
+
+    def _build_quicktime(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
+        # Recording slot: ONE at a time (process memory; lost on restart —
+        # safe). start/new_audio refuse a second recording BEFORE the gate.
+        if action == "start_recording":
+            audio = params.get("with_audio")
+            if audio is None:
+                audio = False
+            if not isinstance(audio, bool):
+                raise ConnectorError("'with_audio' must be true or false")
+            if self._qt_recording is not None:
+                raise ConnectorError(
+                    ERR_QT_ALREADY_RECORDING.format(doc_id=self._qt_recording["doc_id"])
+                )
+
+            def post(raw: dict, _audio: bool = audio) -> dict:
+                items = raw["items"]
+                doc_id = items[0] if items else ""
+                self._qt_recording = {"doc_id": doc_id, "kind": "screen"}
+                return {"ok": True, "doc_id": doc_id, "with_audio": _audio}
+
+            return _ArgvPlan(
+                ["osascript", "-e", QUICKTIME_START_SCREEN, "1" if audio else "0"],
+                kind="split_keep",
+                post=post,
+            )
+        if action == "new_audio_recording":
+            if self._qt_recording is not None:
+                raise ConnectorError(
+                    ERR_QT_ALREADY_RECORDING.format(doc_id=self._qt_recording["doc_id"])
+                )
+
+            def post(raw: dict) -> dict:
+                items = raw["items"]
+                doc_id = items[0] if items else ""
+                self._qt_recording = {"doc_id": doc_id, "kind": "audio"}
+                return {"ok": True, "doc_id": doc_id}
+
+            return _ArgvPlan(
+                ["osascript", "-e", QUICKTIME_NEW_AUDIO],
+                kind="split_keep",
+                post=post,
+            )
+        if action == "stop_recording":
+            recording = self._qt_recording
+            if recording is None:
+                raise ConnectorError(ERR_NO_RECORDING)
+            doc_id = recording["doc_id"]
+
+            def post(raw: dict, _doc_id: str = doc_id) -> dict:
+                items = raw["items"]
+                # Release the slot FIRST: saved or doc-gone, the process-side
+                # recording is over either way.
+                self._qt_recording = None
+                if items and items[0] == QUICKTIME_DOC_GONE_MARKER:
+                    raise ConnectorError(ERR_QT_DOC_GONE.format(doc_id=_doc_id))
+                path = items[0] if items else ""
+                return {"ok": True, "path": path}
+
+            return _ArgvPlan(
+                ["osascript", "-e", QUICKTIME_STOP, doc_id],
+                kind="split_keep",
+                post=post,
+            )
+        if action == "play":
+            file_path = _safe_expand_resolved(
+                _as_string(params.get("file"), "file", QUICKTIME_FILE_MAX_CHARS), "file"
+            )
+            if not os.path.isfile(file_path):
+                raise ConnectorError(ERR_QT_PLAY_FILE.format(path=file_path))
+
+            def post(raw: dict, _path: str = file_path) -> dict:
+                del raw
+                return {"ok": True, "path": _path}
+
+            return _ArgvPlan(
+                ["osascript", "-e", QUICKTIME_PLAY, file_path],
+                kind="ok",
+                post=post,
+            )
+        raise ConnectorError(
+            ERR_UNKNOWN_ACTION.format(
+                domain=domain, action=action, actions=", ".join(CONNECTOR_ACTIONS[domain])
+            )
+        )
+
     def _build_shortcuts(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
         # CLI domain: no osascript source — argv lists start with "shortcuts"
         # (mirror of `open` in _build_system). `-i FILE` is intentionally not
@@ -2392,6 +2916,34 @@ class ConnectorManager:
                 ("marina@imaginaria.test", "2026-11-07"),
                 ("+5511922220001", "2026-11-06"),
             ]
+            # FASE 4 seeds (finder + quicktime) — identical to __init__.
+            _desktop = os.path.realpath(os.path.expanduser("~/Desktop"))
+            _downloads = os.path.realpath(os.path.expanduser("~/Downloads"))
+            self._mock_finder = {
+                "folders": {
+                    _desktop: ["Relatório.pdf", "Captura de Tela.png", "trabalho"],
+                    _downloads: ["Relatório.pdf"],
+                },
+                "items": {
+                    os.path.join(_desktop, "Relatório.pdf"): {
+                        "kind": "PDF document", "size": "20480", "extension": "pdf",
+                        "created": "31/10/2026 18:02", "modified": "01/11/2026 09:15",
+                    },
+                    os.path.join(_desktop, "Captura de Tela.png"): {
+                        "kind": "PNG image", "size": "512000", "extension": "png",
+                        "created": "01/11/2026 08:00", "modified": "01/11/2026 08:00",
+                    },
+                    os.path.join(_desktop, "trabalho"): {
+                        "kind": "Folder", "size": "", "extension": "",
+                        "created": "30/10/2026 12:00", "modified": "02/11/2026 10:30",
+                    },
+                    os.path.join(_downloads, "Relatório.pdf"): {
+                        "kind": "PDF document", "size": "1024", "extension": "pdf",
+                        "created": "02/11/2026 10:00", "modified": "02/11/2026 10:00",
+                    },
+                },
+            }
+            self._mock_qt_seq = 0
 
     def _mock_runner(self, cmd: List[str], timeout: float, stdin: Optional[str] = None) -> _Outcome:
         """In-process osascript/CLI replacement: interprets the SAME frozen
@@ -2647,5 +3199,65 @@ class ConnectorManager:
                 for handle, date in self._mock_threads[:lim]:
                     rows3 += [handle, date]
                 return _Outcome(0, _DELIM.join(rows3), "")
+            if script == FINDER_LIST:
+                _folder_path = argv[0] if argv else ""
+                children = self._mock_finder["folders"].get(_folder_path)
+                if children is None:
+                    # Mirror the script: folder coercion of a missing or
+                    # non-folder path errors -> not-found marker.
+                    return _Outcome(0, FINDER_NOT_FOUND_MARKER, "")
+                return _Outcome(0, _DELIM.join(children[:FINDER_LIST_MAX_ITEMS]), "")
+            if script == FINDER_INFO:
+                _item_path = argv[0] if argv else ""
+                _item = self._mock_finder["items"].get(_item_path)
+                if _item is None:
+                    return _Outcome(0, FINDER_NOT_FOUND_MARKER, "")
+                return _Outcome(0, _DELIM.join([
+                    _item["kind"], _item["size"], _item["extension"],
+                    _item["created"], _item["modified"],
+                ]), "")
+            if script == FINDER_MOVE:
+                _src = argv[0] if argv else ""
+                _dst_dir = argv[1] if len(argv) > 1 else ""
+                _name = argv[2] if len(argv) > 2 else ""
+                if _dst_dir not in self._mock_finder["folders"]:
+                    return _Outcome(0, FINDER_DST_DIR_MISSING_MARKER, "")
+                if _name in self._mock_finder["folders"][_dst_dir]:
+                    return _Outcome(0, FINDER_DST_EXISTS_MARKER, "")
+                if _src not in self._mock_finder["items"]:
+                    return _Outcome(0, FINDER_NOT_FOUND_MARKER, "")
+                _parent = os.path.dirname(_src)
+                if _parent in self._mock_finder["folders"] and _name in self._mock_finder["folders"][_parent]:
+                    self._mock_finder["folders"][_parent].remove(_name)
+                self._mock_finder["folders"].setdefault(_dst_dir, []).append(_name)
+                self._mock_finder["items"][os.path.join(_dst_dir, _name)] = self._mock_finder["items"].pop(_src)
+                return _Outcome(0, "moved", "")
+            if script == FINDER_TRASH:
+                _item_path = argv[0] if argv else ""
+                _trashed = self._mock_finder["items"].pop(_item_path, None)
+                if _trashed is None:
+                    return _Outcome(0, FINDER_NOT_FOUND_MARKER, "")
+                _parent = os.path.dirname(_item_path)
+                _name = os.path.basename(_item_path)
+                if _parent in self._mock_finder["folders"] and _name in self._mock_finder["folders"][_parent]:
+                    self._mock_finder["folders"][_parent].remove(_name)
+                return _Outcome(0, "trashed", "")
+            if script == QUICKTIME_START_SCREEN:
+                self._mock_qt_seq += 1
+                return _Outcome(0, "QT-MOCK-%d\n" % self._mock_qt_seq, "")
+            if script == QUICKTIME_NEW_AUDIO:
+                self._mock_qt_seq += 1
+                return _Outcome(0, "QT-MOCK-%d\n" % self._mock_qt_seq, "")
+            # Doc-NAME semantics + doc-gone mirror: a stop whose argv name
+            # matches no current slot document returns the SAME marker the
+            # frozen script returns when the remembered document is gone.
+            if script == QUICKTIME_STOP:
+                _doc_name = argv[0] if argv else ""
+                _rec = self._qt_recording
+                if _rec is None or (_rec.get("doc_id") or "") != _doc_name:
+                    return _Outcome(0, QUICKTIME_DOC_GONE_MARKER + "\n", "")
+                return _Outcome(0, "~/Movies/Screen Recording %s.mov\n" % _doc_name, "")
+            if script == QUICKTIME_PLAY:
+                return _Outcome(0, "0\n", "")
             # Probe scripts (and anything else): trivial success.
             return _Outcome(0, "0", "")

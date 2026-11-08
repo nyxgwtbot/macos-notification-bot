@@ -273,6 +273,8 @@ export interface ConnectorsResponse {
     mail: ConnectorRow;
     contacts: ConnectorRow;
     messages: ConnectorRow;
+    finder: ConnectorRow;
+    quicktime: ConnectorRow;
     system: ConnectorRow;
   };
 }
