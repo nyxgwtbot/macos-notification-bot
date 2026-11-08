@@ -284,6 +284,18 @@ function unescapeForDisplay(s: string): string {
     .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)));
 }
 
+/** Strip display noise (reasoner tags, HTML tags, code fences, bold markers, md headers) from reasoning text. No-op on clean prose. */
+export function sanitizeThinkingDisplay(text: string): string {
+  if (!text) return '';
+  let s = text;
+  s = s.replace(/<\/?(think|answer)>/gi, ''); // reasoner tags
+  s = s.replace(/```[a-zA-Z0-9]*\n?/g, ''); // code fences
+  s = s.replace(/<(?!\/?(think|answer))[a-zA-z][a-zA-Z0-9-]*(\s[^<>]*)?>/g, ''); // literal HTML tags (keep <answer>/think handled above; never strip '<' not starting a tag, e.g. '< 10')
+  s = s.replace(/\*\*/g, ''); // bold markers
+  s = s.replace(/^#{1,6}\s+/gm, ''); // md headers
+  return s;
+}
+
 /** Smoothed single-line progress preview for a collapsed Thinking block. */
 export function smoothProgressPreview(raw: string): string {
   const tail = raw ?? '';
@@ -295,10 +307,10 @@ export function smoothProgressPreview(raw: string): string {
     const ans = typeof obj?.answer === 'string' ? obj.answer : null;
     if (ans && ans.trim()) {
       const s = unescapeForDisplay(ans.trim());
-      return s.length > 140 ? '…' + s.slice(-140) : s;
+      return sanitizeThinkingDisplay(s.length > 140 ? '…' + s.slice(-140) : s);
     }
     const tool = typeof obj?.tool === 'string' ? obj.tool : null;
-    if (tool) return `Prepared tool ${tool}`;
+    if (tool) return sanitizeThinkingDisplay(`Prepared tool ${tool}`);
   } catch {
     // Partial or multi-part tail: fall through to regex matching below.
   }
@@ -309,12 +321,12 @@ export function smoothProgressPreview(raw: string): string {
   while ((m = re.exec(tail)) !== null) last = m;
   if (last) {
     const s = unescapeForDisplay(last[1]);
-    return s.length > 140 ? '…' + s.slice(-140) : s;
+    return sanitizeThinkingDisplay(s.length > 140 ? '…' + s.slice(-140) : s);
   }
   // Prefer an in-stream tool call name being written.
   const t = /"tool"\s*:\s*"([^"]{0,40})/.exec(tail);
-  if (t) return `Preparing tool ${t[1]}…`;
-  return tail; // raw tail as-is (compact JSON or thinking text)
+  if (t) return sanitizeThinkingDisplay(`Preparing tool ${t[1]}…`);
+  return sanitizeThinkingDisplay(tail); // raw tail as-is (compact JSON or thinking text)
 }
 
 /** One collapsible tool-activity group for a turn's steps, ids scoped to the

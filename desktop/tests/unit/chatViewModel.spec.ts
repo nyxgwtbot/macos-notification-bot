@@ -11,6 +11,7 @@ import {
   isIpcTimeout,
   readStoredDraft,
   reduceChat,
+  sanitizeThinkingDisplay,
   smoothProgressPreview,
   toToolChip,
   toolSummaryFromChips,
@@ -732,6 +733,15 @@ describe('smoothProgressPreview', () => {
   test('preserves escaped quotes inside the in-progress answer', () => {
     expect(smoothProgressPreview('{"answer": "He said \\"hi')).toBe('He said \\"hi');
   });
+
+  test('complete-JSON answer is parsed first, then sanitized (chain order)', () => {
+    // </b> residue is intentional spec-verbatim behavior (the tag regex only strips opening tags).
+    expect(smoothProgressPreview('{"answer":"## Plan\\nUse <b>grep</b>"}')).toBe('Plan\nUse grep</b>');
+  });
+
+  test('raw-tail fallback is sanitized for html/markdown payloads', () => {
+    expect(smoothProgressPreview('partial **bold** and <div>noise')).toBe('partial bold and noise');
+  });
 });
 
 // ---- live turn-progress reducer ------------------------------------------
@@ -957,5 +967,46 @@ describe('turn-progress live item', () => {
     expect(state.items[1].kind).toBe('tools');
     expect(state.pending).toBe(false);
     expect(state.error).toBeNull();
+  });
+});
+
+// ---- sanitizeThinkingDisplay ----
+describe('sanitizeThinkingDisplay', () => {
+  test('strips think/answer stream tags case-insensitively', () => {
+    expect(sanitizeThinkingDisplay('<think>okay')).toBe('okay');
+    expect(sanitizeThinkingDisplay('<answer>okay')).toBe('okay');
+    expect(sanitizeThinkingDisplay('ANSWER: done')).toBe('ANSWER: done');
+    expect(sanitizeThinkingDisplay('</think>ok')).toBe('ok');
+    expect(sanitizeThinkingDisplay('<THINK>okay')).toBe('okay');
+  });
+
+  test('strips code fence lines (```json and bare ```, with or without trailing newline)', () => {
+    expect(sanitizeThinkingDisplay('Use JSON:\n```json\n{"a":1}\n```\ndone')).toBe('Use JSON:\n{"a":1}\ndone');
+    expect(sanitizeThinkingDisplay('```\ncode')).toBe('code');
+  });
+
+  test('strips literal html tags but keeps not-tag comparisons like < 10', () => {
+    expect(sanitizeThinkingDisplay('<div>noise and <span class="x">tag')).toBe('noise and tag');
+    expect(sanitizeThinkingDisplay('if a < 10 then b')).toBe('if a < 10 then b');
+  });
+
+  test('strips **bold** and ## md headers, keeps *italic*', () => {
+    expect(sanitizeThinkingDisplay('**text**')).toBe('text');
+    expect(sanitizeThinkingDisplay('## Heading')).toBe('Heading');
+    expect(sanitizeThinkingDisplay('*italic* stays')).toBe('*italic* stays');
+  });
+
+  test('returns empty string for empty input', () => {
+    expect(sanitizeThinkingDisplay('')).toBe('');
+  });
+
+  test('cleans a messy reasoning sample into prose, preserving bullets, urls and numbers', () => {
+    expect(
+      sanitizeThinkingDisplay(
+        '<answer>\n## Plan\nUse **grep** for <b>search\n- bullet one\n- bullet two\nsee http://example.com/x\nif a < 10 ok'
+      )
+    ).toBe(
+      '\nPlan\nUse grep for search\n- bullet one\n- bullet two\nsee http://example.com/x\nif a < 10 ok'
+    );
   });
 });
