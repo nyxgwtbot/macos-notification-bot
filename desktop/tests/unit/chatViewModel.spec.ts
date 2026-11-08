@@ -5,6 +5,7 @@ import {
   extractToolTarget,
   formatBubbleTime,
   formatTurnElapsed,
+  friendlyThinking,
   formatTurnPhase,
   iframeUrlFrom,
   initialChatState,
@@ -1008,5 +1009,75 @@ describe('sanitizeThinkingDisplay', () => {
     ).toBe(
       '\nPlan\nUse grep for search\n- bullet one\n- bullet two\nsee http://example.com/x\nif a < 10 ok'
     );
+  });
+});
+
+// ---- friendlyThinking ----
+describe('friendlyThinking', () => {
+  test('live sample: complete JSON answer renders the decoded answer text only', () => {
+    const live =
+      'Verificando eventos do bot... action needed. According to the protocol, I should respond with a JSON object of the answer shape, in Brazilian Portuguese. '
+      + '{"answer": "Oi! 👋 Eu sou o assistente do NotifyDesk. Posso te ajudar a gerar dashboards dos dados do bot, verificar eventos e resumo financeiro...", "urls": []}';
+    const out = friendlyThinking(live);
+    expect(out).toBe('Oi! 👋 Eu sou o assistente do NotifyDesk. Posso te ajudar a gerar dashboards dos dados do bot, verificar eventos e resumo financeiro...');
+    expect(out).not.toContain('{"');
+    expect(out).not.toContain('"urls"');
+    expect(out).not.toContain('respond with a JSON');
+    expect(out).not.toContain('protocol');
+    expect(out).not.toContain('answer shape');
+  });
+
+  test('partial stream: unterminated answer shows the text so far, no braces', () => {
+    const out = friendlyThinking('{"answer": "Oi! 👋 Eu sou o assist');
+    expect(out).toBe('Oi! 👋 Eu sou o assist');
+    expect(out).not.toContain('{');
+    expect(out).not.toContain('}');
+  });
+
+  test('partial stream after prose: answer grows, protocol prose dropped', () => {
+    const out = friendlyThinking('According to the protocol, I should respond with a JSON object of the answer shape. {"answer": "Oi! 👋 Eu sou o assist');
+    expect(out).toBe('Oi! 👋 Eu sou o assist');
+    expect(out).not.toContain('protocol');
+    expect(out).not.toContain('{');
+  });
+
+  test('pure natural reasoning with no JSON and no protocol mention is kept (sanitized)', () => {
+    expect(
+      friendlyThinking('Consigo gerar dashboards dos dados do bot. Vou verificar os eventos e o resumo financeiro.'),
+    ).toBe('Consigo gerar dashboards dos dados do bot. Vou verificar os eventos e o resumo financeiro.');
+  });
+
+  test('protocol sentence without JSON is stripped entirely, remaining reasoning kept', () => {
+    expect(
+      friendlyThinking(
+        'According to the protocol, I should respond with a JSON object of the answer shape, in Brazilian Portuguese. Vou verificar os dados do bot agora.',
+      ),
+    ).toBe('Vou verificar os dados do bot agora.');
+  });
+
+  test('decodes escaped newlines inside the answer string', () => {
+    expect(friendlyThinking('{"answer": "Oi!\\nTudo bem?"}')).toBe('Oi!\nTudo bem?');
+  });
+
+  test('unwraps escaped quotes inside the answer string', () => {
+    expect(friendlyThinking('{"answer": "Diz \\"ola\\" e depois sair"}')).toBe('Diz "ola" e depois sair');
+  });
+
+  test('tool-call tail renders friendly copy, not parameters', () => {
+    expect(friendlyThinking('{"tool": "app.data"}')).toBe('Prepared tool app.data');
+    expect(friendlyThinking('{"tool": "query_da')).toBe('Preparing tool query_da…');
+  });
+
+  test('caps the display to the last 400 chars with … prefix', () => {
+    const body = 'x'.repeat(420);
+    const out = friendlyThinking(`{"answer": "${body}!fim"}`);
+    expect(out).toBe('…' + (body + '!fim').slice(-400));
+    expect(out.startsWith('…')).toBe(true);
+    expect(out.length).toBe(401);
+  });
+
+  test('empty and whitespace-only input return an empty string', () => {
+    expect(friendlyThinking('')).toBe('');
+    expect(friendlyThinking('   ')).toBe('');
   });
 });

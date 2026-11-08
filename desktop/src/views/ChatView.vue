@@ -104,7 +104,7 @@
                         :icon="chevronDownOutline"
                       />
                       <span>Thinking</span>
-                      <span class="nb-thinking-preview-inline">{{ smoothProgressPreview(item.thinking) }}</span>
+                      <span class="nb-thinking-preview-inline">{{ friendlyThinking(item.thinking) }}</span>
                     </button>
                     <button
                       type="button"
@@ -115,7 +115,7 @@
                       <ion-icon aria-hidden="true" :icon="copiedThinking.has(item.id) ? checkmarkOutline : copyOutline" />
                     </button>
                   </div>
-                  <pre v-show="expandedThinking.has(item.id)" :id="`nb-thinking-${item.id}`" class="nb-thinking-pre">{{ item.thinking }}</pre>
+                  <pre v-show="expandedThinking.has(item.id)" :id="`nb-thinking-${item.id}`" class="nb-thinking-pre">{{ friendlyThinking(item.thinking) }}</pre>
                 </div>
               </div>
 
@@ -181,7 +181,7 @@
                         :icon="chevronDownOutline"
                       />
                       <span>Thinking</span>
-                      <span class="nb-thinking-preview-inline">{{ smoothProgressPreview(item.rawPartial) }}</span>
+                      <span class="nb-thinking-preview-inline">{{ friendlyThinking(item.rawPartial) }}</span>
                     </button>
                     <button
                       type="button"
@@ -192,7 +192,7 @@
                       <ion-icon aria-hidden="true" :icon="copiedThinking.has(item.id) ? checkmarkOutline : copyOutline" />
                     </button>
                   </div>
-                  <pre v-show="expandedThinking.has(item.id)" :id="`nb-thinking-${item.id}`" class="nb-thinking-pre">{{ item.rawPartial }}</pre>
+                  <pre v-show="expandedThinking.has(item.id)" :id="`nb-thinking-${item.id}`" class="nb-thinking-pre">{{ friendlyThinking(item.rawPartial) }}</pre>
                 </div>
               </div>
 
@@ -249,7 +249,7 @@
                         :icon="chevronDownOutline"
                       />
                       <span>Thinking</span>
-                      <span class="nb-thinking-preview-inline">{{ smoothProgressPreview(item.thinking) }}</span>
+                      <span class="nb-thinking-preview-inline">{{ friendlyThinking(item.thinking) }}</span>
                     </button>
                     <button
                       type="button"
@@ -260,7 +260,7 @@
                       <ion-icon aria-hidden="true" :icon="copiedThinking.has(item.id) ? checkmarkOutline : copyOutline" />
                     </button>
                   </div>
-                  <pre v-show="expandedThinking.has(item.id)" :id="`nb-thinking-${item.id}`" class="nb-thinking-pre">{{ item.thinking }}</pre>
+                  <pre v-show="expandedThinking.has(item.id)" :id="`nb-thinking-${item.id}`" class="nb-thinking-pre">{{ friendlyThinking(item.thinking) }}</pre>
                 </div>
               </div>
             </template>
@@ -413,11 +413,11 @@ import {
   clearStoredDraft,
   formatBubbleTime,
   formatTurnElapsed,
+  friendlyThinking,
   initialChatState,
   isIpcTimeout,
   readStoredDraft,
   reduceChat,
-  smoothProgressPreview,
   toolSummaryFromChips,
   turnFailedErrorText,
   writeStoredDraft,

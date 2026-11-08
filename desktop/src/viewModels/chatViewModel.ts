@@ -329,6 +329,53 @@ export function smoothProgressPreview(raw: string): string {
   return sanitizeThinkingDisplay(tail); // raw tail as-is (compact JSON or thinking text)
 }
 
+const FRIENDLY_THINKING_MAX_CHARS = 400;
+
+/** Owner-friendly thinking display: renders the model's answer text when the stream tail embeds a JSON answer payload (complete or mid-write), otherwise the natural-language reasoning minus output-format meta-instructions. Never shows raw JSON, tags, or parameters. */
+export function friendlyThinking(raw: string): string {
+  const tail = raw ?? '';
+  if (!tail.trim()) return '';
+  // 1. Complete answer: a closing-quoted "answer" string anywhere in the text.
+  const full = /"answer"\s*:\s*"((?:[^"\\]|\\.)*)"(\s*,\s*"urls")?/g;
+  let m: RegExpExecArray | null;
+  let lastFull: RegExpExecArray | null = null;
+  while ((m = full.exec(tail)) !== null) lastFull = m;
+  const fullAnswer = lastFull ? decodeAnswerValue(lastFull[1]) : '';
+  if (fullAnswer.trim()) return capFriendlyDisplay(fullAnswer);
+  // 2. Unterminated answer (stream mid-write): partial text so far — it grows on the next tick.
+  const open = /"answer"\s*:\s*"((?:[^"\\]|\\.)*)/g;
+  let om: RegExpExecArray | null;
+  let lastOpen: RegExpExecArray | null = null;
+  while ((om = open.exec(tail)) !== null) lastOpen = om;
+  if (lastOpen) return capFriendlyDisplay(decodeAnswerValue(lastOpen[1]));
+  // 3. Tool-call tail without an answer payload — keep parameters out of the display.
+  const closedTool = /"tool"\s*:\s*"([^"]*)"/.exec(tail);
+  if (closedTool) return capFriendlyDisplay(sanitizeThinkingDisplay(`Prepared tool ${closedTool[1]}`));
+  const openTool = /"tool"\s*:\s*"([^"]{0,40})/.exec(tail);
+  if (openTool) return capFriendlyDisplay(sanitizeThinkingDisplay(`Preparing tool ${openTool[1]}…`));
+  // 4. No answer payload: natural-language reasoning, sanitised, minus output-format meta-sentences.
+  return capFriendlyDisplay(sanitizeThinkingDisplay(stripMetaSentences(tail)));
+}
+
+function decodeAnswerValue(encoded: string): string {
+  // JSON-string unescape: literal escapes (e.g. \n, \uXXXX via unescapeForDisplay) + \" -> "
+  return unescapeForDisplay(encoded.replace(/\\"/g, '"'));
+}
+
+function stripMetaSentences(text: string): string {
+  // Sentences that are meta-instructions about the required output format are never thinking content.
+  const meta = /\b(protocol|respond with a JSON|answer shape)\b/i;
+  return text
+    .split(/(?<=[.!?])\s+|\n+/)
+    .filter((sentence) => !meta.test(sentence))
+    .join(' ')
+    .trim();
+}
+
+function capFriendlyDisplay(text: string): string {
+  return text.length > FRIENDLY_THINKING_MAX_CHARS ? '…' + text.slice(-FRIENDLY_THINKING_MAX_CHARS) : text;
+}
+
 /** One collapsible tool-activity group for a turn's steps, ids scoped to the
  * group so they stay unique across turns. `thinking` carries the turn's
  * collapsible model output when present. */
