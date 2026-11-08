@@ -81,6 +81,11 @@ Domain/action whitelist (server-side enforced; unknown pairs are rejected):
 | music | play_playlist | `{"name"}` (exact playlist name) | `{ok, playlist}` |
 | music | search_store | `{"query"}` (top 5 store results) | `{results: [{name, artist, album}, ...]}` |
 | music | volume | `{}` to read, or `{"level": 0-100}` (Music app volume, not system) | `{level}` / `{ok, level}` |
+| shortcuts | list | `{}` (no consent needed — runs via the system CLI) | `{names: ["Resumo da semana", ...]}` |
+| shortcuts | run | `{"name"}` (EXACT shortcut name; an unknown name raises an error; optional `{"input_text"}` + `{"stdin": "text"}` — the text rides stdin) | `{output, exit_code}` |
+| mail | unread_count | `{"mailbox?", "account?"}` (empty mailbox = INBOX of every account; gated — connect in Settings first; read-only, no bodies; destructive ops are not available) | `{unread}` |
+| mail | mailboxes | `{}` | `{mailboxes: ["INBOX", ...]}` |
+| mail | list_recent | `{"mailbox?", "count?"}` (count 1-20, default 20) | `{messages: [{subject, from, received}, ...]}` |
 | system | volume | `{}` to read, or `{"level": 0-100}` to set | `{level}` / `{ok, level}` |
 | system | front_app | `{}` | `{app}` |
 | system | open | `{"target"}` (http(s) URL, or an app name) | `{ok, target}` |

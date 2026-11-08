@@ -12,12 +12,12 @@ source (no f-strings, no shell, no ``run script`` of dynamic text). List
 outputs are joined in-script with ``ASCII character 31`` and split here —
 never comma-split.
 
-Consent model (TCC): reminders/notes/calendar/music actions require ``granted`` state, which
-is produced by ``probe()`` (fired from Settings › Connectors) or self-healed
-by a successful action. Actions that come back denied persist ``denied`` and
-raise the PT-BR consent error. ``system`` is ungated (no consent). Probes are
-single-flight per domain; concurrent probes raise ``ProbeBusy`` (API maps to
-409).
+Consent model (TCC): reminders/notes/calendar/music/mail actions require
+``granted`` state, which is produced by ``probe()`` (fired from Settings ›
+Connectors) or self-healed by a successful action. Actions that come back
+denied persist ``denied`` and raise the PT-BR consent error. ``system`` and
+``shortcuts`` (system CLI) are ungated (no consent). Probes are single-flight
+per domain; concurrent probes raise ``ProbeBusy`` (API maps to 409).
 
 Deferred domains (v1 documentation table — NOT rows of GET /api/connectors;
 zero secrets involved; each is read-sensitive and needs its own design pass):
@@ -25,7 +25,7 @@ zero secrets involved; each is read-sensitive and needs its own design pass):
 ==============  =========================  ==================================
 Domain          Example actions            Why deferred to v2
 ==============  =========================  ==================================
-mail            read unread count          read-sensitive mailbox access
+mail            unread/mailboxes/recent    implemented in v1 (read-level-1)
 contacts        list/search people         PII; heavier consent story
 messages        list recent threads        most PII-rich surface on macOS
 findmy          locate devices             location + privacy escalation
@@ -47,8 +47,10 @@ Outcome classification (actions and probes share it):
                                                         stderr (English)
 
 Mock hook: with env ``NOTIFYBOT_CONNECTORS_MOCK=1`` the runner seam executes a
-per-process in-memory world (reminders lists, notes, calendar events, music state, volume, front app, toasts)
-so smokes exercise add->list observability and the endpoints WITHOUT osascript.
+per-process in-memory world (reminders lists, notes, calendar events, music
+state, volume, front app, toasts, shortcut names, mail unread/mailbox/recent
+fixtures) so smokes exercise add->list observability and the endpoints WITHOUT
+osascript.
 """
 
 import json
@@ -66,7 +68,9 @@ from notifybot.agent_tools import _write_atomic
 # ---------------------------------------------------------------------------
 
 #: Domains exposed by native.call in v1 (order == GET /api/connectors row order).
-CONNECTOR_DOMAINS: Tuple[str, ...] = ("reminders", "notes", "calendar", "music", "system")
+CONNECTOR_DOMAINS: Tuple[str, ...] = (
+    "reminders", "notes", "calendar", "music", "shortcuts", "mail", "system"
+)
 
 #: Whitelist: the only (domain, action) pairs dispatch accepts.
 CONNECTOR_ACTIONS: Dict[str, Tuple[str, ...]] = {
@@ -74,15 +78,20 @@ CONNECTOR_ACTIONS: Dict[str, Tuple[str, ...]] = {
     "notes": ("search", "read", "create"),
     "calendar": ("list_calendars", "list_events", "add_event", "delete_event"),
     "music": ("status", "play", "pause", "next", "previous", "play_playlist", "search_store", "volume"),
+    "shortcuts": ("list", "run"),
+    "mail": ("unread_count", "mailboxes", "list_recent"),
     "system": ("volume", "front_app", "open", "toast"),
 }
 
 #: Domains that require granted consent state before ANY action runs
 #: (AppleScript automation of these apps triggers macOS TCC consent).
-GATED_DOMAINS: Tuple[str, ...] = ("reminders", "notes", "calendar", "music")
+GATED_DOMAINS: Tuple[str, ...] = ("reminders", "notes", "calendar", "music", "mail")
 
 #: Hard per-call timeout (also enforced by subprocess.run's timeout kwarg).
 CONNECTORS_TIMEOUT_S = 8.0
+
+#: Shortcuts CLI can cold-start slower than osascript (mission: 10s).
+SHORTCUTS_TIMEOUT_S = 10.0
 
 #: Env var that swaps the osascript runner for the in-process mock world.
 CONNECTORS_MOCK_ENV = "NOTIFYBOT_CONNECTORS_MOCK"
@@ -97,6 +106,13 @@ LIST_NAME_MAX_CHARS = 256
 QUERY_MAX_CHARS = 256
 DATERANGE_MAX_DAYS = 30
 DATERANGE_DEFAULT_DAYS = 7
+
+#: Shortcuts bridge caps: run-stdout tail (bytes) and piped input text (chars).
+SHORTCUTS_OUTPUT_MAX_BYTES = 4096
+SHORTCUTS_INPUT_MAX_CHARS = 512
+
+#: Mail list_recent cap: 1..20 rows (above the cap ERRORS — _as_days precedent).
+MAIL_LIST_MAX_COUNT = 20
 
 #: In-script list delimiter: ASCII character 31 (unit separator). AppleScript
 #: joins list results with it; Python splits on the same byte below.
@@ -118,20 +134,25 @@ HINT_DENIED = (
     "approve the prompt while this app is focused."
 )
 HINT_UNKNOWN = HINT_NEEDS_CONSENT
+HINT_SHORTCUTS = (
+    "Shortcuts run through the system CLI — no consent needed. A shortcut may "
+    "touch apps that ask for their own permission."
+)
 
 # `open` target validation (system.open runs ["open", ...], never osascript).
 _URL_TARGET_RE = re.compile(r"^https?://")
 _APP_TARGET_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,64}$")
 
 # English (ToolFailure-style) whitelist/validation error strings.
-ERR_UNKNOWN_DOMAIN = "unknown domain: {domain!r} (valid: reminders, notes, calendar, music, system)"
+ERR_UNKNOWN_DOMAIN = "unknown domain: {domain!r} (valid: reminders, notes, calendar, music, shortcuts, mail, system)"
 ERR_UNKNOWN_ACTION = "unknown action {action!r} for domain {domain!r} (valid: {actions})"
 ERR_PARAMS_DICT = "params must be a JSON object"
 
 # Display names used inside PT-BR user-facing error strings.
 _DISPLAY_NAMES: Dict[str, str] = {
     "reminders": "Reminders", "notes": "Notes", "calendar": "Calendar",
-    "music": "Music", "system": "System",
+    "music": "Music", "shortcuts": "Shortcuts", "mail": "Mail",
+    "system": "System",
 }
 
 # Structured in-script error marker: NOTES_CREATE raises this AppleScript error
@@ -139,6 +160,15 @@ _DISPLAY_NAMES: Dict[str, str] = {
 # classifier maps it to the PT-BR "set up an account first" tool error. The
 # literal lives ONLY in the frozen script + this constant (kept in sync).
 NO_ACCOUNT_MARKER = "connectors-no-notes-account"
+
+# Mail structured in-script markers: the MAIL_* scripts RETURN these literals
+# on rc-0 stdout (mirroring the "not_found" stdout convention above — NOT the
+# stderr route NOTES_CREATE takes), so they are parsed on the success path.
+# The Python parsers (see _raise_if_mail_marker) map them to the clean
+# user-facing copies; the literals live ONLY in the frozen scripts + these
+# constants (kept in sync).
+MAIL_MISSING_MAILBOX_MARKER = "connectors-mail-missing-mailbox"
+MAIL_ERROR_MARKER = "connectors-mail-error"
 
 # ---------------------------------------------------------------------------
 # Static AppleScript sources — FROZEN constants; the ONLY input channel is
@@ -561,6 +591,113 @@ on run argv
 end run
 """
 
+# Mail read-level-1 scripts. All outputs are STRING-ONLY (character id 31
+# delimiters — same grammar as CALENDAR_LIST_EVENTS). Structured failures are
+# RETURNED as stdout markers (see _raise_if_mail_marker): a named account that
+# does not exist returns the NO_ACCOUNT_MARKER literal, a named mailbox that
+# matches ZERO mailboxes across the scanned accounts returns the
+# MAIL_MISSING_MAILBOX_MARKER literal, any other AppleScript error the
+# MAIL_ERROR_MARKER literal (rc 0) — EXCEPT TCC denials (-1743), which are
+# re-raised so they classify as consent problems. A named mailbox that EXISTS
+# in some but not all accounts is NOT an error (mailboxFound short-circuits
+# the marker: partial presence counts normally). Read-level-1 fields only:
+# unread counts, mailbox names, subject/sender/received date. NO bodies, NO
+# send/delete/save/move (intentionally unimplemented — see module docstring).
+MAIL_UNREAD_COUNT = """
+on run {mailboxArg, accountArg}
+	set unreadTotal to 0
+	set mailboxFound to false
+	tell application id "com.apple.mail"
+		try
+			set targetAccounts to every account
+			if accountArg is not "" then
+				set namedAccounts to every account whose name is accountArg
+				if (count of namedAccounts) is 0 then return "connectors-no-notes-account"
+				set targetAccounts to namedAccounts
+			end if
+			repeat with acct in targetAccounts
+				if mailboxArg is "" then
+					set sourceMailboxes to every mailbox of acct whose name is "INBOX"
+				else
+					set sourceMailboxes to every mailbox of acct whose name is mailboxArg
+					if (count of sourceMailboxes) is greater than 0 then set mailboxFound to true
+				end if
+				repeat with mbx in sourceMailboxes
+					set unreadTotal to unreadTotal + (count of (messages of mbx whose read status is false))
+				end repeat
+			end repeat
+			if mailboxArg is not "" and not mailboxFound then return "connectors-mail-missing-mailbox"
+			return (unreadTotal as text)
+		on error errorMessage number errorNumber
+			if errorNumber is -1743 then error number -1743
+			return "connectors-mail-error"
+		end try
+	end tell
+end run
+"""
+
+MAIL_MAILBOXES = """
+tell application id "com.apple.mail"
+	try
+		set mailboxNames to {}
+		repeat with acct in every account
+			repeat with mbx in every mailbox of acct
+				set end of mailboxNames to name of mbx
+			end repeat
+		end repeat
+		set AppleScript's text item delimiters to character id 31
+		return mailboxNames as text
+	on error errorMessage number errorNumber
+		if errorNumber is -1743 then error number -1743
+		return "connectors-mail-error"
+	end try
+end tell
+"""
+
+MAIL_LIST_RECENT = """
+on run {mailboxArg, limitArg}
+	set limitCount to limitArg as integer
+	set mailboxFound to false
+	set collectedMessages to {}
+	tell application id "com.apple.mail"
+		try
+			repeat with acct in every account
+				if mailboxArg is "" then
+					set sourceMailboxes to every mailbox of acct whose name is "INBOX"
+				else
+					set sourceMailboxes to every mailbox of acct whose name is mailboxArg
+					if (count of sourceMailboxes) is greater than 0 then set mailboxFound to true
+				end if
+				repeat with mbx in sourceMailboxes
+					set availableMessages to messages of mbx
+					if (count of availableMessages) > 0 then
+						set takeCount to limitCount - (count of collectedMessages)
+						if takeCount > (count of availableMessages) then set takeCount to (count of availableMessages)
+						if takeCount > 0 then
+							repeat with msg in items 1 through takeCount of availableMessages
+								set end of collectedMessages to {(subject of msg) as text, (sender of msg) as text, (date received of msg) as text}
+							end repeat
+						end if
+					end if
+				end repeat
+			end repeat
+			if mailboxArg is not "" and not mailboxFound then return "connectors-mail-missing-mailbox"
+			set rowItems to {}
+			repeat with msgRef in collectedMessages
+				set end of rowItems to item 1 of msgRef
+				set end of rowItems to item 2 of msgRef
+				set end of rowItems to item 3 of msgRef
+			end repeat
+			set AppleScript's text item delimiters to character id 31
+			return rowItems as text
+		on error errorMessage number errorNumber
+			if errorNumber is -1743 then error number -1743
+			return "connectors-mail-error"
+		end try
+	end tell
+end run
+"""
+
 #: Static script source per (domain, action) — the model can never influence
 #: these bytes; its strings ride strictly in argv. (system.volume splits into
 #: get/set script variants at argv-build time.)
@@ -585,6 +722,9 @@ SCRIPTS: Dict[Tuple[str, str], str] = {
     ("music", "search_store"): MUSIC_SEARCH_STORE,
     ("music", "volume"): MUSIC_VOLUME_GET,
     ("music", "volume_set"): MUSIC_VOLUME_SET,
+    ("mail", "unread_count"): MAIL_UNREAD_COUNT,
+    ("mail", "mailboxes"): MAIL_MAILBOXES,
+    ("mail", "list_recent"): MAIL_LIST_RECENT,
     ("system", "volume"): SYSTEM_VOLUME_GET,
     ("system", "volume_set"): SYSTEM_VOLUME_SET,
     ("system", "front_app"): SYSTEM_FRONT_APP,
@@ -631,17 +771,36 @@ on run argv
 	end tell
 end run
 """,
+    # Mail: trivial consented touch — account/mailbox counting proves the
+    # automation consent; output content is not consumed by classification.
+    # (Real-Mac grammar, sandbox-unverifiable: "count unregistered accounts".)
+    "mail": """
+tell application id "com.apple.mail"
+	try
+		return ((count unregistered accounts) as text) & "," & ((count of mailboxes of account 1) as text)
+	on error errorMessage number errorNumber
+		if errorNumber is -1743 then error number -1743
+		return "0,0"
+	end try
+end tell
+""",
     # system needs no consent; the volume read is a harmless osascript sanity probe.
     "system": SYSTEM_VOLUME_GET,
 }
 
+# CLI-based probes (no osascript): prove CLI availability by exit code.
+# Consumed by probe() BEFORE the hardcoded ["osascript", "-e", script] path.
+PROBE_COMMANDS: Dict[str, List[str]] = {"shortcuts": ["shortcuts", "list"]}
+
 # Bundle ids keep the scripts immune to pt-BR app-name localization. (system's
-# front_app touches System Events; volume uses scripting additions only.)
+# front_app touches System Events; volume uses scripting additions only;
+# shortcuts is a CLI domain with no app id.)
 BUNDLE_IDS: Dict[str, str] = {
     "reminders": "com.apple.reminders",
     "notes": "com.apple.Notes",
     "calendar": "com.apple.iCal",
     "music": "com.apple.Music",
+    "mail": "com.apple.mail",
     "system": "com.apple.systemevents",
 }
 
@@ -668,9 +827,10 @@ class _Outcome(NamedTuple):
     stderr: str
 
 
-def _default_runner(cmd: List[str], timeout: float) -> Any:
-    """Production osascript bridge: list-form argv (no shell, ever)."""
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+def _default_runner(cmd: List[str], timeout: float, stdin: Optional[str] = None) -> Any:
+    """Production bridge (osascript/open/shortcuts CLI): list-form argv (no
+    shell, ever). stdin text rides subprocess input= (shortcuts -x)."""
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=stdin)
 
 
 def _is_denial_stderr(stderr: str) -> bool:
@@ -682,6 +842,30 @@ def _is_denial_stderr(stderr: str) -> bool:
 def _split_delimited(stdout: str) -> List[str]:
     """Split a delimiter-joined script result; empty strings dropped."""
     return [item for item in (stdout or "").split(_DELIM) if item != ""]
+
+
+def _split_lines(stdout: str) -> List[str]:
+    """Split CLI stdout into non-empty stripped lines (shortcuts list)."""
+    return [line.strip() for line in (stdout or "").split("\n") if line.strip()]
+
+
+def _raise_if_mail_marker(stdout: str) -> None:
+    """Map the frozen mail scripts' stdout markers (rc 0 — the scripts RETURN
+    them instead of raising, mirroring the music "not_found" stdout
+    convention) to clean user-facing errors. Equality-after-strip: an email
+    subject that merely CONTAINS a marker token can never false-positive."""
+    text = (stdout or "").strip()
+    if text == MAIL_MISSING_MAILBOX_MARKER:
+        raise ConnectorError(
+            'Mailbox não encontrada — use a ação "mailboxes" para ver os nomes '
+            "disponíveis."
+        )
+    if text == MAIL_ERROR_MARKER:
+        raise ConnectorError("Mail action failed: unexpected AppleScript error.")
+    if text == NO_ACCOUNT_MARKER:
+        raise ConnectorError(
+            "Nenhuma conta configurada — configure uma conta no Mail primeiro."
+        )
 
 
 def _truncate_bytes(text: str, cap: int) -> str:
@@ -712,6 +896,16 @@ def _parse_count_stdout(stdout: str) -> int:
         return int((stdout or "").strip())
     except ValueError:
         raise ConnectorError("delete count was not an integer (osascript output changed)") from None
+
+
+def _parse_unread_stdout(stdout: str) -> int:
+    """Mail unread_count stdout: marker guard + integer (read-level-1 count)."""
+    text = (stdout or "").strip()
+    _raise_if_mail_marker(text)
+    try:
+        return int(text)
+    except ValueError:
+        raise ConnectorError("unread count was not an integer (osascript output changed)") from None
 
 
 def _parse_status_stdout(stdout: str) -> dict:
@@ -982,15 +1176,20 @@ def _body_bytes_cap(value: Any, field: str) -> str:
 
 class _ArgvPlan(NamedTuple):
     """A fully validated native.call invocation: the exact command list plus
-    how to normalize the runner's stdout into the tool result."""
+    how to normalize the runner's stdout into the tool result. The trailing
+    ``timeout``/``stdin`` fields default safely (existing constructions never
+    pass positional extras); CLI domains (shortcuts) override the timeout and
+    pipe validated text through the runner's stdin channel."""
 
     cmd: List[str]
-    kind: str = "ok"  # ok | split | complete | read | raw | level_get | level_set | playlist | count | status
+    kind: str = "ok"  # ok | split | complete | read | raw | level_get | level_set | playlist | count | status | unread | shortcuts_list | shortcuts_run
     post: Optional[Callable[[dict], dict]] = None
     complete_list: str = ""
     complete_query: str = ""
     read_name: str = ""
     playlist_name: str = ""
+    timeout: float = CONNECTORS_TIMEOUT_S
+    stdin: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1005,7 +1204,7 @@ class ConnectorManager:
     reference so ``native.call`` never rebuilds it).
     """
 
-    _Runner = Callable[[List[str], float], Any]
+    _Runner = Callable[[List[str], float, Optional[str]], Any]
 
     def __init__(self, config_dir: str, runner: Optional[_Runner] = None):
         self.config_dir = config_dir
@@ -1014,7 +1213,7 @@ class ConnectorManager:
         # mock world when NOTIFYBOT_CONNECTORS_MOCK=1; else osascript.
         self._mock_mode = runner is None and os.environ.get(CONNECTORS_MOCK_ENV, "") == "1"
         if runner is not None:
-            self._runner: Callable[[List[str], float], Any] = runner
+            self._runner: Callable[[List[str], float, Optional[str]], Any] = runner
         elif self._mock_mode:
             self._runner = self._mock_runner
         else:
@@ -1035,6 +1234,18 @@ class ConnectorManager:
             "position": 0, "duration": 0, "volume": 50,
             "playlists": ["Foco", "Treino"],
         }
+        self._mock_shortcuts = {
+            "names": ["Resumo da semana", "Abrir agenda", "Backup das fotos"],
+        }
+        self._mock_mail = {
+            "unread": 3,
+            "accounts": ["iCloud", "Gmail"],
+            "mailboxes": ["INBOX", "Enviados", "Arquivo"],
+            "recent": [
+                ("Relatório mensal pronto", "Fulano <fulano@exemplo.com>", "31/10/2026 18:02"),
+                ("Re: contratos", "Beltrano <beltrano@exemplo.com>", "01/11/2026 09:15"),
+            ],
+        }
 
     # ---- public API -------------------------------------------------------
 
@@ -1044,15 +1255,20 @@ class ConnectorManager:
         store_rows = self.state.read()
         connectors: Dict[str, Any] = {}
         for domain in CONNECTOR_DOMAINS:
-            if domain == "system":
+            if domain in ("system", "shortcuts"):
+                # Ungated rows: always granted. shortcuts gets its own English
+                # hint — the CLI needs no consent; a shortcut's own app
+                # permissions are exercised inside the shortcut itself.
                 status = STATUS_GRANTED
+                hint = HINT_SHORTCUTS if domain == "shortcuts" else HINT_SYSTEM
             else:
                 status = store_rows[domain]["status"]
+                hint = _hint_for(status)
             connectors[domain] = {
                 "status": status,
                 "granted": status == STATUS_GRANTED,
                 "last_probe": store_rows[domain]["last_probe"],
-                "hint": HINT_SYSTEM if domain == "system" else _hint_for(status),
+                "hint": hint,
             }
         return {"connectors": connectors}
 
@@ -1072,6 +1288,11 @@ class ConnectorManager:
 
         plan = self._build_argv(domain, action, params)
 
+        # Shortcuts run: exact-existence pre-check BEFORE any run dispatch —
+        # unknown names must produce a clean error, never CLI noise.
+        if domain == "shortcuts" and action == "run":
+            self._ensure_known_shortcut(params)
+
         if domain in GATED_DOMAINS and self.state.read()[domain]["status"] != STATUS_GRANTED:
             raise ConnectorError(
                 f"{_DISPLAY_NAMES[domain]} ainda não está conectado — "
@@ -1079,16 +1300,20 @@ class ConnectorManager:
             )
 
         try:
-            outcome = self._execute(plan.cmd)
+            outcome = self._execute(plan.cmd, timeout=plan.timeout, stdin=plan.stdin)
         except _ScriptFailure as failure:
             # Snapshot the PRE-failure consent state: the timeout copy split
             # keys on it (granted -> retry wording only; ungranted -> the
-            # Settings/Connect consent hint).
+            # Settings/Connect consent hint). `shortcuts` is rows()-style
+            # ungated (no consent flow exists for a CLI domain), so like a
+            # granted domain it gets the retry wording — NEVER the consent
+            # remediation — regardless of its stored state.
             pre_status = self.state.read()[domain]["status"]
             if failure.kind == "denied" and domain in GATED_DOMAINS:
                 self.state.record(domain, STATUS_DENIED)
+            granted = pre_status == STATUS_GRANTED or domain == "shortcuts"
             raise self._action_failure_error(
-                domain, failure, granted=pre_status == STATUS_GRANTED
+                domain, failure, granted=granted, timeout=plan.timeout
             ) from None
 
         result = self._normalize(domain, plan, outcome)
@@ -1111,7 +1336,15 @@ class ConnectorManager:
             raise ProbeBusy(f"a probe for {domain!r} is already running")
         try:
             try:
-                self._execute(["osascript", "-e", PROBE_SCRIPTS[domain]])
+                if domain in PROBE_COMMANDS:
+                    # CLI domain: prove CLI availability by exit code (mirrors
+                    # the `open` precedent — argv only, never shell).
+                    cmd = PROBE_COMMANDS[domain]
+                    timeout = SHORTCUTS_TIMEOUT_S
+                else:
+                    cmd = ["osascript", "-e", PROBE_SCRIPTS[domain]]
+                    timeout = CONNECTORS_TIMEOUT_S
+                self._execute(cmd, timeout=timeout)
                 status = STATUS_GRANTED
             except _ScriptFailure as failure:
                 status = STATUS_NEEDS_CONSENT if failure.kind == "timeout" else STATUS_DENIED
@@ -1122,21 +1355,29 @@ class ConnectorManager:
 
     # ---- internals -----------------------------------------------------------
 
-    def _execute(self, cmd: List[str]) -> _Outcome:
+    def _execute(
+        self,
+        cmd: List[str],
+        timeout: float = CONNECTORS_TIMEOUT_S,
+        stdin: Optional[str] = None,
+    ) -> _Outcome:
         """One dispatch of the runner seam (mock-aware), normalized to _Outcome
         or classified as _ScriptFailure. Never returns a failing outcome."""
         if self._mock_mode:
-            outcome = self._mock_runner(cmd, CONNECTORS_TIMEOUT_S)
+            outcome = self._mock_runner(cmd, timeout, stdin)
             if outcome.returncode != 0:
                 kind = "denied" if _is_denial_stderr(outcome.stderr) else "error"
                 raise _ScriptFailure(kind, outcome.returncode, outcome.stderr)
             return outcome
         try:
-            outcome = self._runner(cmd, CONNECTORS_TIMEOUT_S)
+            outcome = self._runner(cmd, timeout, stdin)
         except subprocess.TimeoutExpired as exc:
             raise _ScriptFailure("timeout", 0, "") from exc
         except OSError as exc:
-            raise ConnectorError(f"osascript execution failed: {exc}") from exc
+            # Domain-neutral prefix: osascript, `open` and the shortcuts CLI
+            # all dispatch through this seam (a missing binary must not read
+            # as an osascript failure).
+            raise ConnectorError(f"command execution failed: {exc}") from exc
         stdout = _as_runner_text(outcome.stdout)
         stderr = _as_runner_text(outcome.stderr)
         returncode = int(outcome.returncode)
@@ -1147,14 +1388,20 @@ class ConnectorManager:
 
     @staticmethod
     def _action_failure_error(
-        domain: str, failure: _ScriptFailure, granted: bool = False
+        domain: str,
+        failure: _ScriptFailure,
+        granted: bool = False,
+        timeout: float = CONNECTORS_TIMEOUT_S,
     ) -> ConnectorError:
         """Map a classified script failure to the FINAL user-visible message
         (PT-BR for the consent family; English for script errors). The timeout
         split is state-aware: a timeout on an ALREADY-granted domain is not a
         consent problem (first-use/warm-up/sync is the likely cause), so it
         gets retry wording with NO Settings/Connect redirect; the Settings
-        consent hint is reserved for ungranted-state timeouts."""
+        consent hint is reserved for ungranted-state timeouts. ``timeout``
+        threads the caller's real per-call timeout into the seconds rendering
+        (CLI domains use SHORTCUTS_TIMEOUT_S; with the default every
+        pre-existing domain's copy stays byte-identical)."""
         display = _DISPLAY_NAMES[domain]
         if failure.kind == "timeout":
             if granted:
@@ -1163,7 +1410,7 @@ class ConnectorManager:
                     "tente de novo que eu reexecuto."
                 )
             return ConnectorError(
-                f"{display} não respondeu em {int(CONNECTORS_TIMEOUT_S)}s — pode ter aparecido "
+                f"{display} não respondeu em {int(timeout)}s — pode ter aparecido "
                 "um prompt de consentimento do macOS pendente (aprove-o com o aplicativo em "
                 "foco) ou o app ainda está iniciando; tente de novo em instantes ou use o botão "
                 "Connect em Settings › Connectors."
@@ -1199,6 +1446,19 @@ class ConnectorManager:
             return {"ok": True, "deleted": _parse_count_stdout(outcome.stdout)}
         if plan.kind == "status":
             return _parse_status_stdout(outcome.stdout)
+        if plan.kind == "shortcuts_list":
+            return {"names": _split_lines(outcome.stdout)}
+        if plan.kind == "shortcuts_run":
+            # Success path is rc==0 (failures already classified in _execute);
+            # stdout tail is byte-capped on a UTF-8 boundary.
+            return {
+                "output": _truncate_bytes(
+                    (outcome.stdout or "").strip(), SHORTCUTS_OUTPUT_MAX_BYTES
+                ),
+                "exit_code": int(outcome.returncode),
+            }
+        if plan.kind == "unread":
+            return {"unread": _parse_unread_stdout(outcome.stdout)}
         if plan.kind == "split":
             assert plan.post is not None
             return plan.post({"items": _split_delimited(outcome.stdout)})
@@ -1239,6 +1499,16 @@ class ConnectorManager:
             )
         return {"ok": True, "playlist": name}
 
+    # ---- mail stdout handling -------------------------------------------------
+
+    @staticmethod
+    def _mail_guard_items(items: List[str]) -> None:
+        """Marker guard for mail's split-kind posts: a structured mail failure
+        returns a BARE marker item instead of rows (single item), so any other
+        list — including a legit one-message chunk — passes through safely."""
+        if len(items) == 1:
+            _raise_if_mail_marker(items[0].strip())
+
     # ---- argv builders (validate + freeze the exact command) ------------------
 
     def _build_argv(self, domain: str, action: str, params: Dict[str, Any]) -> _ArgvPlan:
@@ -1250,6 +1520,10 @@ class ConnectorManager:
             return self._build_calendar(action, params)
         if domain == "music":
             return self._build_music(action, params)
+        if domain == "shortcuts":
+            return self._build_shortcuts(action, params)
+        if domain == "mail":
+            return self._build_mail(action, params)
         return self._build_system(action, params)
 
     def _build_reminders(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
@@ -1439,6 +1713,136 @@ class ConnectorManager:
         level = _as_level(params.get("level"))
         return _ArgvPlan(["osascript", "-e", MUSIC_VOLUME_SET, str(level)], kind="level_set")
 
+    def _build_mail(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
+        # READ-LEVEL-1 only: counts, mailbox names, subject/from/date rows.
+        # Bodies, send, delete, save and move are intentionally not
+        # implemented (destructive/deferred — see module docstring).
+        if action == "unread_count":
+            mailbox = ""
+            if "mailbox" in params:
+                mailbox = _as_string(params["mailbox"], "mailbox", LIST_NAME_MAX_CHARS)
+            account = ""
+            if "account" in params:
+                account = _as_string(params["account"], "account", LIST_NAME_MAX_CHARS)
+            return _ArgvPlan(
+                cmd=["osascript", "-e", MAIL_UNREAD_COUNT, mailbox, account],
+                kind="unread",
+            )
+        if action == "mailboxes":
+            def post(raw: dict) -> dict:
+                ConnectorManager._mail_guard_items(raw["items"])
+                return {"mailboxes": raw["items"]}
+
+            return _ArgvPlan(
+                cmd=["osascript", "-e", MAIL_MAILBOXES],
+                kind="split",
+                post=post,
+            )
+        if action == "list_recent":
+            mailbox = ""
+            if "mailbox" in params:
+                mailbox = _as_string(params["mailbox"], "mailbox", LIST_NAME_MAX_CHARS)
+            count = MAIL_LIST_MAX_COUNT
+            if "count" in params:
+                # _as_positive_int: None/"" -> None (absent). Above the cap
+                # ERRORS (the _as_days precedent) — never clamped down.
+                count_value = _as_positive_int(params["count"], "count")
+                if count_value is not None:
+                    if count_value > MAIL_LIST_MAX_COUNT:
+                        raise ConnectorError(
+                            f"count accepts at most {MAIL_LIST_MAX_COUNT} messages."
+                        )
+                    count = count_value
+
+            def post(raw: dict) -> dict:
+                ConnectorManager._mail_guard_items(raw["items"])
+                return {"messages": _chunk_rows(raw["items"], ("subject", "from", "received"))}
+
+            return _ArgvPlan(
+                cmd=["osascript", "-e", MAIL_LIST_RECENT, mailbox, str(count)],
+                kind="split",
+                post=post,
+            )
+        raise ConnectorError(
+            ERR_UNKNOWN_ACTION.format(
+                domain=domain, action=action, actions=", ".join(CONNECTOR_ACTIONS[domain])
+            )
+        )
+
+    def _build_shortcuts(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
+        # CLI domain: no osascript source — argv lists start with "shortcuts"
+        # (mirror of `open` in _build_system). `-i FILE` is intentionally not
+        # whitelisted; text input rides on stdin (`-x` + subprocess input=).
+        #
+        # Known limitations (redteam-flagged, intentional, NOT changed):
+        # - names starting with "-" are not rejected — like the music
+        #   play_playlist precedent they ride argv verbatim and may be
+        #   misparsed as CLI flags by the real binary;
+        # - every `run` additionally pays ONE extra `shortcuts list`
+        #   subprocess (the pre-check in _ensure_known_shortcut,
+        #   <=SHORTCUTS_TIMEOUT_S each).
+        if action == "list":
+            return _ArgvPlan(
+                cmd=["shortcuts", "list"],
+                kind="shortcuts_list",
+                timeout=SHORTCUTS_TIMEOUT_S,
+            )
+        if action == "run":
+            _required_params(params, ("name",))
+            name = _as_string(params["name"], "name", LIST_NAME_MAX_CHARS)
+            input_text = None
+            if "input_text" in params:
+                input_text = _as_string(
+                    params["input_text"], "input_text", SHORTCUTS_INPUT_MAX_CHARS
+                )
+            if "stdin" in params:
+                if params["stdin"] != "text":
+                    raise ConnectorError('stdin only accepts the value "text".')
+                if input_text is None:
+                    raise ConnectorError('stdin="text" requires an input_text param.')
+            extra_argv = ["-x"] if input_text is not None else []
+            return _ArgvPlan(
+                cmd=["shortcuts", "run", name] + extra_argv,
+                kind="shortcuts_run",
+                timeout=SHORTCUTS_TIMEOUT_S,
+                stdin=input_text,
+            )
+        raise ConnectorError(
+            ERR_UNKNOWN_ACTION.format(
+                domain=domain, action=action, actions=", ".join(CONNECTOR_ACTIONS[domain])
+            )
+        )
+
+    def _ensure_known_shortcut(self, params: Dict[str, Any]) -> None:
+        """Mission: unknown shortcut names must produce a clean error, never
+        CLI noise. Exact-existence match against `shortcuts list` stdout lines
+        BEFORE any run dispatch (runner.calls never contains the run cmd).
+
+        Cost/limits (redteam-flagged, intentional): every `run` pays ONE extra
+        `shortcuts list` subprocess (<=SHORTCUTS_TIMEOUT_S each); the check is
+        a snapshot, so a name that vanishes between listing and running
+        (TOCTOU) surfaces through the generic rc!=0 failure fallback instead.
+        Dash-prefixed names are NOT rejected — like the music play_playlist
+        precedent they ride argv verbatim and may be misparsed as CLI flags by
+        the real binary."""
+        name = _as_string(params["name"], "name", LIST_NAME_MAX_CHARS)
+        try:
+            listing = self._execute(["shortcuts", "list"], timeout=SHORTCUTS_TIMEOUT_S)
+        except _ScriptFailure as failure:
+            # granted=True: the CLI cold-start wording fits an UNGATED domain
+            # (the consent-hint variant would point at Settings › Connectors,
+            # which does not apply to shortcuts); the 10 s CLI timeout is
+            # threaded for the seconds rendering.
+            raise self._action_failure_error(
+                "shortcuts", failure, granted=True, timeout=SHORTCUTS_TIMEOUT_S
+            ) from None
+        known = _split_lines(listing.stdout)
+        if name not in known:
+            raise ConnectorError(
+                'Atalho não encontrado — use a ação "list" para ver os atalhos '
+                "disponíveis."
+            )
+
     def _build_system(self, action: str, params: Dict[str, Any]) -> _ArgvPlan:
         if action == "volume":
             if params.get("level") in (None, ""):
@@ -1494,15 +1898,38 @@ class ConnectorManager:
                 "position": 0, "duration": 0, "volume": 50,
                 "playlists": ["Foco", "Treino"],
             }
+            self._mock_shortcuts = {
+                "names": ["Resumo da semana", "Abrir agenda", "Backup das fotos"],
+            }
+            self._mock_mail = {
+                "unread": 3,
+                "accounts": ["iCloud", "Gmail"],
+                "mailboxes": ["INBOX", "Enviados", "Arquivo"],
+                "recent": [
+                    ("Relatório mensal pronto", "Fulano <fulano@exemplo.com>", "31/10/2026 18:02"),
+                    ("Re: contratos", "Beltrano <beltrano@exemplo.com>", "01/11/2026 09:15"),
+                ],
+            }
 
-    def _mock_runner(self, cmd: List[str], timeout: float) -> _Outcome:
-        """In-process osascript replacement: interprets the SAME frozen scripts
-        against the in-memory world (add -> list stays genuinely observable).
-        Equality-compares cmd[2] against the constants."""
-        del timeout
+    def _mock_runner(self, cmd: List[str], timeout: float, stdin: Optional[str] = None) -> _Outcome:
+        """In-process osascript/CLI replacement: interprets the SAME frozen
+        scripts against the in-memory world (add -> list stays genuinely
+        observable). Equality-compares cmd[2] against the constants; the
+        shortcuts CLI domain branches on cmd[1] BEFORE that lookup (its cmd[2]
+        is the shortcut NAME, not a script)."""
+        del timeout, stdin
         script = cmd[2] if len(cmd) > 2 else ""
         argv = list(cmd[3:])
         with self._mock_lock:
+            # CLI domain first: cmd[2] of a shortcuts run is the shortcut
+            # NAME, not a script constant — branch on cmd[1] BEFORE the
+            # osascript script lookup.
+            if cmd[0] == "shortcuts":
+                if cmd[1] == "list":
+                    # Real CLI prints one name per line, newline-terminated.
+                    return _Outcome(0, "\n".join(self._mock_shortcuts["names"]) + "\n", "")
+                if cmd[1] == "run":
+                    return _Outcome(0, "atalho executado", "")
             if script == REMINDERS_ADD:
                 list_name, title, year, month, day = (argv + [""] * 5)[:5]
                 bucket = self._mock_lists.setdefault(list_name, [])
@@ -1649,5 +2076,30 @@ class ConnectorManager:
             if script == MUSIC_VOLUME_SET:
                 self._mock_music["volume"] = int(argv[0])
                 return _Outcome(0, str(self._mock_music["volume"]), "")
+            if script == MAIL_UNREAD_COUNT:
+                mailbox = argv[0] if argv else ""
+                account = argv[1] if len(argv) > 1 else ""
+                # Account check mirrors the script's named-account pre-check;
+                # a known account proceeds with the mailbox-name rule.
+                if account and account not in self._mock_mail["accounts"]:
+                    return _Outcome(0, NO_ACCOUNT_MARKER, "")
+                if mailbox and mailbox not in self._mock_mail["mailboxes"]:
+                    return _Outcome(0, MAIL_MISSING_MAILBOX_MARKER, "")
+                return _Outcome(0, str(self._mock_mail["unread"]), "")
+            if script == MAIL_MAILBOXES:
+                return _Outcome(0, _DELIM.join(self._mock_mail["mailboxes"]), "")
+            if script == MAIL_LIST_RECENT:
+                # NOTE: no account channel here — the script signature is
+                # plan-verbatim {mailboxArg, limitArg} and the builder
+                # whitelist carries no `account` param for list_recent, so
+                # argv[1] is the COUNT, never an account name.
+                mailbox = argv[0] if argv else ""
+                count = int(argv[1]) if len(argv) > 1 else MAIL_LIST_MAX_COUNT
+                if mailbox and mailbox not in self._mock_mail["mailboxes"]:
+                    return _Outcome(0, MAIL_MISSING_MAILBOX_MARKER, "")
+                rows = []
+                for subject, sender, received in self._mock_mail["recent"][:count]:
+                    rows += [subject, sender, received]
+                return _Outcome(0, _DELIM.join(rows), "")
             # Probe scripts (and anything else): trivial success.
             return _Outcome(0, "0", "")

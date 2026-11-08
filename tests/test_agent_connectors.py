@@ -55,13 +55,15 @@ class RecordingRunner:
         self.outcomes = {}
         self.calls = []
         self.timeout_seen = None
+        self.stdin_values = []  # per-call stdin page (shortcuts -x seam)
 
     def register(self, script, outcome):
         self.outcomes[script] = outcome
 
-    def __call__(self, cmd, timeout):
+    def __call__(self, cmd, timeout, stdin=None):
         self.calls.append(list(cmd))
         self.timeout_seen = timeout
+        self.stdin_values.append(stdin)
         script = cmd[2] if len(cmd) > 2 else ""
         for key, outcome in self.outcomes.items():
             if script == key:
@@ -70,6 +72,9 @@ class RecordingRunner:
 
     def last_argv(self):
         return self.calls[-1][3:] if self.calls else None
+
+    def last_stdin(self):
+        return self.stdin_values[-1] if self.stdin_values else None
 
 
 def make_registry_runtime(tmpdir):
@@ -132,7 +137,7 @@ class TestNativeCallDispatch(unittest.TestCase):
     def test_injected_connector_manager_used_directly(self):
         from notifybot.connectors import ConnectorManager
 
-        injected = ConnectorManager(self.tmp.name, runner=lambda cmd, t: Outcome(0, "Finder", ""))
+        injected = ConnectorManager(self.tmp.name, runner=lambda cmd, timeout, stdin=None: Outcome(0, "Finder", ""))
         self.registry.connector_manager = injected
         dispatched = self.registry.dispatch("native.call", {"domain": "system", "action": "front_app", "params": {}})
         self.assertEqual(dispatched, {"app": "Finder"})
@@ -142,7 +147,7 @@ class TestNativeCallDispatch(unittest.TestCase):
 
         # gate error (PT-BR) must surface VERBATIM as the tool error result.
         self.registry.connector_manager = ConnectorManager(
-            self.tmp.name, runner=lambda cmd, t: Outcome(0, "", "")
+            self.tmp.name, runner=lambda cmd, timeout, stdin=None: Outcome(0, "", "")
         )
         dispatched = self.registry.dispatch(
             "native.call",
@@ -285,7 +290,7 @@ class TestRunnerSeamActions(unittest.TestCase):
         self.assertEqual(self.manager.run_action("system", "volume", {"level": 42}), {"ok": True, "level": 42})
         self.assertEqual(self.runner.last_argv(), ["42"])
         # string levels coerce; echo the requested level back for the assert
-        self.manager._runner = lambda cmd, t: Outcome(0, cmd[3], "")
+        self.manager._runner = lambda cmd, timeout, stdin=None: Outcome(0, cmd[3], "")
         self.assertEqual(self.manager.run_action("system", "volume", {"level": "7"}), {"ok": True, "level": 7})
         self.manager._runner = self.runner
         for bad in (101, -1, "abc", True, 1.5):
@@ -301,7 +306,7 @@ class TestRunnerSeamActions(unittest.TestCase):
     def test_open_accept_reject_matrix(self):
         open_calls = []
 
-        def open_runner(cmd, timeout):
+        def open_runner(cmd, timeout, stdin=None):
             open_calls.append(list(cmd))
             return Outcome(0, "", "")
 
@@ -337,12 +342,15 @@ class TestFailureMappingAndConsent(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.manager = ConnectorManager(self.tmp.name, runner=lambda cmd, t: Outcome(0, "", ""))
+        self.manager = ConnectorManager(
+            self.tmp.name,
+            runner=lambda cmd, timeout, stdin=None: Outcome(0, "", ""),
+        )
 
     def test_timeout_on_granted_domain_gets_retry_copy_without_connect(self):
         """A timeout on an ALREADY-granted domain is not a consent problem: the
         copy must be the retry wording, with NO Settings/Connect redirect."""
-        def timeout_runner(cmd, timeout):
+        def timeout_runner(cmd, timeout, stdin=None):
             raise subprocess.TimeoutExpired(cmd, timeout)
 
         self.manager._runner = timeout_runner
@@ -359,7 +367,7 @@ class TestFailureMappingAndConsent(unittest.TestCase):
         """Ungranted-state timeouts keep the consent copy (Settings hint).
         `system` is ungated, so its unknown state reaches the timeout with the
         Settings/Connect variant."""
-        def timeout_runner(cmd, timeout):
+        def timeout_runner(cmd, timeout, stdin=None):
             raise subprocess.TimeoutExpired(cmd, timeout)
 
         self.manager._runner = timeout_runner
@@ -373,7 +381,7 @@ class TestFailureMappingAndConsent(unittest.TestCase):
         self.assertNotIn("reexecuto", message)
 
     def test_deny_maps_to_ptbr_error_and_persists_denied(self):
-        def deny_runner(cmd, timeout):
+        def deny_runner(cmd, timeout, stdin=None):
             return Outcome(1, "", "script error: Not authorized to send Apple events (-1743)")
 
         self.manager._runner = deny_runner
@@ -388,7 +396,7 @@ class TestFailureMappingAndConsent(unittest.TestCase):
         """NOTES_CREATE's structured in-script error (no Notes account) maps to
         the PT-BR account-setup tool error, not the generic script-error copy."""
         self.manager.state.record("notes", "granted")
-        self.manager._runner = lambda cmd, timeout: Outcome(
+        self.manager._runner = lambda cmd, timeout, stdin=None: Outcome(
             1, "", "execution error: Notes got an error: %s (-2700)" % NO_ACCOUNT_MARKER
         )
         with self.assertRaises(ConnectorError) as ctx:
@@ -398,7 +406,7 @@ class TestFailureMappingAndConsent(unittest.TestCase):
         self.assertNotIn("action failed", message)
 
     def test_other_stderr_maps_to_english_trimmed_error(self):
-        def boom_runner(cmd, timeout):
+        def boom_runner(cmd, timeout, stdin=None):
             return Outcome(3, "", "script error: Can't get list " + "x" * 500)
 
         self.manager._runner = boom_runner
@@ -413,7 +421,7 @@ class TestFailureMappingAndConsent(unittest.TestCase):
         (heals a downgrade that raced between the consent gate and the run)."""
         self.manager.state.record("reminders", "granted")
 
-        def sneaky_runner(cmd, timeout):
+        def sneaky_runner(cmd, timeout, stdin=None):
             # simulate a concurrent downgrade happening mid-run
             self.manager.state.record("reminders", "needs_consent")
             return Outcome(0, "ok", "")
@@ -462,14 +470,14 @@ class TestFailureMappingAndConsent(unittest.TestCase):
         self.assertEqual(manager.probe("reminders")["status"], "granted")
         self.assertEqual(manager.state.read()["reminders"]["status"], "granted")
 
-        def timeout_runner(cmd, timeout):
+        def timeout_runner(cmd, timeout, stdin=None):
             raise subprocess.TimeoutExpired(cmd, timeout)
 
         manager._runner = timeout_runner
         self.assertEqual(manager.probe("reminders")["status"], "needs_consent")
         self.assertEqual(manager.state.read()["reminders"]["status"], "needs_consent")
 
-        manager._runner = lambda cmd, timeout: Outcome(
+        manager._runner = lambda cmd, timeout, stdin=None: Outcome(
             1, "", "Not authorized to send Apple events (-1743)"
         )
         self.assertEqual(manager.probe("reminders")["status"], "denied")
@@ -545,13 +553,26 @@ class TestInjectionBattery(unittest.TestCase):
         for key, source in list(SCRIPTS.items()) + list(PROBE_SCRIPTS.items()):
             self.assertNotIn("do shell script", source, key)
             self.assertNotIn("run script", source, key)
-            self.assertIn("on run argv", source, key)
+            # Input-channel discipline: every script binds model input ONLY
+            # from its run handler — plain `on run argv` (FASE 0/1) or
+            # declared named params (`on run {mailboxArg, ...}`, mail) — or
+            # takes NO input at all (the zero-input mail.mailboxes script and
+            # the mail probe are bare `tell` bodies osascript runs directly).
+            self.assertTrue(
+                "on run argv" in source
+                or "on run {" in source
+                or key in (("mail", "mailboxes"), "mail"),
+                key,
+            )
         # Every app script addresses the app by bundle id (pt-BR locale-proof).
         self.assertIn("com.apple.reminders", SCRIPTS[("reminders", "list_lists")])
         self.assertIn("com.apple.Notes", SCRIPTS[("notes", "search")])
         self.assertIn("com.apple.systemevents", SCRIPTS[("system", "front_app")])
         self.assertIn("com.apple.iCal", SCRIPTS[("calendar", "list_calendars")])
         self.assertIn("com.apple.Music", SCRIPTS[("music", "status")])
+        self.assertIn("com.apple.mail", SCRIPTS[("mail", "unread_count")])
+        self.assertIn("com.apple.mail", SCRIPTS[("mail", "mailboxes")])
+        self.assertIn("com.apple.mail", SCRIPTS[("mail", "list_recent")])
 
     def test_delimiter_never_comma_split(self):
         self.runner.register(
@@ -587,7 +608,7 @@ class TestInjectionBattery(unittest.TestCase):
 class TestStateStoreConcurrency(unittest.TestCase):
     def test_concurrent_probe_and_write_leaves_state_parseable(self):
         with tempfile.TemporaryDirectory() as root:
-            manager = ConnectorManager(root, runner=lambda cmd, t: Outcome(0, "0", ""))
+            manager = ConnectorManager(root, runner=lambda cmd, timeout, stdin=None: Outcome(0, "0", ""))
             errors = []
 
             def hammer():
@@ -610,17 +631,18 @@ class TestStateStoreConcurrency(unittest.TestCase):
 
     def test_read_missing_file_yields_unknown(self):
         with tempfile.TemporaryDirectory() as root:
-            manager = ConnectorManager(root, runner=lambda cmd, t: Outcome(0, "0", ""))
+            manager = ConnectorManager(root, runner=lambda cmd, timeout, stdin=None: Outcome(0, "0", ""))
             rows = manager.state.read()
-            self.assertEqual(
-                {domain: rows[domain]["status"] for domain in CONNECTOR_DOMAINS},
-                {"reminders": "unknown", "notes": "unknown", "calendar": "unknown",
-                 "music": "unknown", "system": "unknown"},
-            )
+        self.assertEqual(
+            {domain: rows[domain]["status"] for domain in CONNECTOR_DOMAINS},
+            {"reminders": "unknown", "notes": "unknown", "calendar": "unknown",
+             "music": "unknown", "shortcuts": "unknown", "mail": "unknown",
+             "system": "unknown"},
+        )
 
     def test_single_flight_probe_busy_then_free(self):
         with tempfile.TemporaryDirectory() as root:
-            manager = ConnectorManager(root, runner=lambda cmd, t: Outcome(0, "0", ""))
+            manager = ConnectorManager(root, runner=lambda cmd, timeout, stdin=None: Outcome(0, "0", ""))
             lock = manager._probe_locks["notes"]
             self.assertTrue(lock.acquire(blocking=False))
             try:
@@ -640,7 +662,7 @@ class TestConnectorEndpoints(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.manager = ConnectorManager(self.tmp.name, runner=lambda cmd, t: Outcome(0, "0", ""))
+        self.manager = ConnectorManager(self.tmp.name, runner=lambda cmd, timeout, stdin=None: Outcome(0, "0", ""))
         self.fixture = ApiServerFixture(valid_config_payload())
         self.addCleanup(self.fixture.close)
         # Inject the mockable manager into the booted runtime (lazy singleton slot).
@@ -650,8 +672,11 @@ class TestConnectorEndpoints(unittest.TestCase):
         status, body = self.fixture.request("GET", "/api/connectors")
         self.assertEqual(status, 200)
         connectors = body["connectors"]
-        self.assertEqual(set(connectors), {"reminders", "notes", "calendar", "music", "system"})
-        for domain in ("reminders", "notes", "calendar", "music"):
+        self.assertEqual(
+            set(connectors),
+            {"reminders", "notes", "calendar", "music", "shortcuts", "mail", "system"},
+        )
+        for domain in ("reminders", "notes", "calendar", "music", "mail"):
             row = connectors[domain]
             self.assertEqual(row["status"], "unknown")
             self.assertFalse(row["granted"])
@@ -660,6 +685,13 @@ class TestConnectorEndpoints(unittest.TestCase):
         self.assertEqual(
             connectors["system"],
             {"status": "granted", "granted": True, "last_probe": None, "hint": "no consent required"},
+        )
+        # shortcuts row: ungated via the rows() special-case (always granted,
+        # own CLI hint), even with an unknown/never-probed state store row.
+        self.assertEqual(
+            connectors["shortcuts"],
+            {"status": "granted", "granted": True, "last_probe": None,
+             "hint": HINT_SHORTCUTS},
         )
 
     def test_post_probe_granted_and_state_file_written(self):
@@ -685,7 +717,7 @@ class TestConnectorEndpoints(unittest.TestCase):
         probe_done = threading.Event()
 
         class BlockingRunner:
-            def __call__(self, cmd, timeout):
+            def __call__(self, cmd, timeout, stdin=None):
                 probe_done.wait(timeout=5)
                 return Outcome(0, "0", "")
 
@@ -730,7 +762,7 @@ class FakeRemindersWorldRunner:
         self.lists = {"Leituras": []}
         self.calls = []
 
-    def __call__(self, cmd, timeout):
+    def __call__(self, cmd, timeout, stdin=None):
         self.calls.append(list(cmd))
         script = cmd[2]
         argv = list(cmd[3:])
@@ -1422,7 +1454,7 @@ class TestCalendarMusicGatingProbeAndMockWorld(unittest.TestCase):
             manager = ConnectorManager(self.tmp.name)  # env mock runner active
             manager.state.record("calendar", "granted")
             # denial path: -1743 stderr classifies "denied" AND persists it
-            manager._mock_runner = lambda cmd, timeout: Outcome(
+            manager._mock_runner = lambda cmd, timeout, stdin=None: Outcome(
                 1, "", "Not authorized to send Apple events (-1743)"
             )
             with self.assertRaises(ConnectorError) as denied_ctx:
@@ -1433,7 +1465,7 @@ class TestCalendarMusicGatingProbeAndMockWorld(unittest.TestCase):
             # generic error path: rc != 0 without denial markers stays "error" —
             # the copy says "action failed" and the granted state is NOT flipped
             manager.state.record("calendar", "granted")
-            manager._mock_runner = lambda cmd, timeout: Outcome(3, "", "boom")
+            manager._mock_runner = lambda cmd, timeout, stdin=None: Outcome(3, "", "boom")
             with self.assertRaises(ConnectorError) as error_ctx:
                 manager.run_action("calendar", "list_calendars", {})
             self.assertIn("action failed", str(error_ctx.exception))
@@ -1464,12 +1496,597 @@ class TestCalendarMusicGatingProbeAndMockWorld(unittest.TestCase):
         # timeout -> needs_consent (persisted), like the reminders probe split
         manager.state.record("music", "unknown")
 
-        def timeout_runner(cmd, timeout):
+        def timeout_runner(cmd, timeout, stdin=None):
             raise subprocess.TimeoutExpired(cmd, timeout)
 
         manager._runner = timeout_runner
         self.assertEqual(manager.probe("music")["status"], "needs_consent")
         self.assertEqual(manager.state.read()["music"]["status"], "needs_consent")
+
+
+# ---- shortcuts + mail domains: dispatch, gating, probe, mock world --------------------
+# Imports for the shortcuts/mail suites below: appended here (not merged into
+# the top block) so this change stays a pure addition to the file (FASE 1
+# precedent above).
+
+from notifybot.connectors import (
+    CONNECTOR_ACTIONS,
+    GATED_DOMAINS,
+    HINT_SHORTCUTS,
+    LIST_NAME_MAX_CHARS,  # noqa: F811  (re-import with the FASE-2 family for locality)
+    MAIL_ERROR_MARKER,
+    MAIL_LIST_MAX_COUNT,
+    MAIL_LIST_RECENT,
+    MAIL_MAILBOXES,
+    MAIL_MISSING_MAILBOX_MARKER,
+    MAIL_UNREAD_COUNT,
+    PROBE_COMMANDS,
+    SHORTCUTS_INPUT_MAX_CHARS,
+    SHORTCUTS_OUTPUT_MAX_BYTES,
+    SHORTCUTS_TIMEOUT_S,
+    _ScriptFailure,
+    _default_runner,
+)
+
+
+class TestShortcutsDispatchActions(unittest.TestCase):
+    """CLI-domain dispatch: 10 s timeout reach-through, stdin seam, 4096 B
+    output cap, unknown-name pre-check ordering, and validation copy. NOT
+    gated — every action runs with an untouched consent state."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.names = ["Resumo da semana", "Abrir agenda", "Backup das fotos"]
+        self.runner = RecordingRunner()
+        # RecordingRunner keys outcomes on cmd[2]-when-present: the 2-arg
+        # `shortcuts list` command has no cmd[2], so it matches the "" key;
+        # a run command's cmd[2] is the shortcut NAME.
+        self.runner.register("", Outcome(0, "\n".join(self.names) + "\n", ""))
+        self.runner.register("Resumo da semana", Outcome(0, "atalho executado", ""))
+        self.manager = ConnectorManager(self.tmp.name, runner=self.runner)
+
+    def test_list_argv_shape_names_parse_and_timeout_reach_through(self):
+        result = self.manager.run_action("shortcuts", "list", {})
+        self.assertEqual(result, {"names": self.names})
+        self.assertEqual(self.runner.calls[-1], ["shortcuts", "list"])
+        self.assertEqual(len(self.runner.calls[0]), 2)  # argv ends after "list"
+        self.assertEqual(self.runner.timeout_seen, SHORTCUTS_TIMEOUT_S)
+
+    def test_run_argv_precheck_order_and_stdin_seam(self):
+        result = self.manager.run_action("shortcuts", "run", {"name": "Resumo da semana"})
+        self.assertEqual(result, {"output": "atalho executado", "exit_code": 0})
+        # pre-check listing ran first, then the run; timeout is CLI-tuned
+        self.assertEqual(self.runner.calls[-2], ["shortcuts", "list"])
+        self.assertEqual(self.runner.calls[-1], ["shortcuts", "run", "Resumo da semana"])
+        self.assertIsNone(self.runner.last_stdin())
+        # input_text: argv gains -x AND the text is paged via the stdin seam
+        result2 = self.manager.run_action(
+            "shortcuts", "run", {"name": "Resumo da semana", "input_text": "carga"}
+        )
+        self.assertEqual(result2, {"output": "atalho executado", "exit_code": 0})
+        self.assertEqual(self.runner.calls[-1], ["shortcuts", "run", "Resumo da semana", "-x"])
+        self.assertEqual(self.runner.last_stdin(), "carga")
+
+    def test_run_validation_english_and_runner_never_invoked(self):
+        cases = [
+            ({}, "'name' is required"),
+            ({"name": None}, "'name' is required"),
+            ({"name": "a" * (LIST_NAME_MAX_CHARS + 1)}, "'name' is limited to 256 characters"),
+            ({"name": "Resumo da semana", "input_text": "c" * (SHORTCUTS_INPUT_MAX_CHARS + 1)},
+             "'input_text' is limited to 512 characters"),
+            ({"name": "Resumo da semana", "stdin": "pipe"}, 'stdin only accepts the value "text".'),
+            ({"name": "Resumo da semana", "stdin": "text"},
+             'stdin="text" requires an input_text param.'),
+        ]
+        for params, expected in cases:
+            with self.assertRaises(ConnectorError) as ctx:
+                self.manager.run_action("shortcuts", "run", params)
+            self.assertEqual(str(ctx.exception), expected, params)
+            self.assertEqual(self.runner.calls, [])  # validation never dispatched anything
+
+    def test_unknown_name_clean_error_and_no_run_dispatch(self):
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("shortcuts", "run", {"name": "Fantasma"})
+        self.assertEqual(
+            str(ctx.exception),
+            'Atalho não encontrado — use a ação "list" para ver os atalhos '
+            "disponíveis.",
+        )
+        # pre-check ordering: ONLY the `shortcuts list` call exists — the run
+        # command was never dispatched (runner.calls never holds it).
+        self.assertEqual(self.runner.calls, [["shortcuts", "list"]])
+
+    def test_run_output_byte_cap_on_utf8_boundary(self):
+        self.runner.register(
+            "Resumo da semana", Outcome(0, "x" * (SHORTCUTS_OUTPUT_MAX_BYTES + 1), "")
+        )
+        result = self.manager.run_action("shortcuts", "run", {"name": "Resumo da semana"})
+        self.assertEqual(len(result["output"].encode("utf-8")), SHORTCUTS_OUTPUT_MAX_BYTES)
+        # multibyte safety: a broken code point must never be emitted
+        self.runner.register("Resumo da semana", Outcome(0, "ç" * 2500, ""))
+        result2 = self.manager.run_action("shortcuts", "run", {"name": "Resumo da semana"})
+        self.assertEqual(len(result2["output"].encode("utf-8")), SHORTCUTS_OUTPUT_MAX_BYTES)
+        self.assertEqual(result2["output"], "ç" * 2048)  # 2048 * 2 B = 4096 B
+
+    def test_ungated_runs_without_touching_consent_state(self):
+        self.assertEqual(self.manager.state.read()["shortcuts"]["status"], "unknown")
+        self.assertEqual(self.manager.run_action("shortcuts", "list", {}), {"names": self.names})
+        # success did NOT self-heal/state-record anything for the CLI domain
+        self.assertEqual(self.manager.state.read()["shortcuts"]["status"], "unknown")
+
+    def test_run_timeout_never_probed_state_renders_granted_copy_without_consent(self):
+        """FIX-2 regression: a `run` timeout on a never-probed (unknown) state
+        renders the CLI cold-start wording (granted side of the split) with NO
+        Settings/Connect remediation — the consent flow does not exist for the
+        ungated shortcuts domain."""
+        run_timeouts = []
+
+        def run_timeout_runner(cmd, timeout, stdin=None):
+            if cmd[0] == "shortcuts" and cmd[1] == "run":
+                run_timeouts.append(timeout)
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            return Outcome(0, "\n".join(self.names) + "\n", "")
+
+        manager = ConnectorManager(self.tmp.name + "-timeout", runner=run_timeout_runner)
+        self.assertEqual(manager.state.read()["shortcuts"]["status"], "unknown")
+        with self.assertRaises(ConnectorError) as ctx:
+            manager.run_action("shortcuts", "run", {"name": "Resumo da semana"})
+        message = str(ctx.exception)
+        # granted-branch copy: retry wording only
+        self.assertEqual(
+            message,
+            "Shortcuts não respondeu a tempo — possível primeiro uso/sincronização; "
+            "tente de novo que eu reexecuto.",
+        )
+        self.assertNotIn("Settings › Connectors", message)
+        self.assertNotIn("Connect", message)
+        # the run call was threaded the CLI timeout, not the shared 8 s
+        self.assertEqual(run_timeouts, [SHORTCUTS_TIMEOUT_S])
+        # a timeout hitting the pre-check first renders the same copy
+        def timeout_runner(cmd, timeout, stdin=None):
+            raise subprocess.TimeoutExpired(cmd, timeout)
+
+        manager2 = ConnectorManager(self.tmp.name + "-timeout2", runner=timeout_runner)
+        with self.assertRaises(ConnectorError) as ctx2:
+            manager2.run_action("shortcuts", "run", {"name": "Resumo da semana"})
+        self.assertEqual(str(ctx2.exception), str(ctx.exception))
+        self.assertNotIn("Settings › Connectors", str(ctx2.exception))
+        # and the 10 s timeout is threaded into the seconds rendering when the
+        # timed branch fires (the granted copy carries no seconds — it stays
+        # byte-identical for every domain):
+        self.assertIn(
+            "não respondeu em 10s",
+            str(
+                ConnectorManager._action_failure_error(
+                    "shortcuts",
+                    _ScriptFailure("timeout", 0, ""),
+                    granted=False,
+                    timeout=SHORTCUTS_TIMEOUT_S,
+                )
+            ),
+        )
+        # the default keeps the five pre-existing domains byte-identical (8 s)
+        self.assertIn(
+            "não respondeu em 8s",
+            str(
+                ConnectorManager._action_failure_error(
+                    "music", _ScriptFailure("timeout", 0, "")
+                )
+            ),
+        )
+
+    def test_default_runner_real_subprocess_stdin_seam_and_neutral_oserror(self):
+        """FIX-3/FIX-4 regressions: the prod runner seam really pipes stdin via
+        subprocess input= (not just the RecordingRunner fixture), and the
+        OSError prefix is domain-neutral with the exception detail preserved."""
+        outcome = _default_runner(["cat"], 5.0, "ping")
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.stdout.strip(), "ping")
+        # a missing binary surfaces through the same domain-neutral wording
+        manager = ConnectorManager(self.tmp.name + "-oserror")  # real runner (no env mock)
+        with self.assertRaises(ConnectorError) as ctx:
+            manager._execute(["definitely-missing-binary-fase2-check"])
+        self.assertIn("command execution failed", str(ctx.exception))
+        self.assertIn("definitely-missing-binary-fase2-check", str(ctx.exception))
+        self.assertNotIn("osascript execution failed", str(ctx.exception))
+
+
+class TestMailDispatchActions(unittest.TestCase):
+    """Read-level-1 mail dispatch: argv layout, chunk rows, marker parsing,
+    validation caps, and the GATED consent + probe machinery."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runner = RecordingRunner()
+        self.manager = ConnectorManager(self.tmp.name, runner=self.runner)
+        self.manager.state.record("mail", "granted")
+
+    def test_unread_count_argv_order_and_result(self):
+        self.runner.register(MAIL_UNREAD_COUNT, Outcome(0, "3", ""))
+        self.assertEqual(self.manager.run_action("mail", "unread_count", {}), {"unread": 3})
+        self.assertEqual(self.runner.calls[-1][2], MAIL_UNREAD_COUNT)
+        self.assertEqual(self.runner.last_argv(), ["", ""])  # (mailbox, account) with "" defaults
+        with_params = self.manager.run_action(
+            "mail", "unread_count", {"mailbox": "Work INBOX", "account": "fulano@exemplo.com"}
+        )
+        self.assertEqual(with_params, {"unread": 3})
+        self.assertEqual(self.runner.last_argv(), ["Work INBOX", "fulano@exemplo.com"])
+
+    def test_mailboxes_single_script_argv_and_split(self):
+        self.runner.register(
+            MAIL_MAILBOXES, Outcome(0, _DELIM.join(["INBOX", "Enviados", "Arquivo"]), "")
+        )
+        self.assertEqual(
+            self.manager.run_action("mail", "mailboxes", {}),
+            {"mailboxes": ["INBOX", "Enviados", "Arquivo"]},
+        )
+        cmd = self.runner.calls[-1]
+        self.assertEqual(cmd[:3], ["osascript", "-e", MAIL_MAILBOXES])
+        self.assertEqual(cmd[3:], [])  # argv ends after the script constant
+
+    def test_list_recent_argv_chunk_rows_and_default_count(self):
+        self.runner.register(
+            MAIL_LIST_RECENT,
+            Outcome(0, _DELIM.join(["S1", "F1", "D1", "S2", "F2", "D2"]), ""),
+        )
+        result = self.manager.run_action("mail", "list_recent", {"mailbox": "Work INBOX"})
+        self.assertEqual(
+            result,
+            {"messages": [
+                {"subject": "S1", "from": "F1", "received": "D1"},
+                {"subject": "S2", "from": "F2", "received": "D2"},
+            ]},
+        )
+        self.assertEqual(self.runner.last_argv(), ["Work INBOX", "20"])  # default count 20
+        self.manager.run_action("mail", "list_recent", {"mailbox": "Work INBOX", "count": 5})
+        self.assertEqual(self.runner.last_argv(), ["Work INBOX", "5"])
+        upper = self.manager.run_action("mail", "list_recent", {"count": MAIL_LIST_MAX_COUNT})
+        self.assertEqual(self.runner.last_argv(), ["", "20"])  # boundary 20 is VALID
+        self.assertEqual(len(upper["messages"]), 2)
+
+    def test_list_recent_count_validation_error_not_clamp(self):
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("mail", "list_recent", {"count": MAIL_LIST_MAX_COUNT + 1})
+        self.assertEqual(str(ctx.exception), "count accepts at most 20 messages.")
+        for bad in (0, -1, 2.5, True, "abc"):
+            with self.assertRaises(ConnectorError) as pos_ctx:
+                self.manager.run_action("mail", "list_recent", {"count": bad})
+            self.assertEqual(
+                str(pos_ctx.exception), "'count' must be a positive integer", bad
+            )
+        with self.assertRaises(ConnectorError) as len_ctx:
+            self.manager.run_action(
+                "mail", "list_recent", {"mailbox": "m" * (LIST_NAME_MAX_CHARS + 1)}
+            )
+        self.assertIn("limited to 256", str(len_ctx.exception))
+        self.assertEqual(self.runner.calls, [])  # every rejection predates dispatch
+
+    def test_missing_mailbox_marker_maps_to_clean_ptbr_copy(self):
+        self.runner.register(MAIL_UNREAD_COUNT, Outcome(0, MAIL_MISSING_MAILBOX_MARKER, ""))
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("mail", "unread_count", {"mailbox": "Não Existe"})
+        self.assertEqual(
+            str(ctx.exception),
+            'Mailbox não encontrada — use a ação "mailboxes" para ver os nomes '
+            "disponíveis.",
+        )
+        self.runner.register(MAIL_LIST_RECENT, Outcome(0, MAIL_MISSING_MAILBOX_MARKER, ""))
+        with self.assertRaises(ConnectorError) as ctx2:
+            self.manager.run_action("mail", "list_recent", {"mailbox": "Não Existe"})
+        self.assertEqual(
+            str(ctx2.exception),
+            'Mailbox não encontrada — use a ação "mailboxes" para ver os nomes '
+            "disponíveis.",
+        )
+        # argv was still recorded for the failing executions (mirror music)
+        self.assertEqual(self.runner.last_argv(), ["Não Existe", "20"])
+
+    def test_error_and_no_account_markers_map_to_clean_copies(self):
+        self.runner.register(MAIL_UNREAD_COUNT, Outcome(0, MAIL_ERROR_MARKER, ""))
+        with self.assertRaises(ConnectorError) as ctx:
+            self.manager.run_action("mail", "unread_count", {})
+        self.assertEqual(str(ctx.exception), "Mail action failed: unexpected AppleScript error.")
+        self.runner.register(MAIL_UNREAD_COUNT, Outcome(0, NO_ACCOUNT_MARKER, ""))
+        with self.assertRaises(ConnectorError) as ctx2:
+            self.manager.run_action("mail", "unread_count", {"account": "fantasma"})
+        self.assertEqual(
+            str(ctx2.exception),
+            "Nenhuma conta configurada — configure uma conta no Mail primeiro.",
+        )
+
+    def test_ungranted_gate_never_reaches_runner_exact_copy(self):
+        gate_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(gate_tmp.cleanup)
+        gate_runner = RecordingRunner()
+        gate_runner.register(MAIL_UNREAD_COUNT, Outcome(0, "0", ""))
+        manager = ConnectorManager(gate_tmp.name, runner=gate_runner)
+        for status in ("unknown", "denied", "needs_consent"):
+            manager.state.record("mail", status)
+            self.assertEqual(gate_runner.calls, [])
+            with self.assertRaises(ConnectorError) as ctx:
+                manager.run_action("mail", "unread_count", {})
+            # gate copy flows from the existing PT-BR machinery verbatim
+            self.assertEqual(
+                str(ctx.exception),
+                "Mail ainda não está conectado — conecte mail em Settings › Connectors.",
+            )
+            self.assertEqual(gate_runner.calls, [])  # runner never invoked on the gate
+
+    def test_probe_mail_grant_and_denial_classification(self):
+        granted_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(granted_tmp.cleanup)
+        granted_runner = RecordingRunner()
+        granted_runner.register(PROBE_SCRIPTS["mail"], Outcome(0, "0,0", ""))
+        manager = ConnectorManager(granted_tmp.name, runner=granted_runner)
+        self.assertEqual(manager.probe("mail")["status"], "granted")
+        self.assertEqual(manager.state.read()["mail"]["status"], "granted")
+        # canned -1743 denial: classified AND persisted (mirror calendar/music)
+        denied_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(denied_tmp.cleanup)
+        denied_runner = RecordingRunner()
+        denied_runner.register(
+            PROBE_SCRIPTS["mail"], Outcome(1, "", "Not authorized to send Apple events (-1743)")
+        )
+        manager2 = ConnectorManager(denied_tmp.name, runner=denied_runner)
+        self.assertEqual(manager2.probe("mail")["status"], "denied")
+        self.assertEqual(manager2.state.read()["mail"]["status"], "denied")
+
+
+class TestShortcutsMailGatingProbeAndMockWorld(unittest.TestCase):
+    """Membership batteries, probe-registration sanity, and the env-gated
+    mock world observability for the shortcuts + mail domains."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_domain_membership_and_gate_lists(self):
+        self.assertIn("shortcuts", CONNECTOR_DOMAINS)
+        self.assertIn("mail", CONNECTOR_DOMAINS)
+        self.assertEqual(CONNECTOR_DOMAINS.index("shortcuts"), 4)
+        self.assertEqual(CONNECTOR_DOMAINS.index("mail"), 5)
+        self.assertEqual(CONNECTOR_DOMAINS[6], "system")
+        self.assertIn("mail", GATED_DOMAINS)
+        self.assertNotIn("shortcuts", GATED_DOMAINS)
+        self.assertEqual(CONNECTOR_ACTIONS["shortcuts"], ("list", "run"))
+        self.assertEqual(
+            CONNECTOR_ACTIONS["mail"], ("unread_count", "mailboxes", "list_recent")
+        )
+
+    def test_mail_scripts_error_only_when_named_mailbox_matched_nothing(self):
+        """FIX-1 regression: the mail scripts' marker fires ONLY when the
+        named mailbox matched ZERO mailboxes across the scanned accounts
+        (`mailboxArg is not "" and not mailboxFound`); a mailbox present in
+        some but not all accounts counts normally (the old missingMailbox
+        conflation is gone)."""
+        for script in (MAIL_UNREAD_COUNT, MAIL_LIST_RECENT):
+            self.assertIn("set mailboxFound to false", script)
+            self.assertIn(
+                "(count of sourceMailboxes) is greater than 0 then set mailboxFound to true",
+                script,
+            )
+            self.assertIn(
+                'if mailboxArg is not "" and not mailboxFound then return '
+                '"connectors-mail-missing-mailbox"',
+                script,
+            )
+            self.assertNotIn("missingMailbox", script)
+
+    def test_probe_registration_and_bundle_battery(self):
+        self.assertEqual(PROBE_COMMANDS["shortcuts"], ["shortcuts", "list"])
+        self.assertIn("mail", PROBE_SCRIPTS)
+        self.assertIn("com.apple.mail", PROBE_SCRIPTS["mail"])
+        for script in (MAIL_UNREAD_COUNT, MAIL_MAILBOXES, MAIL_LIST_RECENT):
+            self.assertIn("com.apple.mail", script)
+            self.assertNotIn("do shell script", script)
+            self.assertNotIn("run script", script)
+        source = PROBE_SCRIPTS["mail"]
+        self.assertNotIn("do shell script", source)
+        self.assertNotIn("run script", source)
+
+    def test_rows_shortcuts_ungated_granted_and_mail_gated_unknown(self):
+        manager = ConnectorManager(
+            self.tmp.name,
+            runner=lambda cmd, timeout, stdin=None: Outcome(0, "0", ""),
+        )
+        rows = manager.rows()["connectors"]
+        self.assertEqual(
+            set(rows),
+            {"reminders", "notes", "calendar", "music", "shortcuts", "mail", "system"},
+        )
+        self.assertEqual(
+            rows["shortcuts"],
+            {"status": "granted", "granted": True, "last_probe": None, "hint": HINT_SHORTCUTS},
+        )
+        self.assertFalse(rows["mail"]["granted"])  # gate machinery still applies
+
+    def test_mock_shortcuts_and_mail_observability(self):
+        try:
+            os.environ["NOTIFYBOT_CONNECTORS_MOCK"] = "1"
+        finally:
+            pass
+        try:
+            manager = ConnectorManager(self.tmp.name)  # env mock runner active
+            self.assertEqual(
+                manager.run_action("shortcuts", "list", {}),
+                {"names": ["Resumo da semana", "Abrir agenda", "Backup das fotos"]},
+            )
+            self.assertEqual(
+                manager.run_action("shortcuts", "run", {"name": "Resumo da semana"}),
+                {"output": "atalho executado", "exit_code": 0},
+            )
+            # unknown shortcut name: clean error, and the run cmd never went
+            # to the mock runner (only the pre-check list call did)
+            mock_calls = []
+            original = manager._mock_runner
+
+            def recording(cmd, timeout, stdin=None):
+                mock_calls.append(list(cmd))
+                return original(cmd, timeout, stdin)
+
+            manager._mock_runner = recording
+            with self.assertRaises(ConnectorError) as ctx:
+                manager.run_action("shortcuts", "run", {"name": "Fantasma"})
+            self.assertEqual(
+                str(ctx.exception),
+                'Atalho não encontrado — use a ação "list" para ver os atalhos '
+                "disponíveis.",
+            )
+            self.assertEqual(
+                [(cmd[0], cmd[1]) for cmd in mock_calls], [("shortcuts", "list")]
+            )
+            # mail (gated): consent first, then the read-level-1 fixtures
+            manager.state.record("mail", "granted")
+            self.assertEqual(manager.run_action("mail", "unread_count", {}), {"unread": 3})
+            self.assertEqual(
+                manager.run_action("mail", "mailboxes", {}),
+                {"mailboxes": ["INBOX", "Enviados", "Arquivo"]},
+            )
+            self.assertEqual(
+                manager.run_action("mail", "list_recent", {}),
+                {"messages": [
+                    {"subject": "Relatório mensal pronto",
+                     "from": "Fulano <fulano@exemplo.com>",
+                     "received": "31/10/2026 18:02"},
+                    {"subject": "Re: contratos",
+                     "from": "Beltrano <beltrano@exemplo.com>",
+                     "received": "01/11/2026 09:15"},
+                ]},
+            )
+            with self.assertRaises(ConnectorError) as mbx_ctx:
+                manager.run_action("mail", "unread_count", {"mailbox": "Não Existe"})
+            self.assertEqual(
+                str(mbx_ctx.exception),
+                'Mailbox não encontrada — use a ação "mailboxes" para ver os nomes '
+                "disponíveis.",
+            )
+        finally:
+            os.environ.pop("NOTIFYBOT_CONNECTORS_MOCK", None)
+
+    def test_reset_mock_world_reseeds_shortcuts_and_mail(self):
+        try:
+            os.environ["NOTIFYBOT_CONNECTORS_MOCK"] = "1"
+        finally:
+            pass
+        try:
+            manager = ConnectorManager(self.tmp.name)  # env mock runner active
+            manager.state.record("mail", "granted")
+            # mutate BOTH worlds away from the seed...
+            manager._mock_mail["unread"] = 99
+            manager._mock_mail["mailboxes"].append("Fantasma")
+            manager._mock_shortcuts["names"].append("Fantasma")
+            manager.reset_mock_world()
+            # ...and observe the post-reset seed state end to end
+            self.assertEqual(
+                manager.run_action("mail", "unread_count", {}),
+                {"unread": 3},
+            )
+            self.assertEqual(
+                manager.run_action("mail", "mailboxes", {}),
+                {"mailboxes": ["INBOX", "Enviados", "Arquivo"]},
+            )
+            self.assertEqual(
+                manager.run_action("shortcuts", "list", {}),
+                {"names": ["Resumo da semana", "Abrir agenda", "Backup das fotos"]},
+            )
+        finally:
+            os.environ.pop("NOTIFYBOT_CONNECTORS_MOCK", None)
+
+    def test_mock_probe_flows_grant_new_domains(self):
+        try:
+            os.environ["NOTIFYBOT_CONNECTORS_MOCK"] = "1"
+        finally:
+            pass
+        try:
+            manager = ConnectorManager(self.tmp.name)  # env mock runner active
+            # shortcuts probe goes through PROBE_COMMANDS (CLI list outcome)
+            self.assertEqual(manager.probe("shortcuts")["status"], "granted")
+            self.assertEqual(manager.state.read()["shortcuts"]["status"], "granted")
+            # mail probe rides the trivial-success fallback for its script
+            self.assertEqual(manager.probe("mail")["status"], "granted")
+            self.assertEqual(manager.state.read()["mail"]["status"], "granted")
+            self.assertEqual(manager.rows()["connectors"]["shortcuts"]["hint"], HINT_SHORTCUTS)
+        finally:
+            os.environ.pop("NOTIFYBOT_CONNECTORS_MOCK", None)
+
+    def test_mock_mail_account_not_found_maps_to_clean_ptbr(self):
+        """FIX-5 regression: the env-mock mail world is account-aware — an
+        unknown non-empty account yields the NO_ACCOUNT_MARKER outcome, which
+        the parser maps to the clean PT-BR account-setup copy; a known account
+        proceeds with the mailbox-name rule."""
+        try:
+            os.environ["NOTIFYBOT_CONNECTORS_MOCK"] = "1"
+        finally:
+            pass
+        try:
+            manager = ConnectorManager(self.tmp.name)  # env mock runner active
+            manager.state.record("mail", "granted")
+            # unknown account (unread_count) -> NO_ACCOUNT_MARKER -> clean copy
+            with self.assertRaises(ConnectorError) as ctx:
+                manager.run_action("mail", "unread_count", {"account": "Fantasma"})
+            self.assertEqual(
+                str(ctx.exception),
+                "Nenhuma conta configurada — configure uma conta no Mail primeiro.",
+            )
+            # a known account proceeds with the mailbox rule: missing mailbox
+            with self.assertRaises(ConnectorError) as ctx2:
+                manager.run_action(
+                    "mail", "unread_count", {"account": "iCloud", "mailbox": "Não Existe"}
+                )
+            self.assertEqual(
+                str(ctx2.exception),
+                'Mailbox não encontrada — use a ação "mailboxes" para ver os nomes '
+                "disponíveis.",
+            )
+            # known account + no mailbox named -> the seeded unread count
+            self.assertEqual(
+                manager.run_action("mail", "unread_count", {"account": "Gmail"}),
+                {"unread": 3},
+            )
+            # list_recent carries NO account channel (script signature is
+            # plan-verbatim {mailboxArg, limitArg}): its mailbox rule fires and
+            # the ignored 'account' param never reaches the runner.
+            with self.assertRaises(ConnectorError) as ctx3:
+                manager.run_action(
+                    "mail", "list_recent", {"account": "Fantasma", "mailbox": "Não Existe"}
+                )
+            self.assertEqual(
+                str(ctx3.exception),
+                'Mailbox não encontrada — use a ação "mailboxes" para ver os nomes '
+                "disponíveis.",
+            )
+            self.assertEqual(
+                manager.run_action("mail", "list_recent", {}),
+                {"messages": [
+                    {"subject": "Relatório mensal pronto",
+                     "from": "Fulano <fulano@exemplo.com>",
+                     "received": "31/10/2026 18:02"},
+                    {"subject": "Re: contratos",
+                     "from": "Beltrano <beltrano@exemplo.com>",
+                     "received": "01/11/2026 09:15"},
+                ]},
+            )
+        finally:
+            os.environ.pop("NOTIFYBOT_CONNECTORS_MOCK", None)
+
+    def test_mock_reset_reseeds_mail_accounts(self):
+        """reset_mock_world reseeds the FIX-5 accounts key too."""
+        try:
+            os.environ["NOTIFYBOT_CONNECTORS_MOCK"] = "1"
+        finally:
+            pass
+        try:
+            manager = ConnectorManager(self.tmp.name)  # env mock runner active
+            manager.state.record("mail", "granted")
+            manager._mock_mail["accounts"].append("Fantasma")
+            manager.reset_mock_world()
+            with self.assertRaises(ConnectorError) as ctx:
+                manager.run_action("mail", "unread_count", {"account": "Fantasma"})
+            self.assertIn("Nenhuma conta configurada", str(ctx.exception))
+        finally:
+            os.environ.pop("NOTIFYBOT_CONNECTORS_MOCK", None)
 
 
 if __name__ == "__main__":

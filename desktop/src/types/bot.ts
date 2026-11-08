@@ -269,6 +269,8 @@ export interface ConnectorsResponse {
     notes: ConnectorRow;
     calendar: ConnectorRow;
     music: ConnectorRow;
+    shortcuts: ConnectorRow;
+    mail: ConnectorRow;
     system: ConnectorRow;
   };
 }
