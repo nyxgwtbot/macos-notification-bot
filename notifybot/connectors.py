@@ -106,6 +106,17 @@ SHORTCUTS_TIMEOUT_S = 10.0
 #: window that covers that wait (45s: wait loop + activate + safety margin).
 QUICKTIME_RECORD_TIMEOUT_S = 45.0
 
+#: Script returns this marker when the recording doc never appeared (60s
+#: wait exhausted): the setup window is awaiting a manual confirmation.
+QUICKTIME_DOC_TIMEOUT_MARKER = "connectors-qt-doc-timeout"
+
+#: User-visible error for the doc-timeout marker (honest: setup window may
+#: need a manual click; script side holds NO slot in that case).
+ERR_QT_RECORD_SETUP = (
+    "{display} não conseguiu iniciar a gravação — a tela de preparação "
+    "provavelmente pede uma confirmação manual. Nada foi gravado."
+)
+
 #: Env var that swaps the osascript runner for the in-process mock world.
 CONNECTORS_MOCK_ENV = "NOTIFYBOT_CONNECTORS_MOCK"
 
@@ -2706,6 +2717,14 @@ class ConnectorManager:
             def post(raw: dict, _audio: bool = audio) -> dict:
                 items = raw["items"]
                 doc_id = items[0] if items else ""
+                if doc_id == QUICKTIME_DOC_TIMEOUT_MARKER:
+                    # `new screen recording` opened the setup window but no
+                    # document appeared within 30s (Setup needs a manual
+                    # "Record" click on modern macOS — no UI scripting here).
+                    # Do NOT occupy the recording slot.
+                    raise ConnectorError(
+                        ERR_QT_RECORD_SETUP.format(display=_DISPLAY_NAMES["quicktime"])
+                    )
                 self._qt_recording = {"doc_id": doc_id, "kind": "screen"}
                 return {"ok": True, "doc_id": doc_id, "with_audio": _audio}
 
