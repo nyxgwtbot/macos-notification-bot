@@ -49,6 +49,16 @@
   color: var(--ion-color-danger);
 }
 
+.nb-banner-info {
+  background: var(--nb-info-muted);
+  color: var(--nb-info);
+}
+
+.nb-banner-ok {
+  background: var(--nb-green-muted);
+  color: var(--ion-color-success);
+}
+
 .nb-offline {
   display: flex;
   align-items: center;
@@ -149,6 +159,10 @@
   background: var(--nb-info-muted);
   color: var(--nb-info);
 }
+.nb-status-muted {
+  background: var(--nb-bg-elevated);
+  color: var(--nb-text-secondary);
+}
 .nb-status-warn {
   background: var(--nb-chip-warn-bg);
   color: var(--nb-chip-warn-fg);
@@ -160,6 +174,21 @@
 .nb-status-live {
   background: var(--nb-teal-muted);
   color: var(--nb-teal-light);
+}
+
+/* Needs-consent nudge: opacity pulse on the dot only (1.6s ease-in-out).
+   Gated app-wide by the prefers-reduced-motion block below. */
+@keyframes nb-chip-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.nb-status-warn.is-pulsing .nb-dot {
+  animation: nb-chip-pulse 1.6s ease-in-out infinite;
 }
 
 /* ========================================

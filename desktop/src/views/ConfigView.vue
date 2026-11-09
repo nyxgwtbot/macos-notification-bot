@@ -169,40 +169,95 @@
       <ion-card>
         <ion-card-header><ion-card-title>Connectors</ion-card-title></ion-card-header>
         <ion-card-content>
+          <!-- one-line orienting caption; instructions live in hints + banner -->
           <p class="nb-muted">
-            Connectors let the in-app agent (Chat tab) control native macOS apps. macOS may show a
-            system consent prompt — approve it while this app is focused.
+            Grant the assistant access to native macOS apps. macOS shows a consent prompt the first
+            time.
           </p>
-          <template v-if="connectors.rows.length > 0">
-            <div v-for="row in connectors.rows" :key="row.domain" class="nb-connector-row">
-              <div class="nb-connector-head">
-                <strong>{{ row.domain }}</strong>
-                <span class="nb-status-chip" :class="'nb-status-' + statusChipTone(row.status)">
-                  <i class="nb-dot" aria-hidden="true"></i>{{ statusChipLabel(row.status) }}
-                </span>
-                <ion-button
-                  class="nb-connector-btn"
-                  size="small"
-                  :fill="row.granted ? 'clear' : 'outline'"
-                  :class="{ 'nb-connector-quiet': row.granted }"
-                  :disabled="isProbingConnectors(row.domain)"
-                  :aria-label="(row.granted ? 'Re-check ' : 'Connect ') + row.domain"
-                  @click="probeConnector(row.domain)"
-                >
-                  <ion-spinner v-if="isProbingConnectors(row.domain)" name="crescent" />
-                  <template v-else>{{ buttonLabel(row) }}</template>
-                </ion-button>
-              </div>
-              <p class="nb-muted nb-connector-hint">{{ row.hint }}</p>
-            </div>
-          </template>
-          <ion-spinner v-else name="crescent" class="nb-connectors-loading" />
+          <!-- triage: loading / error / empty never render together -->
+          <ion-spinner
+            v-if="!connectors.loaded && !connectors.error"
+            name="crescent"
+            class="nb-connectors-loading"
+          />
           <!-- R8: the error banner carries a Retry (same affordance as the
                config-load banner above) re-raising loadConnectors -->
-          <div v-if="connectors.error" class="nb-banner nb-banner-err">
-            <span>{{ connectors.error }}</span>
+          <div v-else-if="connectors.error" class="nb-banner nb-banner-err">
+            <span>{{ connectorsErrorText }}</span>
             <ion-button size="small" fill="outline" @click="loadConnectors">Retry</ion-button>
           </div>
+          <div v-else-if="connectors.rows.length === 0" class="nb-empty nb-connectors-empty">
+            <span>No connectors reported by the API.</span>
+            <ion-button size="small" fill="outline" @click="loadConnectors">Retry</ion-button>
+          </div>
+          <template v-else>
+            <!-- wizard banner: single macOS prompt at a time, honest states -->
+            <div
+              v-if="connectorsBanner"
+              class="nb-banner nb-connectors-banner"
+              :class="connectorsBannerClass"
+              role="status"
+              aria-live="polite"
+            >
+              <ion-spinner v-if="connectorsBanner.spinner" name="crescent" />
+              <span>{{ connectorsBanner.text }}</span>
+              <span class="nb-connectors-banner-actions">
+                <ion-button
+                  v-if="connectorsBanner.checkAgain"
+                  size="small"
+                  fill="outline"
+                  @click="recheckActive"
+                  >Check again</ion-button
+                >
+                <ion-button
+                  v-if="connectorsBanner.dismiss"
+                  size="small"
+                  fill="outline"
+                  @click="dismissWizard"
+                  >Dismiss</ion-button
+                >
+              </span>
+            </div>
+            <!-- grouped adaptive grid: API order, no client-side domain filter -->
+            <div class="nb-connectors-grid">
+              <template v-for="group in connectorGroups" :key="group.key">
+                <p class="nb-connectors-group-label">{{ group.label }}</p>
+                <div v-for="row in group.rows" :key="row.domain" class="nb-connector-row">
+                  <div class="nb-connector-head">
+                    <strong>{{ row.name }}</strong>
+                    <span
+                      class="nb-status-chip"
+                      :class="[
+                        connectorChipClass(row),
+                        {
+                          'is-pulsing': row.status === 'needs_consent' && !connectorQueued(row),
+                        },
+                      ]"
+                    >
+                      <i class="nb-dot" aria-hidden="true"></i>{{ connectorChipLabel(row) }}
+                    </span>
+                    <!-- always-available rows never need action: no button -->
+                    <ion-button
+                      v-if="row.group !== 'always'"
+                      class="nb-connector-btn"
+                      size="small"
+                      :fill="row.granted ? 'clear' : 'outline'"
+                      :class="{ 'nb-connector-quiet': row.granted, 'nb-connector-danger': row.status === 'denied' }"
+                      :disabled="connectorsBusy"
+                      :aria-label="buttonLabel(row) + ' ' + row.name"
+                      @click="probeConnector(row.domain)"
+                    >
+                      <ion-spinner v-if="isProbingConnectors(row.domain)" name="crescent" />
+                      <template v-else>{{ buttonLabel(row) }}</template>
+                    </ion-button>
+                  </div>
+                  <p v-if="row.hint" class="nb-muted nb-connector-hint" :title="row.hint">
+                    {{ row.hint }}
+                  </p>
+                </div>
+              </template>
+            </div>
+          </template>
         </ion-card-content>
       </ion-card>
 
@@ -384,14 +439,18 @@ import {
   type DirtyGuardState
 } from '@/viewModels/configDirtyViewModel';
 import {
+  PID_RESTART_PREFIX,
   buttonLabel,
+  connectorDisplayName,
   initialConnectorsState,
   isProbing,
+  isProbingAnywhere,
   reduceConnectors,
-  statusChipTone,
   statusChipLabel,
+  statusChipTone,
   type ConnectorsEvent,
   type ConnectorsState,
+  type ConnectorRowView,
 } from '@/viewModels/connectorsViewModel';
 import type { BotConfig, BotRule } from '@/types/bot';
 
@@ -438,9 +497,17 @@ async function loadConnectors(): Promise<void> {
 }
 
 async function probeConnector(domain: string): Promise<void> {
-  // concurrent-probe guard: the button disables, but double-check anyway
-  if (isProbing(connectors.value, domain)) return;
+  const state = connectors.value;
+  if (isProbing(state, domain)) return;
+  // wizard gate: one prompt at a time — later clicks join the queue
+  if (state.active !== null && state.active !== domain) {
+    dispatchConnectors({ type: 'enqueued', domain });
+    return;
+  }
+  dispatchConnectors({ type: 'activated', domain });
   dispatchConnectors({ type: 'probe-start', domain });
+  // card-wide single-flight backstop: the guard may have no-op'd the start
+  if (!isProbing(connectors.value, domain)) return;
   try {
     const probe = await notifyClient.postConnectorProbe(domain);
     dispatchConnectors({
@@ -450,12 +517,153 @@ async function probeConnector(domain: string): Promise<void> {
         status: probe.status,
         granted: probe.status === 'granted',
         last_probe: probe.last_probe,
-        hint: '',
+        hint: probe.hint ?? '',
       },
+      pid: probe.pid,
     });
+    if (probe.status === 'granted') {
+      // granted results advance the queue automatically; non-granted hold it
+      dispatchConnectors({ type: 'queue-advanced' });
+      const nextDomain = connectors.value.active;
+      // the recursive start is guaranteed to land: probe-succeeded already
+      // cleared probing[domain] before the advance, and the reducer's
+      // card-wide guard makes a parallel flight impossible.
+      if (nextDomain) void probeConnector(nextDomain);
+    }
   } catch (err) {
+    // F1: a probe failure is additive — keep the wizard session (active +
+    // queue hold) so the banner can instruct; Dismiss is the explicit exit.
     dispatchConnectors({ type: 'probe-failed', domain, error: errorText(err) });
   }
+}
+
+function recheckActive(): void {
+  const domain = connectors.value.active;
+  if (domain) void probeConnector(domain);
+}
+
+function dismissWizard(): void {
+  dispatchConnectors({ type: 'queue-cleared' });
+}
+
+interface ConnectorsBannerView {
+  tone: 'warn' | 'err' | 'info' | 'ok';
+  spinner?: boolean;
+  text: string;
+  checkAgain?: boolean;
+  dismiss?: boolean;
+}
+
+const connectorsBusy = computed(() => isProbingAnywhere(connectors.value));
+
+/** Map the server's single-flight 409 phrase to plain English (both load + probe paths). */
+function friendlyProbeError(text: string): string {
+  // couples to api.py:951's exact 409 message ("already running")
+  return text.includes('already running')
+    ? 'Another permission check is running — wait a moment.'
+    : text;
+}
+
+const connectorsErrorText = computed(() => friendlyProbeError(connectors.value.error ?? ''));
+
+const connectorsBanner = computed<ConnectorsBannerView | null>(() => {
+  const wizard = connectors.value;
+  if (!wizard.loaded || wizard.error) return null;
+  const activeName = wizard.active ? connectorDisplayName(wizard.active) : null;
+  if (wizard.pidRestart && wizard.active && activeName) {
+    return {
+      tone: 'info',
+      text: `${PID_RESTART_PREFIX} Press Repair on ${activeName} to try again.`,
+      dismiss: true,
+    };
+  }
+  if (wizard.probeError && wizard.active) {
+    return {
+      tone: 'err',
+      text: friendlyProbeError(wizard.probeError),
+      checkAgain: true,
+      dismiss: true,
+    };
+  }
+  if (wizard.active && wizard.probing[wizard.active] && activeName) {
+    return { tone: 'warn', spinner: true, text: `Asking macOS for ${activeName} access…` };
+  }
+  const activeRow = wizard.active
+    ? wizard.rows.find((row) => row.domain === wizard.active)
+    : undefined;
+  if (wizard.active && activeRow && !wizard.probing[wizard.active]) {
+    if (activeRow.status === 'needs_consent') {
+      return {
+        tone: 'warn',
+        text: 'If a macOS permission window is open, click Allow. Then press Check again.',
+        checkAgain: true,
+        dismiss: true,
+      };
+    }
+    if (activeRow.status === 'denied') {
+      return {
+        tone: 'err',
+        text: `macOS denied ${activeName} access. Press Repair to open the permission window again.`,
+        checkAgain: true,
+        dismiss: true,
+      };
+    }
+  }
+  if (wizard.grantedNames.length > 0) {
+    return {
+      tone: 'ok',
+      text: `Done — connected: ${wizard.grantedNames.join(', ')}.`,
+      dismiss: true,
+    };
+  }
+  return null;
+});
+
+const connectorsBannerClass = computed<string | null>(() => {
+  switch (connectorsBanner.value?.tone) {
+    case 'err':
+      return 'nb-banner-err';
+    case 'info':
+      return 'nb-banner-info';
+    case 'ok':
+      return 'nb-banner-ok';
+    case 'warn':
+      return 'nb-banner-warn';
+    default:
+      return null;
+  }
+});
+
+const CONNECTOR_GROUP_LABELS: Record<'native' | 'always' | 'other', string> = {
+  native: 'Native apps — macOS asks for consent',
+  always: 'Always available — no consent needed',
+  other: 'Other',
+};
+
+const connectorGroups = computed(() => {
+  const buckets: Record<'native' | 'always' | 'other', ConnectorRowView[]> = {
+    native: [],
+    always: [],
+    other: [],
+  };
+  for (const row of connectors.value.rows) buckets[row.group].push(row);
+  return (['native', 'always', 'other'] as const)
+    .filter((key) => buckets[key].length > 0)
+    .map((key) => ({ key, label: CONNECTOR_GROUP_LABELS[key], rows: buckets[key] }));
+});
+
+function connectorQueued(row: ConnectorRowView): boolean {
+  return connectors.value.queue.includes(row.domain) && connectors.value.active !== row.domain;
+}
+
+function connectorChipClass(row: ConnectorRowView): string {
+  if (connectorQueued(row)) return 'nb-status-muted';
+  return 'nb-status-' + statusChipTone(row.status);
+}
+
+function connectorChipLabel(row: ConnectorRowView): string {
+  if (connectorQueued(row)) return 'Queued';
+  return statusChipLabel(row.status);
 }
 
 const draft = reactive<ConfigDraft>({
@@ -959,13 +1167,10 @@ onUnmounted(() => {
   padding-left: var(--nb-space-4);
   font-size: var(--nb-fs-secondary);
 }
-/* ST1: calm separators — solid hairline (was dashed) */
+/* G2: hairline separators leave with the grid — row-gap rhythm replaces
+   the per-row rule (a border would collide with 2-col cells). */
 .nb-connector-row {
-  border-bottom: 1px solid var(--nb-border-default);
   padding: var(--nb-space-2) 0;
-}
-.nb-connector-row:last-of-type {
-  border-bottom: none;
 }
 .nb-connector-head {
   display: flex;
@@ -975,6 +1180,9 @@ onUnmounted(() => {
 .nb-connector-hint {
   margin: var(--nb-space-1) 0 0;
   font-size: var(--nb-fs-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .nb-connectors-loading {
   display: block;
@@ -1000,6 +1208,63 @@ onUnmounted(() => {
   --color-focused: var(--nb-text-primary) !important;
   --border-radius: var(--nb-radius-sm) !important;
   --box-shadow: none !important;
+}
+/* G5: denied rows get recovery wording — same !important custom-prop channel
+   as .nb-connector-quiet (proven route past Ionic md :host() specificity). */
+.nb-connector-danger {
+  --background: transparent !important;
+  --background-hover: var(--nb-danger-muted) !important;
+  --background-activated: var(--nb-danger-muted) !important;
+  --background-focused: var(--nb-danger-muted) !important;
+  --background-focused-opacity: 1 !important;
+  --color: var(--nb-danger) !important;
+  --color-hover: var(--nb-danger) !important;
+  --color-activated: var(--nb-danger) !important;
+  --color-focused: var(--nb-danger) !important;
+  --border-color: var(--nb-danger) !important;
+  --border-radius: var(--nb-radius-sm) !important;
+  --box-shadow: none !important;
+}
+/* G4: card-scoped wizard banner — color pairs come from the shared nb-banner
+   variants; this only fixes placement and density. */
+.nb-connectors-banner {
+  margin: 0 0 var(--nb-space-4);
+}
+.nb-connectors-banner ion-spinner {
+  width: var(--nb-space-4);
+  height: var(--nb-space-4);
+}
+.nb-connectors-banner-actions {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nb-space-2);
+}
+/* G2: adaptive grouped grid — `container-type` applies to the grid element
+   itself (inside ion-card-content), not to the card content. The user
+   resizes the desktop window, so there is no breakpoint: auto-fit with
+   min(100%, 360px) degrades to one column without a media query. */
+.nb-connectors-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+  column-gap: var(--nb-space-4);
+  row-gap: var(--nb-space-2);
+  container-type: inline-size;
+}
+.nb-connectors-group-label {
+  grid-column: 1 / -1;
+  margin: var(--nb-space-2) 0 0;
+  font-size: var(--nb-fs-micro);
+  font-weight: 600;
+  color: var(--nb-text-secondary);
+}
+/* G8: empty state keeps the shared centered .nb-empty look; column flex for
+   the Retry button underneath. */
+.nb-connectors-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--nb-space-2);
 }
 /* ST2: Bot & Ollama fields read as editable inputs — elevated surface,
    strong hairline, radius, focus ring; labels stay small/muted (Ion stacked).

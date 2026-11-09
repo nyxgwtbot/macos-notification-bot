@@ -381,16 +381,21 @@ def main() -> int:
             if connectors_mock:
                 status, conn_body = api_request(base, "GET", "/api/connectors")
                 connectors = (conn_body or {}).get("connectors", {})
+                domain_names = {
+                    "reminders", "notes", "calendar", "music", "shortcuts", "mail",
+                    "contacts", "messages", "finder", "quicktime", "system",
+                }
                 shape_ok = (
                     status == 200
-                    and set(connectors) == {"reminders", "notes", "system"}
+                    and set(connectors) == domain_names
                     and all(
                         set(connectors.get(domain, {})) == {"status", "granted", "last_probe", "hint"}
-                        for domain in ("reminders", "notes", "system")
+                        for domain in domain_names
                     )
+                    and isinstance((conn_body or {}).get("pid"), int)
                     and connectors.get("system", {}).get("status") == "granted"
                     and connectors.get("system", {}).get("granted") is True
-                    and connectors.get("system", {}).get("hint") == "no consent required"
+                    and connectors.get("system", {}).get("hint") == "No consent required."
                 )
                 all_ok &= print_check(
                     "connectors list shape", shape_ok,
@@ -398,7 +403,15 @@ def main() -> int:
                 )
 
                 status, probe_body = api_request(base, "POST", "/api/connectors/probe", {"domain": "notes"})
-                probe_ok = status == 200 and (probe_body or {}).get("status") == "granted" and (probe_body or {}).get("ok") is True
+                probe_row = probe_body or {}
+                probe_ok = (
+                    status == 200
+                    and probe_row.get("status") == "granted"
+                    and probe_row.get("ok") is True
+                    and isinstance(probe_row.get("hint"), str)
+                    and bool(probe_row.get("hint"))
+                    and isinstance(probe_row.get("pid"), int)
+                )
                 all_ok &= print_check(
                     "connectors probe notes -> granted", probe_ok, str(probe_body)
                 )

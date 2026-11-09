@@ -23,6 +23,9 @@ from notifybot.connectors import (
     CONNECTOR_DOMAINS,
     ConnectorError,
     ConnectorManager,
+    HINT_GRANTED,
+    HINT_SYSTEM,
+    HINT_UNKNOWN,
     LIST_LIMIT_DEFAULT,
     LIST_LIMIT_MAX,
     NOTES_CREATE,
@@ -673,6 +676,8 @@ class TestConnectorEndpoints(unittest.TestCase):
     def test_get_connectors_shape_and_system_granted(self):
         status, body = self.fixture.request("GET", "/api/connectors")
         self.assertEqual(status, 200)
+        self.assertIsInstance(body.get("pid"), int)
+        self.assertEqual(body["pid"], os.getpid())
         connectors = body["connectors"]
         self.assertEqual(
             set(connectors),
@@ -685,10 +690,10 @@ class TestConnectorEndpoints(unittest.TestCase):
             self.assertEqual(row["status"], "unknown")
             self.assertFalse(row["granted"])
             self.assertIsNone(row["last_probe"])
-            self.assertIn("consent prompt", row["hint"])
+            self.assertEqual(row["hint"], HINT_UNKNOWN)
         self.assertEqual(
             connectors["system"],
-            {"status": "granted", "granted": True, "last_probe": None, "hint": "no consent required"},
+            {"status": "granted", "granted": True, "last_probe": None, "hint": HINT_SYSTEM},
         )
         # shortcuts row: ungated via the rows() special-case (always granted,
         # own CLI hint), even with an unknown/never-probed state store row.
@@ -703,6 +708,9 @@ class TestConnectorEndpoints(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["status"], "granted")
         self.assertTrue(body["ok"])
+        self.assertEqual(body["hint"], HINT_GRANTED)
+        self.assertIsInstance(body.get("pid"), int)
+        self.assertEqual(body["pid"], os.getpid())
         state_path = os.path.join(self.tmp.name, "data", "connectors_state.json")
         self.assertTrue(os.path.exists(state_path))
         with open(state_path, "r", encoding="utf-8") as f:

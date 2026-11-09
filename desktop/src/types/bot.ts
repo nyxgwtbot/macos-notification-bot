@@ -277,6 +277,8 @@ export interface ConnectorsResponse {
     quicktime: ConnectorRow;
     system: ConnectorRow;
   };
+  /** pid of the API process that built the payload (restart detection). */
+  pid?: number;
 }
 
 /** POST /api/connectors/probe response (row 16). */
@@ -285,6 +287,10 @@ export interface ConnectorProbeResponse {
   domain: string;
   status: ConnectorStatus;
   last_probe: string | null;
+  /** Server EN hint for the resulting status (older servers omit it). */
+  hint?: string;
+  /** pid of the API process that answered the probe (restart detection). */
+  pid?: number;
 }
 
 /** 400 {error, details:[…]} error bodies from the API. */

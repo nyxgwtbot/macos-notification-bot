@@ -178,18 +178,12 @@ VALID_STATUSES = frozenset({STATUS_UNKNOWN, STATUS_GRANTED, STATUS_NEEDS_CONSENT
 
 # English hint strings surfaced by GET /api/connectors (Settings copy is
 # English per owner rule; only chat-relayed tool errors are PT-BR).
-HINT_SYSTEM = "no consent required"
-HINT_GRANTED = "connected — the in-app agent may use this domain."
-HINT_NEEDS_CONSENT = "macOS may show a system consent prompt — approve it while this app is focused."
-HINT_DENIED = (
-    "macOS previously denied automation for this domain — press Connect and "
-    "approve the prompt while this app is focused."
-)
-HINT_UNKNOWN = HINT_NEEDS_CONSENT
-HINT_SHORTCUTS = (
-    "Shortcuts run through the system CLI — no consent needed. A shortcut may "
-    "touch apps that ask for their own permission."
-)
+HINT_SYSTEM = "No consent required."
+HINT_GRANTED = "Connected — the assistant can use this domain."
+HINT_NEEDS_CONSENT = "A macOS permission window may be open — click Allow, then Check again."
+HINT_DENIED = "macOS blocked this access. Repair re-opens the permission window — approve when it appears."
+HINT_UNKNOWN = "Not checked yet — press Connect to test access."
+HINT_SHORTCUTS = "Runs through the system CLI — no consent needed."
 
 # `open` target validation (system.open runs ["open", ...], never osascript).
 _URL_TARGET_RE = re.compile(r"^https?://")
@@ -1871,8 +1865,9 @@ class ConnectorManager:
     # ---- public API -------------------------------------------------------
 
     def rows(self) -> dict:
-        """GET /api/connectors payload: per-domain status/granted/last_probe/hint.
-        ``system`` is always granted (no consent required)."""
+        """GET /api/connectors payload: per-domain status/granted/last_probe/hint
+        plus ``pid`` (server process id). ``system`` is always granted (no
+        consent required)."""
         store_rows = self.state.read()
         connectors: Dict[str, Any] = {}
         for domain in CONNECTOR_DOMAINS:
@@ -1891,7 +1886,7 @@ class ConnectorManager:
                 "last_probe": store_rows[domain]["last_probe"],
                 "hint": hint,
             }
-        return {"connectors": connectors}
+        return {"connectors": connectors, "pid": os.getpid()}
 
     def run_action(self, domain: str, action: str, params: Any) -> dict:
         """Validate -> consent-gate -> argv-build -> run -> classify. Raises
@@ -1948,7 +1943,7 @@ class ConnectorManager:
 
     def probe(self, domain: str) -> dict:
         """Single-flight per-domain probe; returns ``{ok, domain, status,
-        last_probe}``. Never raises for app-level outcomes (a hang classifies
+        last_probe, hint, pid}``. Never raises for app-level outcomes (a hang classifies
         needs_consent; a -1743/error classifies denied)."""
         if domain not in CONNECTOR_DOMAINS:
             raise ConnectorError(ERR_UNKNOWN_DOMAIN.format(domain=domain))
@@ -1970,7 +1965,14 @@ class ConnectorManager:
             except _ScriptFailure as failure:
                 status = STATUS_NEEDS_CONSENT if failure.kind == "timeout" else STATUS_DENIED
             stored = self.state.record(domain, status)
-            return {"ok": True, "domain": domain, "status": status, "last_probe": stored["last_probe"]}
+            return {
+                "ok": True,
+                "domain": domain,
+                "status": status,
+                "last_probe": stored["last_probe"],
+                "hint": _hint_for(status),
+                "pid": os.getpid(),
+            }
         finally:
             lock.release()
 

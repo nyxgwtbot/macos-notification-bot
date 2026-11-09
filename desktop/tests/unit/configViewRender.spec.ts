@@ -30,7 +30,7 @@ import { useBotStore } from '../../src/stores/bot';
 import { notifyClient } from '../../src/services/notifyClient';
 import { ACTION_COMMAND_REQUIRED_TEXT } from '../../src/services/configValidation';
 import ConfigView from '../../src/views/ConfigView.vue';
-import type { BotConfig } from '../../src/types/bot';
+import type { BotConfig, ConnectorsResponse } from '../../src/types/bot';
 
 function baseConfig(overrides: Partial<BotConfig> = {}): BotConfig {
   return {
@@ -66,6 +66,11 @@ function connectorsResponse() {
   };
 }
 
+/** One probe-able API row for custom connector payloads. */
+function connectorRow(status: string, granted = false) {
+  return { status, granted, last_probe: null, hint: '' };
+}
+
 let pinia: Pinia | null = null;
 let mounted: VueWrapper<any> | null = null;
 /** (target, options) pairs recorded from Element.prototype.scrollIntoView
@@ -80,7 +85,7 @@ function lastScrollCall(): { target: Element; options?: ScrollIntoViewOptions } 
 
 async function mountConfig(
   config: BotConfig,
-  options: { connectorsReject?: string } = {}
+  options: { connectorsReject?: string; connectors?: ConnectorsResponse } = {}
 ): Promise<{ wrapper: VueWrapper<any>; saveConfigSpy: Mock; connectorsSpy: Mock }> {
   pinia = createPinia();
   setActivePinia(pinia);
@@ -92,7 +97,7 @@ async function mountConfig(
     .mockResolvedValue({ ok: true });
   const connectorsSpy = vi
     .spyOn(notifyClient, 'getConnectors')
-    .mockResolvedValue(connectorsResponse());
+    .mockResolvedValue(options.connectors ?? connectorsResponse());
   if (options.connectorsReject !== undefined) {
     // the first connectors load (onMounted) rejects; later retries resolve
     connectorsSpy.mockRejectedValueOnce(new Error(options.connectorsReject));
@@ -298,6 +303,142 @@ describe('ConfigView banner flow + actions validation (R8)', () => {
     });
   });
 
+  describe('Connectors probe wizard (rendered)', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    /** Click a row's action button and let the mocked probe land. */
+    async function clickRow(wrapper: VueWrapper<any>, index: number): Promise<void> {
+      const rows = wrapper.findAll('.nb-connector-row');
+      await rows[index].find('.nb-connector-btn').trigger('click');
+      await flushPromises();
+      await wrapper.vm.$nextTick();
+    }
+
+    test('a granted probe auto-advances the queued domain and shows the done banner', async () => {
+      const { wrapper } = await mountConfig(baseConfig(), {
+        connectors: {
+          pid: 4242,
+          connectors: {
+            reminders: connectorRow('unknown'),
+            notes: connectorRow('unknown')
+          }
+        } as unknown as ConnectorsResponse
+      });
+      const probeSpy = vi.spyOn(notifyClient, 'postConnectorProbe').mockResolvedValue({
+        ok: true,
+        domain: 'x',
+        status: 'granted',
+        last_probe: 't',
+        hint: 'granted',
+        pid: 4242
+      });
+
+      const rows = wrapper.findAll('.nb-connector-row');
+      expect(rows.length).toBe(2);
+      // dispatch both clicks synchronously so the second lands while the
+      // first flight is still live (it must join the queue, not race it)
+      const firstClick = rows[0].find('.nb-connector-btn').trigger('click');
+      const secondClick = rows[1].find('.nb-connector-btn').trigger('click');
+      await firstClick;
+      await secondClick;
+      await flushPromises();
+      await flushPromises();
+      await wrapper.vm.$nextTick();
+
+      expect(probeSpy).toHaveBeenCalledTimes(2);
+      expect(probeSpy.mock.calls.map((call) => call[0])).toEqual(['reminders', 'notes']);
+      // the queued (second) domain's granted result is rendered
+      expect(wrapper.findAll('.nb-connector-row')[1].text()).toContain('Granted');
+      const banner = wrapper.find('.nb-connectors-banner');
+      expect(banner.exists()).toBe(true);
+      expect(banner.text()).toContain('Done — connected: Reminders, Notes.');
+
+      wrapper.unmount();
+      mounted = null;
+    });
+
+    test('a needs_consent probe shows the Check again banner and re-probes the same domain', async () => {
+      const { wrapper } = await mountConfig(baseConfig());
+      const probeSpy = vi.spyOn(notifyClient, 'postConnectorProbe').mockResolvedValue({
+        ok: true,
+        domain: 'notes',
+        status: 'needs_consent',
+        last_probe: 't',
+        hint: 'ask',
+        pid: 4242
+      });
+
+      // fixture: rows[0]=reminders (granted), rows[1]=notes (needs_consent),
+      // rows[2]=system (always -> no button)
+      await clickRow(wrapper, 1);
+
+      const banner = wrapper.find('.nb-connectors-banner');
+      expect(banner.exists()).toBe(true);
+      expect(banner.text()).toContain('If a macOS permission window is open');
+      const checkAgain = banner.findAll('ion-button').find((b) => b.text() === 'Check again');
+      expect(checkAgain).toBeTruthy();
+      expect(probeSpy).toHaveBeenCalledTimes(1);
+
+      await checkAgain!.trigger('click');
+      await flushPromises();
+      await wrapper.vm.$nextTick();
+
+      expect(probeSpy).toHaveBeenCalledTimes(2);
+      expect(probeSpy.mock.calls[1][0]).toBe('notes');
+
+      wrapper.unmount();
+      mounted = null;
+    });
+
+    test('a rejected probe keeps all rows visible and shows the single-flight banner', async () => {
+      const { wrapper } = await mountConfig(baseConfig());
+      vi.spyOn(notifyClient, 'postConnectorProbe').mockRejectedValue(
+        new Error('a probe for notes is already running')
+      );
+
+      expect(wrapper.findAll('.nb-connector-row').length).toBe(3);
+      await clickRow(wrapper, 1);
+
+      // F1: the load-error triage never fires — the grid is still rendered
+      expect(wrapper.findAll('.nb-connector-row').length).toBe(3);
+      const banner = wrapper.find('.nb-connectors-banner');
+      expect(banner.exists()).toBe(true);
+      expect(banner.classes()).toContain('nb-banner-err');
+      expect(banner.text()).toContain('Another permission check is running — wait a moment.');
+
+      wrapper.unmount();
+      mounted = null;
+    });
+
+    test('Dismiss clears the wizard banner', async () => {
+      const { wrapper } = await mountConfig(baseConfig());
+      vi.spyOn(notifyClient, 'postConnectorProbe').mockResolvedValue({
+        ok: true,
+        domain: 'notes',
+        status: 'needs_consent',
+        last_probe: 't',
+        hint: 'ask',
+        pid: 4242
+      });
+
+      await clickRow(wrapper, 1);
+      const banner = wrapper.find('.nb-connectors-banner');
+      expect(banner.exists()).toBe(true);
+      const dismiss = banner.findAll('ion-button').find((b) => b.text() === 'Dismiss');
+      expect(dismiss).toBeTruthy();
+
+      await dismiss!.trigger('click');
+      await wrapper.vm.$nextTick();
+
+      expect(wrapper.find('.nb-connectors-banner').exists()).toBe(false);
+
+      wrapper.unmount();
+      mounted = null;
+    });
+  });
+
   describe('L5-R1 settings UX', () => {
     test('field labels read as plain names with dotted help text', async () => {
       const { wrapper } = await mountConfig(baseConfig());
@@ -355,10 +496,15 @@ describe('ConfigView banner flow + actions validation (R8)', () => {
       const rows = wrapper.findAll('.nb-connector-row');
       expect(rows.length).toBe(3);
 
-      const buttons = rows.map((row) => row.find('.nb-connector-btn'));
-      buttons.forEach((button) => expect(button.exists()).toBe(true));
-      expect(buttons[0].classes()).toContain('nb-connector-quiet');
-      expect(buttons[1].classes()).not.toContain('nb-connector-quiet');
+      // G2: the `always`-group domain (system) renders no action button; only
+      // the native reminders/notes rows carry one, pinned right.
+      const remindersBtn = rows[0].find('.nb-connector-btn');
+      const notesBtn = rows[1].find('.nb-connector-btn');
+      expect(remindersBtn.exists()).toBe(true);
+      expect(notesBtn.exists()).toBe(true);
+      expect(rows[2].find('.nb-connector-btn').exists()).toBe(false); // system = always
+      expect(remindersBtn.classes()).toContain('nb-connector-quiet');
+      expect(notesBtn.classes()).not.toContain('nb-connector-quiet');
 
       wrapper.unmount();
       mounted = null;
