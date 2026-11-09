@@ -101,6 +101,11 @@ CONNECTORS_TIMEOUT_S = 8.0
 #: Shortcuts CLI can cold-start slower than osascript (mission: 10s).
 SHORTCUTS_TIMEOUT_S = 10.0
 
+#: QuickTime recording: `new screen recording` opens a setup window and the
+#: scripts busy-wait up to 30s for the document, so the runner needs a
+#: window that covers that wait (45s: wait loop + activate + safety margin).
+QUICKTIME_RECORD_TIMEOUT_S = 45.0
+
 #: Env var that swaps the osascript runner for the in-process mock world.
 CONNECTORS_MOCK_ENV = "NOTIFYBOT_CONNECTORS_MOCK"
 
@@ -1115,21 +1120,6 @@ on run argv
 		end if
 		start _doc
 		return (id of _doc)
-	end tell
-end run
-on run argv
-	set _docId to (item 1 of argv) as text
-	tell application id "com.apple.QuickTimePlayerX"
-		try
-			set _doc to document id _docId
-		on error
-			return "connectors-qt-doc-gone"
-		end try
-		stop _doc
-		if (file of _doc) is missing value then
-			return "connectors-qt-doc-gone"
-		end if
-		return (POSIX path of (file of _doc))
 	end tell
 end run
 """
@@ -2723,6 +2713,7 @@ class ConnectorManager:
                 ["osascript", "-e", QUICKTIME_START_SCREEN, "1" if audio else "0"],
                 kind="split_keep",
                 post=post,
+                timeout=QUICKTIME_RECORD_TIMEOUT_S,
             )
         if action == "new_audio_recording":
             if self._qt_recording is not None:
@@ -2740,6 +2731,7 @@ class ConnectorManager:
                 ["osascript", "-e", QUICKTIME_NEW_AUDIO],
                 kind="split_keep",
                 post=post,
+                timeout=QUICKTIME_RECORD_TIMEOUT_S,
             )
         if action == "stop_recording":
             recording = self._qt_recording
