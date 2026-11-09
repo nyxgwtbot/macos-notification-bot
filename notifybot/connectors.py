@@ -1060,26 +1060,6 @@ end run
 #: front doc); with_audio sets the doc's current microphone inside a benign
 #: try (device list empty -> recording still starts, just silent).
 #: Returns the doc id — the Python post REMEMBERS it (process memory).
-QUICKTIME_START_SCREEN = """
-on run argv
-	set _audio to ((item 1 of argv) is "1")
-	tell application id "com.apple.QuickTimePlayerX"
-		activate
-		new screen recording
-		set _doc to document 1
-		if _audio then
-			try
-				set current microphone of _doc to audio recording device 1
-			end try
-		end if
-		start _doc
-		return (id of _doc)
-	end tell
-end run
-"""
-
-#: QuickTime.new_audio_recording: `new audio recording` RETURNS a document (sdef);
-#: start it and return the doc id (same single recording slot as screen).
 QUICKTIME_NEW_AUDIO = """
 on run argv
 	tell application id "com.apple.QuickTimePlayerX"
@@ -1091,10 +1071,52 @@ on run argv
 end run
 """
 
-#: QuickTime.stop: argv[0] = remembered doc id. Stops the doc and returns the
-#: saved file's POSIX path (QT default save location, e.g. ~/Movies/...). A doc
-#: that no longer exists (closed externally) -> doc-gone marker.
 QUICKTIME_STOP = """
+on run argv
+	set _docId to (item 1 of argv) as text
+	tell application id "com.apple.QuickTimePlayerX"
+		try
+			set _doc to document id _docId
+		on error
+			return "connectors-qt-doc-gone"
+		end try
+		stop _doc
+		if (file of _doc) is missing value then
+			return "connectors-qt-doc-gone"
+		end if
+		return (POSIX path of (file of _doc))
+	end tell
+end run
+"""
+
+QUICKTIME_START_SCREEN = """
+on run argv
+	set _audio to ((item 1 of argv) is "1")
+	tell application id "com.apple.QuickTimePlayerX"
+		activate
+		new screen recording
+		-- new screen recording opens a setup window; wait for the actual document (30s)
+		set _doc to missing value
+		repeat with i from 1 to 30
+			delay 1
+			try
+				set _doc to document 1
+				exit repeat
+			on error
+			end try
+		end repeat
+		if _doc is missing value then
+			return "connectors-qt-doc-timeout"
+		end if
+		if _audio then
+			try
+				set current microphone of _doc to audio recording device 1
+			end try
+		end if
+		start _doc
+		return (id of _doc)
+	end tell
+end run
 on run argv
 	set _docId to (item 1 of argv) as text
 	tell application id "com.apple.QuickTimePlayerX"
