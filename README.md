@@ -613,19 +613,21 @@ never regenerate the report unless it is missing.
 Python API smoke (sandboxed; never touches the real config/log/db):
 
 ```bash
-python3 scripts/smoke_api.py
+python3 scripts/smoke_api.py                               # core rows
+NOTIFYBOT_SMOKE_AGENT_MOCK=1 python3 scripts/smoke_api.py   # + agent pipeline rows (mock LLM)
 ```
 
 ## Desktop UI
 
 An Ionic/Vue desktop app under `desktop/` (renderer) + `desktop/electron/` (Electron
 wrapper) that operates the bot locally through `python3 bot.py api` — a stdlib-only,
-loopback-bound JSON server (`notifybot/api.py`). Screens: **Painel** (daemon/health +
-live event feed), **Finanças** (month navigator, category bars, ledger, report
-generation + open/reveal), **Config** (Ollama/router editing, action registry, rules
-with raw-JSON mode; Telegram is read-only env-driven), **Logs** (raw tail with
-malformed lines dimmed). No new Python dependencies; the renderer dependency set
-mirrors the HydraNote scaffold minus duckdb/tiptap/pdf/native modules.
+loopback-bound JSON server (`notifybot/api.py`). Screens: **Dashboard** (daemon/health
++ live event feed), **Finance** (month navigator, category bars, ledger, report
+generation + open/reveal), **Chat** (in-app agent + tool pipeline, below),
+**Settings** (Ollama/router editing, action registry, rules with raw-JSON mode;
+Telegram is read-only env-driven), **Logs** (raw tail with malformed lines dimmed).
+No new Python dependencies; the renderer dependency set mirrors the HydraNote
+scaffold minus duckdb/tiptap/pdf/native modules.
 
 ```bash
 # First install:
@@ -659,9 +661,12 @@ python3 scripts/smoke_api.py
   via `--port` or the `NOTIFYBOT_API_PORT` env var.
 - Endpoints: `GET /api/health`, `GET /api/events?limit=&since=&kind=`, `GET|POST
   /api/config`, `GET /api/finance/summary|transactions?month=YYYY-MM`,
-  `GET|POST /api/finance/report?month=`, `POST /api/test-notify`, plus `GET
-  /api/logs/tail?lines=N` (raw tail for the Logs screen). Unknown paths/methods answer
-  `404/405` as JSON.
+  `GET|POST /api/finance/report?month=`, `POST /api/test-notify`, `POST
+  /api/agent/turn`, `GET /api/agent/sessions`, `GET /api/agent/session/{id}`,
+  `GET /api/services`, `GET /api/connectors`,
+  `POST /api/connectors/probe {domain}` (single-flight per domain; concurrent
+  probe → 409, unknown domain → 400), plus `GET /api/logs/tail?lines=N` (raw
+  tail for the Logs screen). Unknown paths/methods answer `404/405` as JSON.
 - The API **never spawns or manages the daemon** and never touches the Notification
   Center db2; finance reads use read-only SQLite connections (`mode=ro`, 3s busy
   timeout); config writes are atomic (tmp file + `os.replace`) with schema-lite
@@ -681,9 +686,128 @@ python3 scripts/smoke_api.py
   `/usr/bin/python3`) and SIGTERMs both on quit. If a healthy API already answers on
   the preferred port, the app **adopts** it instead of spawning — so you can run the
   bot in Terminal and let the UI ride along.
-- The on-screen Electron smoke (window, tabs, live feed) is manual — boot
-  `cd desktop/electron && npm start` and click through the four tabs.
+- The on-screen Electron smoke (window, tabs, live feed, artifact iframe) is manual —
+  boot `cd desktop/electron && npm start` and click through the five tabs.
 - Debug boot: `cd desktop/electron && npm run electron:start-debug` (port 9223).
+- **Single-instance lock**: a second launch of the Electron app exits immediately
+  (`app.requestSingleInstanceLock()`) and the running instance shows+focuses its window
+  (`second-instance`). The lock keys on the userData path, so a different
+  `--remote-debugging-port` on the second launch changes nothing. The Navigate menu
+  adds ⌘1-⌘4 accelerators (Chat / Status / Logs / Settings).
+
+## Agent & Chat (in-app tool pipeline)
+
+The Chat tab talks to an in-process agent inside the existing `bot.py api` server
+(`notifybot/agent.py` + `notifybot/agent_tools.py` — stdlib only, no new processes).
+Each turn runs a strict **one-JSON-per-turn tool loop**: the model either calls one
+tool (`{"tool", "args"}`) or answers (`{"answer": <PT-BR text>, "urls": [...]}`). The
+final assistant reply is always in Brazilian Portuguese; everything else (prompts,
+code, tool JSON) is English.
+
+### Tools
+
+| Tool | Args | Behavior |
+| --- | --- | --- |
+| `app.data` | `{"dataset", "params?"}` | Reads bot datasets through the same handlers as the JSON API: `health`, `events?since=&limit=&kind=`, `finance_summary?month=`, `finance_transactions?month=`. Errors surface as tool `{"error"}` results. |
+| `dashboard.create` | `{"title", "html", "data_source"}` | Server-side `artifact_id` (uuid4 hex); validates the HTML is self-contained (rejects `<script>`, external refs, `@import`, `url(http`, `fetch(`, `XMLHttpRequest`, >512 KB) and writes `<config_dir>/artifacts/<id>.html` (rotation: newest 200 kept). |
+| `server.serve` | `{"artifact_id"}` | Ensures the loopback artifacts sub-service is healthy on **127.0.0.1:4770** (fixed constant; port-0 injection is test-only via `NOTIFYBOT_ARTIFACTS_PORT`) and returns the artifact URL. |
+| `notify.test` | `{}` | Posts 3 REAL macOS notifications (reuses `POST /api/test-notify` semantics); osascript failures surface as tool errors. |
+| `native.call` | `{"domain", "action", "params"}` | Drives native macOS apps through the connectors whitelist (`reminders` list/add/complete, `notes` search/read/create, `system` volume/front_app/open/toast). Model strings travel ONLY as argv items to a frozen AppleScript source (`osascript -e <const> <argv…>`, no shell, no interpolation); hard 8 s per-call timeout; `reminders`/`notes` require consent granted from Settings › Connectors and surface PT-BR consent errors that the agent relays verbatim without retrying that domain in the turn. |
+
+Loop guards: max 6 tool turns, ~90 s global budget, ~4 KB tool-result truncation in
+context, one protocol-reminder retry on unparsable model output, and graceful PT-BR
+error answers (HTTP 200) when Ollama is unreachable — failures never 500 the turn.
+The loop auto-serves after `dashboard.create` (it executes `server.serve` itself and
+synthesizes the PT-BR answer when the model drifts), date-grounds the prompt header
+with a build-time `Current local date:` line, and retries transient Ollama transport
+errors (2 extra attempts, 2 s linear backoff).
+Session-context hardening: prior assistant answers longer than ~240 chars are
+truncated in the outgoing model context only (first ~200 chars plus
+`…[answer truncated N chars in context]`; the full answer stays in the session file
+and the UI), and any turn on a session with prior history carries one standing
+system line — `Reminder: respond with exactly ONE JSON object …` — from the first
+model call onward; known limitation: with the current small model, occasional
+free-form drift still lands on the clean PT-BR guard answer (the accepted UX for v1).
+Sessions persist append-only under `<config_dir>/data/agent_sessions/<id>.jsonl`;
+ids match `^[A-Za-z0-9-]{1,64}$`.
+
+### Connectors (native.call)
+
+`native.call` lets the Chat agent drive native macOS apps. Every
+(domain, action) pair is whitelisted server-side (`notifybot/connectors.py`):
+`reminders` (`list_lists`, `list_reminders`, `add`, `complete`), `notes`
+(`search`, `read`, `create`), and `system` (`volume`, `front_app`, `open`,
+`toast`). Injection safety is structural: the model's strings are passed as
+positional **argv** items to a *constant* AppleScript source
+(`subprocess.run(["osascript", "-e", SCRIPT_CONST, *argv])`) — user bytes never
+appear in script source, and list results join on ASCII character 31 in-script
+(never comma-split).
+
+Consent (macOS TCC): `reminders`/`notes` actions need per-domain state
+`granted`, which is produced by the Settings › Connectors **Connect/Re-check**
+button (`POST /api/connectors/probe`) or self-heals after a successful action;
+a `-1743`/not-authorized osascript error persists `denied`, a probe timeout
+classifies `needs_consent` (a hanging consent dialog is the usual cause), and
+an ungranted action answers a PT-BR error ("…conecte <domain> em Settings ›
+Connectors.") that the agent relays verbatim without retrying the domain in
+the turn. `system` is ungated (no consent). Probes are single-flight per
+domain (concurrent probe → 409). Per-domain state persists atomically to
+`data/connectors_state.json` (runtime file, gitignored, holds no secrets).
+
+- Endpoints: `GET /api/connectors` (per-domain `status`/`granted`/
+  `last_probe`/`hint`; `system` always granted), `POST
+  /api/connectors/probe` `{"domain": …}` (→ `{ok, domain, status,
+  last_probe}`; 400 unknown domain, 409 busy).
+- Deferred to v2 (documentation only, not rows of `GET /api/connectors`):
+  `mail`, `contacts`, `messages`, `findmy` — read-sensitive domains that need
+  their own consent/privacy design pass; no secrets are involved anywhere.
+- Mock hook: `NOTIFYBOT_CONNECTORS_MOCK=1` swaps the osascript runner for a
+  per-process in-memory world (reminders lists + notes + volume + toasts), so
+  `add` → `list_reminders` stays observable and smokes exercise the endpoints
+  without executing AppleScript or touching TCC.
+
+### API rows
+
+- `POST /api/agent/turn` `{session_id?, message}` (synchronous; missing/empty/oversize
+  message → 400, unknown session → 404).
+- `GET /api/agent/sessions` — newest-first summaries.
+- `GET /api/agent/session/{id}` — full transcript (id regex-validated).
+- `GET /api/services` — sub-service registry (`artifacts` running/port/root/since).
+- `GET /api/connectors` — connectors status rows (see Connectors above).
+- `POST /api/connectors/probe` — one trivial per-domain osascript touch
+  (≤ 8 s) that classifies + persists consent; English endpoint errors.
+
+### Rendering + CSP
+
+When the answer carries `urls[]`, ChatView renders
+`<iframe sandbox src="http://127.0.0.1:4770/<id>.html">` — an EMPTY `sandbox` attribute
+(no scripts) combined with the `<script>`-free artifact validation. The Electron CSP
+adds exactly one directive: `frame-src 'self' <scheme>://* http://127.0.0.1:4770`
+(fixed port — deliberate, so no other local service may be framed); the renderer
+additionally allowlists only `http://127.0.0.1:4770/<32-hex>.html` URLs.
+
+### Agent smoke (mock mode, no Ollama needed)
+
+```bash
+NOTIFYBOT_SMOKE_AGENT_MOCK=1 python3 scripts/smoke_api.py
+# with the connectors mock (same run also exercises rows 15/16 and the
+# native.call agent turn — no osascript, no TCC prompt):
+NOTIFYBOT_SMOKE_AGENT_MOCK=1 NOTIFYBOT_CONNECTORS_MOCK=1 python3 scripts/smoke_api.py
+```
+
+`NOTIFYBOT_SMOKE_AGENT_MOCK=1` selects a deterministic scripted LLM (test/smoke-only
+hook documented in `notifybot/agent.py`) that walks the dashboard pipeline
+(`app.data` → `dashboard.create` → `server.serve` → answer with urls) and — with
+`NOTIFYBOT_CONNECTORS_MOCK=1` — a reminders flow (`native.call add` →
+`list_reminders` → PT-BR answer). Unit tests inject their own `llm_fn`
+transcripts instead (`tests/test_agent.py`);
+
+> If something else owns port 4770 when `server.serve` runs, the tool fails with a
+> clear error ("artifacts port 4770 busy — close the other process"); there is no
+> auto-increment by design. The API smoke sandbox resolves its own artifacts port
+> (4770 when free, else the documented test-only `NOTIFYBOT_ARTIFACTS_PORT`
+> override picks a free 4771–4780), so it stays runnable next to a live bot;
+> production itself never moves off 4770.
 
 ## Project layout
 
@@ -698,6 +822,10 @@ notifybot/              Implementation package:
   actions.py              action dispatcher (log/telegram/command/registry/handlers)
   finance.py              FinanceCurator (regex + LLM fallback) + FinanceLedger (SQLite)
   report.py               inline SVG chart engine + FinanceReporter (HTML/markdown/PT-BR insights)
+  agent_tools.py          agent tools (app.data/dashboard.create/server.serve/notify.test)
+                          + the 4770 artifacts sub-service registry
+  agent.py                in-process agent tool loop + agent session JSONL store
+  agent_prompt.md         English system prompt template for the agent
   cli.py                  CLI logic: poll loop wiring, `report` subcommand, config defaults
 config.json             Runtime configuration (polling, Ollama, Telegram, router,
                         actions registry, finance, rules)
@@ -710,22 +838,25 @@ scripts/
                           python3 scripts/smoke_finance.py
   smoke_api.py          Desktop-UI API smoke test (sandboxed):
                           python3 scripts/smoke_api.py
+                        # agent rows (mock mode):
+                        NOTIFYBOT_SMOKE_AGENT_MOCK=1 python3 scripts/smoke_api.py
 desktop/                Desktop UI (Electron app), sibling of the Python app:
   package.json            renderer scaffold (Vue 3 + Vite + TS + Ionic + Pinia),
                           mirrored from hydranote's (no duckdb/tiptap/pdf/native deps)
   src/main.ts             Ionic boot + dark.system.css palette
-  src/App.vue             IonTabs shell (Painel / Finanças / Config / Logs)
-  src/router/index.ts     routes /dashboard /finance /config /logs (/ -> /dashboard)
+  src/App.vue             IonTabs shell (Dashboard / Finance / Chat / Settings / Logs)
+  src/router/index.ts     routes /dashboard /chat /finance /config /logs (/ -> /dashboard)
   src/types/bot.ts        TS payloads mirroring the bot's Python dicts
   src/notify.d.ts         `window.notifyAPI` bridge typings (preload-exposed)
   src/services/           notifyClient.ts (bridge / browser-dev fetch) + configValidation
   src/stores/bot.ts       Pinia store (status, events ring, finance cache, config draft)
   src/composables/        usePolling.ts (2s poll loop helper)
-  src/viewModels/         eventViewModel.ts (event -> row mapping for the feed)
-  src/views/              DashboardView / FinanceView / ConfigView / LogsView
+  src/viewModels/         eventViewModel.ts (event -> row mapping) + chatViewModel.ts
+                          (pure chat state machine, 4770 artifact URL allowlist)
+  src/views/              DashboardView / ChatView / FinanceView / ConfigView / LogsView
   tests/unit/             vitest specs (npm run test:unit -- --run)
   electron/               Electron wrapper (hydranote's scaffold, slimmed):
-    src/index.ts            app boot, menu, IPC registration
+    src/index.ts            app boot, menu (⌘1-⌘4 navigate), single-instance lock, IPC registration
     src/setup.ts            ElectronCapacitorApp (electron-serve scheme, CSP, window state)
     src/processManager.ts   spawns/adopts `bot.py api` + `bot.py`; SIGTERM on quit
     src/ipc/                botApiIpc (http proxy) / daemonIpc / reportIpc

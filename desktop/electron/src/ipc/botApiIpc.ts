@@ -2,7 +2,9 @@
  * bot-api:request — proxy that forwards renderer HTTP calls to the bot API.
  * Runs in the Electron MAIN process on the Node `http` module (Electron 26
  * main is Node 16 — no global fetch), mirroring hydranote's web:fetch IPC
- * pattern with a 60s timeout.
+ * pattern. Default timeout 60s; agent turns get a 150s budget (a worst-case
+ * turn is a ~90s agent budget plus one in-flight 30s Ollama call — see
+ * notifybot/agent.py run_turn).
  */
 
 import { ipcMain } from 'electron';
@@ -11,6 +13,10 @@ import * as http from 'http';
 import type { PythonProcessManager } from '../processManager';
 
 const PROXY_TIMEOUT_MS = 60000;
+// Agent-path timeout (/api/agent/*): turn budget 90s + one in-flight 30s
+// Ollama call exceeds the 60s default, so agent paths get 150s. The UI
+// recovers a finished-but-unresponsive turn via GET /api/agent/session/<id>.
+const AGENT_PROXY_TIMEOUT_MS = 150000;
 
 export interface BotApiHttpRequest {
   method: 'GET' | 'POST';
@@ -45,7 +51,8 @@ function validateRequest(
   return { ok: true, value: { method: candidate.method, path: candidate.path, body: candidate.body } };
 }
 
-/** One http.request round-trip to 127.0.0.1:<port> with a 60s timeout. */
+/** One http.request round-trip to 127.0.0.1:<port> (60s default, 150s for
+ * agent paths — see AGENT_PROXY_TIMEOUT_MS). */
 function proxyOnce(port: number, req: BotApiHttpRequest): Promise<BotApiHttpResult> {
   return new Promise((resolve, reject) => {
     const payload = req.method === 'POST' && req.body !== undefined ? JSON.stringify(req.body) : null;
@@ -54,8 +61,9 @@ function proxyOnce(port: number, req: BotApiHttpRequest): Promise<BotApiHttpResu
       headers['Content-Type'] = 'application/json; charset=utf-8';
       headers['Content-Length'] = Buffer.byteLength(payload);
     }
+    const timeoutMs = req.path.startsWith('/api/agent/') ? AGENT_PROXY_TIMEOUT_MS : PROXY_TIMEOUT_MS;
     const request = http.request(
-      { host: '127.0.0.1', port, path: req.path, method: req.method, headers, timeout: PROXY_TIMEOUT_MS },
+      { host: '127.0.0.1', port, path: req.path, method: req.method, headers, timeout: timeoutMs },
       (response) => {
         const chunks: Buffer[] = [];
         response.on('data', (chunk) => chunks.push(chunk as Buffer));
@@ -69,8 +77,8 @@ function proxyOnce(port: number, req: BotApiHttpRequest): Promise<BotApiHttpResu
         });
       }
     );
-    request.setTimeout(PROXY_TIMEOUT_MS, () => {
-      reject(new Error('timeout da chamada ao bot API (60s)'));
+    request.setTimeout(timeoutMs, () => {
+      reject(new Error(`timeout da chamada ao bot API (${Math.round(timeoutMs / 1000)}s)`));
     });
     request.on('error', (err) => reject(err));
     if (payload !== null) request.write(payload);

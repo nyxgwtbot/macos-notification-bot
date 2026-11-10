@@ -1,0 +1,589 @@
+/**
+ * Chat view-model: pure state machine for the Chat tab
+ * (tests: tests/unit/chatViewModel.spec.ts). Mirrors eventViewModel.ts
+ * conventions: no Ionic imports, pure reduce over typed events, exported
+ * mapping helpers.
+ */
+
+import { errorText } from '@/services/notifyClient';
+
+import type {
+  AgentActiveTurnPhase,
+  AgentActiveTurnResponse,
+  AgentRecord,
+  AgentSessionSummary,
+  AgentTurnResponse,
+  AgentTurnStep,
+} from '@/types/bot';
+
+/** Defense-in-depth allowlist: only 4770-loopback artifact URLs (32-hex ids,
+ * matching what dashboard.create generates) may reach iframe.src. */
+export const ARTIFACT_URL_PATTERN = /^http:\/\/127\.0\.0\.1:4770\/([0-9a-f]{32})\.html$/;
+
+/** Tool chip preview cap (~2 KB pretty-printed JSON). */
+export const TOOL_CHIP_PREVIEW_MAX_CHARS = 2000;
+
+export interface ChatBubble {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+  /** ISO timestamp of the message (server ts on transcript reload, arrival
+   * time for live turns); null when unknowable. Rendered HH:MM. */
+  ts: string | null;
+}
+
+export interface ChatToolChip {
+  id: string;
+  tool: string;
+  ok: boolean;
+  /** Pretty-printed result (ok) or error text, truncated to the cap. */
+  preview: string;
+  /** First string value of step.args truncated to 24 chars, '' when absent (skips 'html' key). */
+  target: string;
+}
+
+/** Live turn-progress entry rendered while POST /api/agent/turn is in flight;
+ * replaced by the turn's real tools group + assistant bubble on completion. */
+export interface ChatProgressItem {
+  kind: 'progress';
+  id: string;
+  sessionId: string | null;
+  phase: AgentActiveTurnPhase;
+  phaseLabel: string;
+  attempt: number;
+  startedAt: string | null;
+  currentTool: { tool: string; target: string } | null;
+  toolStartedAt: string | null;
+  completedChips: ChatToolChip[];
+  rawPartial: string;
+}
+
+/** One transcript entry in display order. A turn's tool steps are interleaved
+ * as a single collapsible group directly under that turn's user bubble and
+ * before its assistant reply (kind: 'tools'). Completed turns keep their
+ * collapsible model thinking on the tools group or on the answer bubble. */
+export type ChatTranscriptItem =
+  | ({ kind: 'bubble'; thinking?: string } & ChatBubble)
+  | ({ kind: 'tools'; id: string; chips: ChatToolChip[]; thinking?: string })
+  | ChatProgressItem;
+
+export interface ChatState {
+  /** Interleaved transcript: bubbles + per-turn tool groups in display order. */
+  items: ChatTranscriptItem[];
+  /** Composer draft owned by the VM so prefill/send/locked states are pure. */
+  draft: string;
+  artifactUrl: string | null;
+  pending: boolean;
+  error: string | null;
+  sessionId: string | null;
+  sessions: AgentSessionSummary[];
+}
+
+export type ChatEvent =
+  | { type: 'send'; message: string }
+  /** Suggestion click / retry: fill the draft, focus is a view concern. */
+  | { type: 'prefill'; text: string }
+  /** Composer keystrokes (keeps send-on-enter semantics view-side). */
+  | { type: 'draft-changed'; text: string }
+  | { type: 'turn-succeeded'; response: AgentTurnResponse }
+  /** ~1s poll of GET /api/agent/active-turn while a turn is pending. */
+  | { type: 'turn-progress'; progress: AgentActiveTurnResponse }
+  | { type: 'turn-failed'; error: string }
+  | { type: 'error-cleared' }
+  | { type: 'sessions-loaded'; sessions: AgentSessionSummary[] }
+  /** null -> "New session" (full reset); id -> switch (view then loads it). */
+  | { type: 'session-selected'; sessionId: string | null }
+  /** Server transcript arrived after switching sessions or recovering an
+   * IPC-timeout turn. */
+  | { type: 'session-loaded'; sessionId: string; records: AgentRecord[] };
+
+export function initialChatState(): ChatState {
+  return {
+    items: [],
+    draft: '',
+    artifactUrl: null,
+    pending: false,
+    error: null,
+    sessionId: null,
+    sessions: [],
+  };
+}
+
+/** First artifact URL from answer.urls shaped exactly `<id>.html` on 4770. */
+export function iframeUrlFrom(urls: string[] | null | undefined): string | null {
+  if (!Array.isArray(urls)) return null;
+  for (const url of urls) {
+    if (typeof url !== 'string') continue;
+    const match = ARTIFACT_URL_PATTERN.exec(url);
+    if (match && !match[1].includes('..')) return url;
+  }
+  return null;
+}
+
+/** True when a thrown error looks like the bot-api bridge proxy timeout
+ * (botApiIpc.ts rejects with "timeout da chamada ao bot API..."). */
+export function isIpcTimeout(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? '');
+  return /timeout|timed out/i.test(message);
+}
+
+/** Turn-failure copy: the IPC-timeout case is recoverable (the session is
+ * reopened to check), so it reads differently from a plain failure. */
+export function turnFailedErrorText(err: unknown): string {
+  return isIpcTimeout(err)
+    ? 'The bot API didn\'t respond in time. The turn may have finished — this session is being reopened to check.'
+    : `Turn failed: ${errorText(err)}`;
+}
+
+/** Deterministic node ids from a monotonic counter carried in the state. */
+let seqCounter = 0;
+function nextId(prefix: string): string {
+  seqCounter += 1;
+  return `${prefix}-seq-${seqCounter}`;
+}
+
+/** Arrival-time ISO timestamp for bubbles created from live events. */
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+export function toBubble(role: 'user' | 'assistant', text: string, ts: string | null = null): ChatBubble {
+  return { id: nextId('bubble'), role, text, ts };
+}
+
+/** ISO timestamp -> local wall clock 'HH:MM' (empty when unparsable). */
+export function formatBubbleTime(ts: string | null | undefined): string {
+  if (!ts) return '';
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return '';
+  const two = (n: number) => String(n).padStart(2, '0');
+  return `${two(date.getHours())}:${two(date.getMinutes())}`;
+}
+
+const CHAT_DRAFT_STORAGE_KEY = 'nb:chat.draft';
+const CHAT_DRAFT_MAX_LENGTH = 10_000;
+
+/** Composer draft persistence: localStorage can throw in privacy modes, so
+ * every access degrades to session-only (LogsView R7 pattern). */
+export function readStoredDraft(): string {
+  try {
+    return window.localStorage.getItem(CHAT_DRAFT_STORAGE_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+export function writeStoredDraft(text: string): void {
+  try {
+    if (text.trim() === '') {
+      window.localStorage.removeItem(CHAT_DRAFT_STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(CHAT_DRAFT_STORAGE_KEY, text.slice(0, CHAT_DRAFT_MAX_LENGTH));
+    }
+  } catch {
+    /* session-only */
+  }
+}
+
+export function clearStoredDraft(): void {
+  try {
+    window.localStorage.removeItem(CHAT_DRAFT_STORAGE_KEY);
+  } catch {
+    /* session-only */
+  }
+}
+
+/** First string value of a tool-args record, skipping 'html', sliced to 24
+ * chars ('' when absent). Shared by persisted chips and live progress. */
+export function extractToolTarget(args: Record<string, unknown> | undefined | null): string {
+  if (!args || typeof args !== 'object') return '';
+  for (const [key, val] of Object.entries(args)) {
+    if (key === 'html') continue;
+    if (typeof val === 'string') return val.slice(0, 24);
+  }
+  return '';
+}
+
+/** "Working · Ns" elapsed label for the live turn; null/invalid timestamps
+ * render "Working · 0s" and a clock ahead of startedAt clamps to 0. */
+export function formatTurnElapsed(startedAt: string | null | undefined, nowMs: number = Date.now()): string {
+  if (!startedAt) return 'Working \u00b7 0s';
+  const parsed = new Date(startedAt).getTime();
+  if (Number.isNaN(parsed)) return 'Working \u00b7 0s';
+  const seconds = Math.max(0, Math.floor((nowMs - parsed) / 1000));
+  return `Working \u00b7 ${seconds}s`;
+}
+
+/** Human copy for the active loop phase (thinking / retry / tool / serving). */
+export function formatTurnPhase(
+  progress: Pick<AgentActiveTurnResponse, 'phase' | 'attempt' | 'current_tool'>
+): string {
+  switch (progress.phase) {
+    case 'thinking':
+      return 'Thinking\u2026';
+    case 'retry':
+      return `Reformatting response (retry ${Math.max(1, progress.attempt || 1)})`;
+    case 'tool':
+      return progress.current_tool?.tool ? `Running tool ${progress.current_tool.tool}\u2026` : 'Running tool\u2026';
+    case 'serving':
+      return 'Serving dashboard\u2026';
+    default:
+      return 'Thinking\u2026';
+  }
+}
+
+/** Pretty-printed preview of one tool step: result JSON on success, error
+ * text otherwise, truncated to TOOL_CHIP_PREVIEW_MAX_CHARS. */
+export function toToolChip(step: AgentTurnStep, index: number): ChatToolChip {
+  const ok = typeof step.error !== 'string';
+  let preview: string;
+  if (!ok) {
+    preview = String(step.error ?? 'unknown tool error');
+  } else if (step.result === undefined || step.result === null) {
+    preview = '(empty result)';
+  } else {
+    try {
+      preview = JSON.stringify(step.result, null, 2);
+    } catch {
+      preview = String(step.result);
+    }
+  }
+  if (preview.length > TOOL_CHIP_PREVIEW_MAX_CHARS) {
+    preview = `${preview.slice(0, TOOL_CHIP_PREVIEW_MAX_CHARS)}\n…[truncated]`;
+  }
+  const target = extractToolTarget(step.args as Record<string, unknown> | undefined);
+  return { id: `chip-${step.ts}-${index}`, tool: step.tool, ok, preview, target };
+}
+
+/** Deduped tool names in first-seen order with " ×N" for repeats joined by " · ". */
+export function toolSummaryFromChips(chips: ChatToolChip[]): string {
+  if (!chips || chips.length === 0) return '';
+  const counts = new Map<string, number>();
+  const order: string[] = [];
+  for (const chip of chips) {
+    const tool = chip.tool;
+    if (!counts.has(tool)) {
+      order.push(tool);
+      counts.set(tool, 1);
+    } else {
+      counts.set(tool, (counts.get(tool) ?? 0) + 1);
+    }
+  }
+  return order
+    .map((tool) => {
+      const count = counts.get(tool) ?? 1;
+      return count > 1 ? `${tool} \u00d7${count}` : tool;
+    })
+    .join(' \u00b7 ');
+}
+
+/** Unescape common JSON string escapes (\\n and \\u00XX) for display. */
+function unescapeForDisplay(s: string): string {
+  return s
+    .replace(/\\n/g, '\n')
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)));
+}
+
+/** Strip display noise (reasoner tags, HTML tags, code fences, bold markers, md headers) from reasoning text. No-op on clean prose. */
+export function sanitizeThinkingDisplay(text: string): string {
+  if (!text) return '';
+  let s = text;
+  s = s.replace(/<\/?(think|answer)>/gi, ''); // reasoner tags
+  s = s.replace(/```[a-zA-Z0-9]*\n?/g, ''); // code fences
+  s = s.replace(/<(?!\/?(think|answer))[a-zA-z][a-zA-Z0-9-]*(\s[^<>]*)?>/g, ''); // literal HTML tags (keep <answer>/think handled above; never strip '<' not starting a tag, e.g. '< 10')
+  s = s.replace(/\*\*/g, ''); // bold markers
+  s = s.replace(/^#{1,6}\s+/gm, ''); // md headers
+  return s;
+}
+
+/** Smoothed single-line progress preview for a collapsed Thinking block. */
+export function smoothProgressPreview(raw: string): string {
+  const tail = raw ?? '';
+  if (!tail.trim()) return '';
+  // Prefer a complete JSON object in the tail (best case: parse out the answer text).
+  try {
+    const trimmed = tail.trim();
+    const obj = JSON.parse(trimmed.startsWith('{') ? trimmed : trimmed.slice(trimmed.indexOf('{')));
+    const ans = typeof obj?.answer === 'string' ? obj.answer : null;
+    if (ans && ans.trim()) {
+      const s = unescapeForDisplay(ans.trim());
+      return sanitizeThinkingDisplay(s.length > 140 ? '…' + s.slice(-140) : s);
+    }
+    const tool = typeof obj?.tool === 'string' ? obj.tool : null;
+    if (tool) return sanitizeThinkingDisplay(`Prepared tool ${tool}`);
+  } catch {
+    // Partial or multi-part tail: fall through to regex matching below.
+  }
+  // Prefer an unterminated answer string (stream mid-write): last match, no EOF anchor.
+  const re = /"answer"\s*:\s*"((?:[^"\\]|\\.)*)/g;
+  let m: RegExpExecArray | null;
+  let last: RegExpExecArray | null = null;
+  while ((m = re.exec(tail)) !== null) last = m;
+  if (last) {
+    const s = unescapeForDisplay(last[1]);
+    return sanitizeThinkingDisplay(s.length > 140 ? '…' + s.slice(-140) : s);
+  }
+  // Prefer an in-stream tool call name being written.
+  const t = /"tool"\s*:\s*"([^"]{0,40})/.exec(tail);
+  if (t) return sanitizeThinkingDisplay(`Preparing tool ${t[1]}…`);
+  return sanitizeThinkingDisplay(tail); // raw tail as-is (compact JSON or thinking text)
+}
+
+const FRIENDLY_THINKING_MAX_CHARS = 400;
+
+/** Owner-friendly thinking display: renders the model's answer text when the stream tail embeds a JSON answer payload (complete or mid-write), otherwise the natural-language reasoning minus output-format meta-instructions. Never shows raw JSON, tags, or parameters. */
+export function friendlyThinking(raw: string): string {
+  const tail = raw ?? '';
+  if (!tail.trim()) return '';
+  // 1. Complete answer: a closing-quoted "answer" string anywhere in the text.
+  const full = /"answer"\s*:\s*"((?:[^"\\]|\\.)*)"(\s*,\s*"urls")?/g;
+  let m: RegExpExecArray | null;
+  let lastFull: RegExpExecArray | null = null;
+  while ((m = full.exec(tail)) !== null) lastFull = m;
+  const fullAnswer = lastFull ? decodeAnswerValue(lastFull[1]) : '';
+  if (fullAnswer.trim()) return capFriendlyDisplay(fullAnswer);
+  // 2. Unterminated answer (stream mid-write): partial text so far — it grows on the next tick.
+  const open = /"answer"\s*:\s*"((?:[^"\\]|\\.)*)/g;
+  let om: RegExpExecArray | null;
+  let lastOpen: RegExpExecArray | null = null;
+  while ((om = open.exec(tail)) !== null) lastOpen = om;
+  if (lastOpen) return capFriendlyDisplay(decodeAnswerValue(lastOpen[1]));
+  // 3. Tool-call tail without an answer payload — keep parameters out of the display.
+  const closedTool = /"tool"\s*:\s*"([^"]*)"/.exec(tail);
+  if (closedTool) return capFriendlyDisplay(sanitizeThinkingDisplay(`Prepared tool ${closedTool[1]}`));
+  const openTool = /"tool"\s*:\s*"([^"]{0,40})/.exec(tail);
+  if (openTool) return capFriendlyDisplay(sanitizeThinkingDisplay(`Preparing tool ${openTool[1]}…`));
+  // 4. No answer payload: natural-language reasoning, sanitised, minus output-format meta-sentences.
+  return capFriendlyDisplay(sanitizeThinkingDisplay(stripMetaSentences(tail)));
+}
+
+function decodeAnswerValue(encoded: string): string {
+  // JSON-string unescape: literal escapes (e.g. \n, \uXXXX via unescapeForDisplay) + \" -> "
+  return unescapeForDisplay(encoded.replace(/\\"/g, '"'));
+}
+
+function stripMetaSentences(text: string): string {
+  // Sentences that are meta-instructions about the required output format are never thinking content.
+  const meta = /\b(protocol|respond with a JSON|answer shape)\b/i;
+  return text
+    .split(/(?<=[.!?])\s+|\n+/)
+    .filter((sentence) => !meta.test(sentence))
+    .join(' ')
+    .trim();
+}
+
+function capFriendlyDisplay(text: string): string {
+  return text.length > FRIENDLY_THINKING_MAX_CHARS ? '…' + text.slice(-FRIENDLY_THINKING_MAX_CHARS) : text;
+}
+
+/** One collapsible tool-activity group for a turn's steps, ids scoped to the
+ * group so they stay unique across turns. `thinking` carries the turn's
+ * collapsible model output when present. */
+function toolsItemFromSteps(steps: AgentTurnStep[], thinking?: string): ChatTranscriptItem {
+  const id = nextId('tools');
+  const item = {
+    kind: 'tools' as const,
+    id,
+    chips: steps.map((step, index) => ({ ...toToolChip(step, index), id: `${id}-${index}` })),
+  };
+  return thinking && thinking.length > 0 ? { ...item, thinking } : item;
+}
+
+/** Max chars of accumulated assistant_raw text kept per turn (tail). */
+const THINKING_TAIL_MAX_CHARS = 400;
+
+/** True for the transient live progress entry. */
+function isProgressItem(item: ChatTranscriptItem): item is ChatProgressItem {
+  return item.kind === 'progress';
+}
+
+/** Rebuild the interleaved transcript (bubbles + per-turn tool groups) and
+ * artifact URL from a persisted session transcript. Consecutive tool rows
+ * form the group of the turn whose user message precedes them; any answer /
+ * content row closes the group. Loop-internal assistant_raw rows feed the
+ * turn's collapsible thinking but never flush; other loop-internal rows are
+ * ignored. */
+export function transcriptFromRecords(records: AgentRecord[]): { items: ChatTranscriptItem[]; artifactUrl: string | null } {
+  const items: ChatTranscriptItem[] = [];
+  let artifactUrl: string | null = null;
+  let toolRun: AgentTurnStep[] | null = null;
+  let rawPieces: string[] = [];
+
+  /** Consume the active turn's accumulated assistant_raw text (tail-capped). */
+  const takeThinking = (): string => {
+    if (rawPieces.length === 0) return '';
+    const joined = rawPieces.join('\n');
+    rawPieces = [];
+    return joined.length > THINKING_TAIL_MAX_CHARS ? joined.slice(-THINKING_TAIL_MAX_CHARS) : joined;
+  };
+
+  /** Close the current turn at a real boundary: flush its tool group and, when
+   * no tools ran, attach its thinking to the assistant answer bubble. */
+  const closeTurn = (answerBubble: ChatBubble | null): void => {
+    const thinking = takeThinking();
+    const hasTools = toolRun !== null && toolRun.length > 0;
+    if (hasTools && toolRun !== null) {
+      items.push(toolsItemFromSteps(toolRun, thinking));
+    }
+    toolRun = null;
+    if (answerBubble === null) return;
+    items.push(
+      !hasTools && thinking ? { kind: 'bubble', ...answerBubble, thinking } : { kind: 'bubble', ...answerBubble }
+    );
+  };
+
+  records.forEach((record) => {
+    if (record.role === 'user') {
+      closeTurn(null);
+      items.push({ kind: 'bubble', ...toBubble('user', String(record.content ?? ''), record.ts) });
+    } else if (record.role === 'assistant' && typeof record.tool === 'string') {
+      (toolRun ??= []).push({
+        role: 'assistant',
+        tool: record.tool,
+        args: record.args,
+        result: record.result,
+        error: record.error,
+        ts: record.ts,
+      });
+    } else if (record.role === 'assistant' && typeof record.answer === 'string') {
+      const bubble = toBubble('assistant', record.answer, record.ts);
+      closeTurn(bubble);
+      const url = iframeUrlFrom(record.urls ?? []);
+      if (url) artifactUrl = url;
+    } else if (record.role === 'assistant' && typeof record.content === 'string') {
+      // legacy/loop-internal records without a tool or answer payload
+      closeTurn(toBubble('assistant', record.content, record.ts));
+    } else if (record.role === 'assistant_raw') {
+      // Loop-internal raw output feeds the turn's thinking; it NEVER flushes.
+      if (typeof record.raw_model_output === 'string' && record.raw_model_output.length > 0) {
+        rawPieces.push(record.raw_model_output);
+      }
+    } else {
+      // Other loop-internal rows NEVER flush; flushes happen only at real
+      // boundaries (user / answer / content) and at transcript end.
+    }
+  });
+  closeTurn(null);
+  return { items, artifactUrl };
+}
+
+export function reduceChat(state: ChatState, event: ChatEvent): ChatState {
+  switch (event.type) {
+    case 'send': {
+      // Defensively drop a stale live-progress entry from a previous turn.
+      const items = state.items.filter((item) => !isProgressItem(item));
+      return {
+        ...state,
+        items: [...items, { kind: 'bubble', ...toBubble('user', event.message, nowIso()) }],
+        draft: '',
+        pending: true,
+        error: null,
+      };
+    }
+    case 'prefill':
+      return { ...state, draft: event.text };
+    case 'draft-changed':
+      return { ...state, draft: event.text };
+    case 'turn-progress': {
+      const progress = event.progress;
+      // Late/stale polls must never re-open a finished transcript.
+      if (!state.pending) return state;
+      const existing = state.items.find(isProgressItem);
+      if (progress.done === true && !existing) return state;
+      if (
+        state.sessionId !== null &&
+        progress.session_id !== null &&
+        state.sessionId !== progress.session_id
+      ) {
+        return state;
+      }
+      const progressId = existing?.id ?? nextId('progress');
+      const completedChips = (progress.completed_tools ?? []).map((step, index) => ({
+        ...toToolChip(step, index),
+        id: `${progressId}-${index}`,
+      }));
+      const currentTool = progress.current_tool
+        ? { tool: progress.current_tool.tool, target: extractToolTarget(progress.current_tool.args) }
+        : null;
+      const progressItem: ChatProgressItem = {
+        kind: 'progress',
+        id: progressId,
+        // Do not mutate state.sessionId: POST /api/agent/turn owns it. The item
+        // only carries the id so the view can scope polling on first turn.
+        sessionId: existing?.sessionId ?? progress.session_id ?? state.sessionId ?? null,
+        phase: progress.phase,
+        phaseLabel: formatTurnPhase(progress),
+        attempt: progress.attempt,
+        startedAt: progress.started_at,
+        currentTool,
+        toolStartedAt: progress.tool_started_at,
+        completedChips,
+        // Tool/serving ticks carry no raw chunks: keep the last non-empty tail.
+        rawPartial: progress.raw_partial || existing?.rawPartial || '',
+      };
+      return {
+        ...state,
+        items: existing
+          ? state.items.map((item) => (item === existing ? progressItem : item))
+          : [...state.items, progressItem],
+      };
+    }
+    case 'turn-succeeded': {
+      const response = event.response;
+      const newUrl = iframeUrlFrom(response?.urls);
+      const progressItem = state.items.find(isProgressItem);
+      const lastThinking = progressItem?.rawPartial ?? '';
+      const items: ChatTranscriptItem[] = state.items.filter((item) => !isProgressItem(item));
+      const turn = Array.isArray(response.turn) ? response.turn : [];
+      // F1: the turn's tool steps land as one group under this turn's user
+      // bubble, before its assistant reply (both are appended in order).
+      if (turn.length > 0) {
+        items.push(toolsItemFromSteps(turn, lastThinking));
+      }
+      const answerBubble = { kind: 'bubble' as const, ...toBubble('assistant', response.answer, nowIso()) };
+      items.push(turn.length === 0 && lastThinking ? { ...answerBubble, thinking: lastThinking } : answerBubble);
+      return {
+        ...state,
+        sessionId: response.session_id,
+        items,
+        artifactUrl: newUrl ?? state.artifactUrl,
+        pending: false,
+        error: null,
+        // keep sessions list untouched here; the view refreshes it separately
+      };
+    }
+    case 'turn-failed':
+      return {
+        ...state,
+        items: state.items.filter((item) => !isProgressItem(item)),
+        pending: false,
+        error: event.error,
+      };
+    case 'error-cleared':
+      return { ...state, error: null };
+    case 'sessions-loaded':
+      return { ...state, sessions: event.sessions };
+    case 'session-selected':
+      return {
+        ...initialChatState(),
+        sessions: state.sessions,
+        sessionId: event.sessionId,
+      };
+    case 'session-loaded': {
+      // Guard against a stale transcript arriving after the user switched.
+      if (state.sessionId !== event.sessionId) return state;
+      const { items, artifactUrl } = transcriptFromRecords(event.records);
+      return {
+        ...state,
+        items,
+        artifactUrl,
+        pending: false,
+        error: null,
+      };
+    }
+    default: {
+      const exhaustive: never = event;
+      return exhaustive;
+    }
+  }
+}

@@ -10,6 +10,8 @@ Modules (Phase 2 layout, per PLAN-PHASE2.md):
 - finance:    bank-notification transaction curator + SQLite ledger
 - report:     SVG chart engine + finance HTML/markdown reporting
 - api:        local JSON API server for the desktop UI (bot.py api, loopback only)
+- agent_tools: in-app agent tool implementations + artifacts sub-service registry
+- agent:      in-app agent tool loop (strict one-JSON-per-turn protocol) + sessions
 - cli:        CLI entrypoint logic (bot.py is the thin executable)
 """
 
